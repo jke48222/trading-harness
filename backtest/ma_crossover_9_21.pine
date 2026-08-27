@@ -1,0 +1,75 @@
+//@version=5
+// MA Crossover 9/21 — paper research strategy (mirrors the local bot)
+//
+// Honesty properties:
+// - Signals computed on closed candles only; orders fill at the signal bar's
+//   close (process_orders_on_close) — no repainting, no future data.
+// - All costs are folded into commission_value (default 0.05% per side
+//   = 10 bps round trip, matching the bot's FEE_BPS=10). TradingView's
+//   `slippage` parameter is in TICKS (0.01 on BTCUSDT ≈ nothing), so it is
+//   left at 0 and costs are modeled via commission instead.
+// - The date window inputs make in-sample / out-of-sample splits explicit:
+//   run once with the IS window, once with the OOS window, and never tune
+//   parameters on the OOS run.
+strategy("MA Cross 9/21 (paper research)", overlay=true,
+     initial_capital=100000,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=10,
+     commission_type=strategy.commission.percent,
+     commission_value=0.05,
+     slippage=0,
+     process_orders_on_close=true,
+     calc_on_every_tick=false,
+     pyramiding=0)
+
+// ---------- Inputs ----------
+fastLen     = input.int(9,  "Fast SMA length", minval=1)
+slowLen     = input.int(21, "Slow SMA length", minval=2)
+allowShorts = input.bool(true,  "Allow shorts (stop-and-reverse)", tooltip="Off = long-only: bearish cross just exits the long.")
+useTimeExit = input.bool(false, "Also exit after N bars", tooltip="Mirrors the local bot's fixed 12-candle scoring horizon.")
+exitBars    = input.int(12, "N bars for time exit", minval=1)
+useRegime   = input.bool(false, "HTF regime filter (Trial 02)", tooltip="Entries only with the higher-timeframe trend; opposite cross still exits. Pre-registered in docs/trial_02_htf_regime_filter.md.")
+htfTf       = input.timeframe("60", "HTF timeframe")
+htfMaLen    = input.int(50, "HTF trend SMA length")
+startDate   = input.time(timestamp("1 May 2026 00:00 +0000"), "Test window start")
+endDate     = input.time(timestamp("1 Jan 2030 00:00 +0000"), "Test window end")
+
+inWindow = time >= startDate and time <= endDate
+
+// ---------- Signals (closed-candle values only) ----------
+fastMA = ta.sma(close, fastLen)
+slowMA = ta.sma(close, slowLen)
+bullCross = ta.crossover(fastMA, slowMA)
+bearCross = ta.crossunder(fastMA, slowMA)
+
+plot(fastMA, "Fast MA", color=color.new(color.teal, 0), linewidth=2)
+plot(slowMA, "Slow MA", color=color.new(color.orange, 0), linewidth=2)
+
+// ---------- HTF regime (non-repainting: previous CONFIRMED HTF bar) ----------
+htfMaVal = request.security(syminfo.tickerid, htfTf, ta.sma(close, htfMaLen)[1], lookahead=barmerge.lookahead_off)
+htfClose = request.security(syminfo.tickerid, htfTf, close[1], lookahead=barmerge.lookahead_off)
+longOk   = not useRegime or (not na(htfMaVal) and htfClose > htfMaVal)
+shortOk  = not useRegime or (not na(htfMaVal) and htfClose < htfMaVal)
+
+// ---------- Entries / exits (regime gates ENTRIES only; opposite cross still exits) ----------
+if inWindow and bullCross
+    if longOk
+        strategy.entry("Long", strategy.long)
+    else
+        strategy.close("Short", comment="bull cross exit (long entry regime-filtered)")
+
+if inWindow and bearCross
+    if allowShorts and shortOk
+        strategy.entry("Short", strategy.short)
+    else
+        strategy.close("Long", comment=allowShorts and not shortOk ? "bear cross exit (short entry regime-filtered)" : "bear cross exit")
+
+// Optional fixed-horizon exit, to compare against the bot's 12-candle scoring
+if useTimeExit and strategy.opentrades > 0
+    barsHeld = bar_index - strategy.opentrades.entry_bar_index(strategy.opentrades - 1)
+    if barsHeld >= exitBars
+        strategy.close_all(comment="time exit (" + str.tostring(exitBars) + " bars)")
+
+// Keep the IS/OOS split clean: flat outside the test window
+if not inWindow and strategy.position_size != 0
+    strategy.close_all(comment="outside test window")
