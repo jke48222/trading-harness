@@ -1,0 +1,30 @@
+{
+  "name": "paper-trading-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Paper-trading bot with a two-file memory system. Real market data, simulated orders only — no live trading path exists.",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "scan": "tsx src/index.ts scan",
+    "score": "tsx src/index.ts score",
+    "replay:raw": "tsx src/index.ts replay:raw",
+    "replay:memory": "tsx src/index.ts replay:memory",
+    "memory:reset": "tsx src/index.ts memory:reset",
+    "positions": "tsx src/index.ts positions",
+    "report": "tsx src/index.ts report",
+    "dashboard": "tsx src/dashboard/server.ts",
+    "test": "node --import tsx --test test/*.test.ts",
+    "health": "tsx src/index.ts health",
+    "tsmom:monitor": "tsx scripts/tsmom_monitor.ts",
+    "broker:check": "tsx src/index.ts broker:check",
+    "broker:preview": "tsx src/index.ts broker:preview"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

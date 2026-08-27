@@ -1,0 +1,18 @@
+# Dependencies and build output
+node_modules/
+dist/
+
+# Secrets. .env holds the Alpaca paper key id and secret. Never commit it.
+# .env.example documents every variable with placeholder values instead.
+.env
+.env.local
+*.key
+
+# Scan and monitor logs. Tens of megabytes, regenerable, and specific to one
+# machine's run history. The pre-registration ledger and the trial results in
+# data/*.csv are the actual research record and ARE tracked.
+*.log
+data/*.log
+
+# OS noise
+.DS_Store
