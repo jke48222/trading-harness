@@ -1,8 +1,12 @@
 # Paper Trading Bot
 
+[![License](https://img.shields.io/github/license/jke48222/trading-harness)](LICENSE) ![Top language](https://img.shields.io/github/languages/top/jke48222/trading-harness) ![orders](https://img.shields.io/badge/orders-paper%20only%2C%20no%20broker-important)
+
 A TypeScript paper-trading bot that runs a 9/21 moving-average crossover on real BTCUSDT market data, remembers every trade and skip in a two-file memory system, and refuses to repeat setups it has genuinely lost on.
 
 **It cannot place real orders.** There is no broker endpoint, no API-key requirement, and no live code path anywhere in `src/`. Execution is simulation only.
+
+![9/21 moving-average crossover backtest, 2026-07-15](backtest/ma_cross_9_21_backtest_2026-07-15.png)
 
 ## What it does
 
@@ -96,3 +100,7 @@ launchd never overlaps runs, so ledger writes stay serialized.
 - ~500 candles of 5m data ≈ 41 hours — an in-sample snapshot, not a validated edge. Regime changes will change results.
 - A 9/21 crossover on 5m is a teaching strategy, not an edge claim. Validate before trusting it with anything.
 - Two-file memory is right for this stage; if you become high-frequency, migrate the ledger to a database (Supabase/Firebase) as the video suggests.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
