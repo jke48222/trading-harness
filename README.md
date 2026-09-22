@@ -10,7 +10,7 @@ A TypeScript paper-trading bot that runs a 9/21 moving-average crossover on real
 
 ## What it does
 
-- **Brain:** deterministic strategy code (built and iterated with Claude); **data:** Binance public klines (no key needed); **memory:** `data/ledger.csv` + `data/learnings.md`.
+- **Brain:** deterministic strategy code (built and iterated with an assistant); **data:** Binance public klines (no key needed); **memory:** `data/ledger.csv` + `data/learnings.md`.
 - Strategy: BUY when the 9-period MA crosses above the 21-period MA, SELL when it crosses below, HOLD otherwise — closed candles only, so signals never repaint.
 - Risk: configurable order quantity and max position; anything that would exceed limits becomes SKIP with the reason logged.
 - Memory: before any BUY/SELL the bot checks whether this symbol has really lost on this setup before (≥ 2 recorded losses, net negative, with a learnings warning) and skips known bad trades.

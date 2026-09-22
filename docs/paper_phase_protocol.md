@@ -41,7 +41,7 @@ All of the following, sustained, before the $300 conversation is evidence-based 
 3. **Regime monitor: no ALARM** at decision time.
 4. **Evidence status reviewed honestly:** as of registration, every strategy is *watch* (Trial 06) with portfolio-level historical support only (Trial 07, OOS-era statistically silent). The base rates from three research runs stand: most retail algo traders lose; costs are the dominant force at this account size.
 5. **A final fidelity period before any real deployment:** the last 2+ weeks of paper run at the actual planned real scale (e.g., $300 total, $100/position) so the habits being promoted are the ones that transfer — the $100k breadth phase discovers, the fidelity phase rehearses.
-6. **The user consciously amends §2** (paper-only) in `trading_bot_instructions.md`, holds the keys, and owns the switch. No prompt, agent, or assistant flips it — and Claude never executes real trades.
+6. **The user consciously amends §2** (paper-only) in `trading_bot_instructions.md`, holds the keys, and owns the switch. No prompt, agent, or assistant flips it — and the assistant never executes real trades.
 
 ## Reliability & deferred decisions (recorded 2026-07-15)
 
