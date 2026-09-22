@@ -5,8 +5,8 @@ This build executed Prompts 03–06 directly with the PDF's safe defaults. Promp
 
 | # | Prompt | Status | Notes |
 |---|---|---|---|
-| 01 | Connect MCP to Claude before build | **Done 2026-07-14** | Alpaca PAPER account verified read-only (account/positions/orders/clock/market data, zero orders touched). MCP server ✔ Connected (`uvx alpaca-mcp-server`, paper mode pinned). `broker:check`/`broker:preview` added. Connection report in session notes + `trading_bot_instructions.md` §5. |
-| 02 | Backtest strategy with TradingView | **Ready to run — needs you (~10 min)** | Pine Script v5 strategy at `backtest/ma_crossover_9_21.pine`; exact procedure + metrics template in `docs/tradingview_backtest.md`. TradingView MCP machine setup done by Claude; needs TradingView Desktop app installed + logged in for MCP mode, or just use the manual browser steps today. Paste results into `trading_bot_instructions.md` §3. |
+| 01 | Connect MCP to the assistant before build | **Done 2026-07-14** | Alpaca PAPER account verified read-only (account/positions/orders/clock/market data, zero orders touched). MCP server ✔ Connected (`uvx alpaca-mcp-server`, paper mode pinned). `broker:check`/`broker:preview` added. Connection report in session notes + `trading_bot_instructions.md` §5. |
+| 02 | Backtest strategy with TradingView | **Ready to run — needs you (~10 min)** | Pine Script v5 strategy at `backtest/ma_crossover_9_21.pine`; exact procedure + metrics template in `docs/tradingview_backtest.md`. TradingView MCP machine setup done by the assistant; needs TradingView Desktop app installed + logged in for MCP mode, or just use the manual browser steps today. Paste results into `trading_bot_instructions.md` §3. |
 | 03 | Create the instructions file | **Done** | `trading_bot_instructions.md` written with safe paper defaults; open items marked for your answers. |
 | 04 | First build without memory | **Done** | Full TypeScript bot: real Binance public data, 9/21 crossover, risk module, paper execution, `scan` + `replay:raw`. |
 | 05 | Add memory system and run comparison | **Done** | `data/ledger.csv`, `data/learnings.md`, `src/memory.ts`, `src/adaptiveFilter.ts`, `replay:memory`, `memory:reset`; raw-vs-memory comparison printed honestly. |
@@ -15,12 +15,12 @@ This build executed Prompts 03–06 directly with the PDF's safe defaults. Promp
 ## Prompt 01 — exact prompt to paste when you're ready
 
 ```
-Help me connect my broker or exchange MCP/API to Claude before we build the trading bot.
+Help me connect my broker or exchange MCP/API to my assistant before we build the trading bot.
 Do not write bot code yet. First guide me through the connection safely.
 Start by asking me these questions if the answers are not obvious:
 - Which venue: Alpaca, Pionex, Binance, Bybit, another crypto exchange, or another brokerage?
 - Trading stocks, crypto, or both?
-- Which Claude environment: Claude Desktop, Claude Code, Claude in the browser, Cursor with Claude, or another client?
+- Which assistant client?
 - Am I using paper/test mode? If not, stop and tell me to create a paper/test setup first.
 - Market-data-only permissions first, or paper-trading permissions?
 Connection rules: paper/test mode only, no live trading, no order placed, no API keys pasted into chat or source code, no secrets logged, no credentials exposed to frontend code. If an exchange supports sub-accounts or restricted API keys, recommend that restricted paper/test setup first.
@@ -45,7 +45,7 @@ Return: the strategy hypothesis, the exact rules tested, Pine Script if needed, 
 
 ## After 01 + 02
 
-Paste both outputs into `trading_bot_instructions.md` (§3 strategy rules, §5 broker rules), then ask Claude to add the `src/broker/` paper adapter with `broker:check` / `broker:preview` scripts — paper mode only, keys in the MCP client config, never in source.
+Paste both outputs into `trading_bot_instructions.md` (§3 strategy rules, §5 broker rules), then ask the assistant to add the `src/broker/` paper adapter with `broker:check` / `broker:preview` scripts — paper mode only, keys in the MCP client config, never in source.
 
 ## The video's operating advice (transcript distillation)
 

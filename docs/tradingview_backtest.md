@@ -36,17 +36,17 @@ TradingView backtest (BINANCE:BTCUSDT 5m, run <date>):
 
 Rule of thumb: adopt the rule set only if the **out-of-sample** run has ≥30 trades, profit factor > 1.1, and a max drawdown you'd actually sit through. An OOS profit factor near or below 1.0 after costs means the raw crossover has no edge in that window — expected for fast MA crosses in chop; that's what filters (regime/HTF trend) are for, which is Week 2+ of the research plan.
 
-## D. TradingView MCP (so Claude can run this for you next time)
+## D. TradingView MCP (so the assistant can run this for you next time)
 
 From your copy-paste kit (tradesdontlie/tradingview-mcp). Machine setup status as of 2026-07-14:
 
 | Piece | Status |
 |---|---|
-| MCP repo cloned to `~/tradingview-mcp` + `npm install` | see session notes — installed by Claude |
-| MCP registered in Claude Code (`claude mcp list` → `tradingview`) | installed by Claude |
-| `~/tradingview-mcp/rules.json` (your watchlist/bias/risk config) | created by Claude |
-| Permissions pre-approval `mcp__tradingview__*` | added by Claude |
+| MCP repo cloned to `~/tradingview-mcp` + `npm install` | see session notes — installed by the assistant |
+| MCP registered with the assistant | installed by the assistant |
+| `~/tradingview-mcp/rules.json` (your watchlist/bias/risk config) | created by the assistant |
+| Permissions pre-approval `mcp__tradingview__*` | added by the assistant |
 | **TradingView Desktop app** | **required — install if missing** ([tradingview.com/desktop](https://www.tradingview.com/desktop/)) |
 | Active TradingView subscription + login in the desktop app | **you** |
 
-To use it: launch TradingView Desktop with the debug port (`/Applications/TradingView.app/Contents/MacOS/TradingView --remote-debugging-port=9222`, or ask Claude to run `tv_launch`), start a **fresh** Claude Code session in this folder, then ask: *"Run tv_health_check. If cdp_connected is true, add my strategy from backtest/ma_crossover_9_21.pine to the BINANCE:BTCUSDT 5m chart and run the backtest per docs/tradingview_backtest.md."*
+To use it: launch TradingView Desktop with the debug port (`/Applications/TradingView.app/Contents/MacOS/TradingView --remote-debugging-port=9222`, or ask the assistant to run `tv_launch`), start a **fresh** the assistant Code session in this folder, then ask: *"Run tv_health_check. If cdp_connected is true, add my strategy from backtest/ma_crossover_9_21.pine to the BINANCE:BTCUSDT 5m chart and run the backtest per docs/tradingview_backtest.md."*
