@@ -10,7 +10,7 @@
   <array>
     <string>/bin/zsh</string>
     <string>-lc</string>
-    <string>cd __ROOT__ || exit 1; __NPM__ run health &gt;&gt; data/health.log 2&gt;&amp;1 || /usr/bin/osascript -e 'display notification "Health check failed: see data/health.log" with title "Trading bot alert"'</string>
+    <string>cd __ROOT__ || { /usr/bin/osascript -e 'display notification "The health check cannot reach its folder" with title "Trading bot alert"'; exit 1; }; __NPM__ run health &gt;&gt; data/health.log 2&gt;&amp;1 || /usr/bin/osascript -e 'display notification "Health check failed: see data/health.log" with title "Trading bot alert"'</string>
   </array>
   <key>StartInterval</key>
   <integer>1800</integer>

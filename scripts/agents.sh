@@ -19,6 +19,26 @@ RETIRED=(scan)
 
 label() { echo "com.jalenedusei.trading.$1"; }
 
+# The paths go into a sed replacement, an XML plist and a shell command line.
+# Refuse anything outside a plain character set rather than escape all three.
+for p in "$ROOT" "$NPM"; do
+  if [[ ! "$p" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+    echo "refusing: '$p' has characters (spaces, quotes, &, \$ ...) the agents can't run safely; move the checkout to a plain path" >&2
+    exit 1
+  fi
+done
+
+running() { launchctl print "$DOMAIN/$(label "$1")" 2>/dev/null | grep -qE '^[[:space:]]+state = running'; }
+
+wait_until_gone() {
+  for _ in $(seq 1 50); do
+    launchctl print "$DOMAIN/$(label "$1")" >/dev/null 2>&1 || return 0
+    sleep 0.2
+  done
+  echo "$(label "$1") did not unload within 10 s" >&2
+  return 1
+}
+
 case "${1:-status}" in
   install)
     mkdir -p "$DEST"
@@ -27,6 +47,16 @@ case "${1:-status}" in
       launchctl disable "$DOMAIN/$(label "$a")"
       echo "retired $(label "$a")"
     done
+    # Unloading the book mid-scan would kill it between an order and its row.
+    for _ in $(seq 1 60); do
+      running tsmom-daily || break
+      echo "waiting for the running book scan to finish..."
+      sleep 5
+    done
+    if running tsmom-daily; then
+      echo "the book scan is still running after 5 minutes; try again later" >&2
+      exit 1
+    fi
     for a in "${AGENTS[@]}"; do
       src="$ROOT/ops/launchd/$(label "$a").plist"
       dst="$DEST/$(label "$a").plist"
@@ -34,6 +64,8 @@ case "${1:-status}" in
       plutil -lint "$dst.tmp" > /dev/null
       mv "$dst.tmp" "$dst"
       launchctl bootout "$DOMAIN/$(label "$a")" 2>/dev/null || true
+      wait_until_gone "$a"
+      launchctl enable "$DOMAIN/$(label "$a")"
       launchctl bootstrap "$DOMAIN" "$dst"
       echo "loaded $(label "$a") from $dst"
     done
