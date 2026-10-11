@@ -20,6 +20,10 @@ export const BOOK_ENV: Readonly<Record<string, string>> = Object.freeze({
   STRATEGY: 'tsmom',
   INTERVAL: '1d',
   TSMOM_LOOKBACK: '28',
+  // Trial 09's v2: votes over 7, 14, 28 and 56 days, enter at 3, exit at 1 or fewer.
+  TSMOM_LOOKBACKS: '7,14,28,56',
+  TSMOM_ENTER_VOTES: '3',
+  TSMOM_EXIT_VOTES: '1',
   EVAL_HORIZON: '28',
   FEE_BPS: '30',
   BUDGET: '100000',
