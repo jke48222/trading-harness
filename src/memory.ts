@@ -1,7 +1,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { CONFIG } from './config';
-import { withLedgerLock } from './locks';
+import { assertLedgerLockHeld, withLedgerLock } from './locks';
 import type { LedgerRow } from './types';
 
 const LEDGER_HEADER = 'timestamp,symbol,action,price,quantity,reason,mode,outcome,pnl';
@@ -24,10 +24,20 @@ export function ensureMemoryFiles(): void {
   if (!fs.existsSync(learningsPath())) fs.writeFileSync(learningsPath(), LEARNINGS_HEADER);
 }
 
+/** Write a whole file atomically (temp file + rename), so a reader never sees half of it. */
+function writeAtomic(file: string, body: string): void {
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, body);
+  fs.renameSync(tmp, file);
+}
+
 export function resetMemory(): void {
-  fs.mkdirSync(CONFIG.dataDir, { recursive: true });
-  fs.writeFileSync(ledgerPath(), LEDGER_HEADER + '\n');
-  fs.writeFileSync(learningsPath(), LEARNINGS_HEADER);
+  withLedgerLock(() => {
+    fs.mkdirSync(CONFIG.dataDir, { recursive: true });
+    assertLedgerLockHeld();
+    writeAtomic(ledgerPath(), LEDGER_HEADER + '\n');
+    writeAtomic(learningsPath(), LEARNINGS_HEADER);
+  });
 }
 
 export function csvEscape(value: string): string {
@@ -75,8 +85,23 @@ function rowLine(row: LedgerRow): string {
 export function appendLedgerRow(row: LedgerRow): void {
   withLedgerLock(() => {
     ensureMemoryFiles();
+    assertLedgerLockHeld();
     fs.appendFileSync(ledgerPath(), rowLine(row) + '\n');
   });
+}
+
+/** Remove ledger temp files left by a crashed writer (older than an hour). */
+function sweepStaleTemps(): void {
+  try {
+    const base = path.basename(ledgerPath());
+    for (const name of fs.readdirSync(CONFIG.dataDir)) {
+      if (!name.startsWith(`${base}.`) || !name.endsWith('.tmp')) continue;
+      const file = path.join(CONFIG.dataDir, name);
+      if (Date.now() - fs.statSync(file).mtimeMs > 3_600_000) fs.rmSync(file, { force: true });
+    }
+  } catch {
+    /* best effort */
+  }
 }
 
 /**
@@ -88,10 +113,12 @@ export function appendLedgerRow(row: LedgerRow): void {
 export function writeLedger(rows: LedgerRow[]): void {
   withLedgerLock(() => {
     ensureMemoryFiles();
+    sweepStaleTemps();
     const lines = rows.map(rowLine);
     const body = LEDGER_HEADER + '\n' + lines.join('\n') + (lines.length ? '\n' : '');
     const tmp = `${ledgerPath()}.${process.pid}.tmp`;
     fs.writeFileSync(tmp, body);
+    assertLedgerLockHeld(); // a stalled holder whose lock was taken over must not rename over the new holder's write
     fs.renameSync(tmp, ledgerPath());
   });
 }
@@ -207,18 +234,23 @@ export function loadLearnings(): string {
  * near-duplicates.
  */
 export function upsertLesson(tag: string, text: string): void {
-  ensureMemoryFiles();
-  const marker = `[${tag}]`;
-  const lessonLine = `- ${marker} ${text}`;
-  const lines = loadLearnings().split('\n');
-  const idx = lines.findIndex((l) => l.includes(marker));
-  if (idx >= 0) {
-    lines[idx] = lessonLine;
-  } else {
-    while (lines.length > 0 && lines[lines.length - 1].trim() === '') lines.pop();
-    lines.push(lessonLine);
-  }
-  fs.writeFileSync(learningsPath(), lines.join('\n').replace(/\n*$/, '\n'));
+  // Same lock as the ledger: two scorers refreshing lessons at once would
+  // otherwise each rewrite the file from their own stale copy.
+  withLedgerLock(() => {
+    ensureMemoryFiles();
+    const marker = `[${tag}]`;
+    const lessonLine = `- ${marker} ${text}`;
+    const lines = loadLearnings().split('\n');
+    const idx = lines.findIndex((l) => l.includes(marker));
+    if (idx >= 0) {
+      lines[idx] = lessonLine;
+    } else {
+      while (lines.length > 0 && lines[lines.length - 1].trim() === '') lines.pop();
+      lines.push(lessonLine);
+    }
+    assertLedgerLockHeld();
+    writeAtomic(learningsPath(), lines.join('\n').replace(/\n*$/, '\n'));
+  });
 }
 
 export function learningsWarnsAbout(tag: string): boolean {

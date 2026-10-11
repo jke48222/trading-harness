@@ -17,6 +17,7 @@ process.env.EVAL_HORIZON = '2';
 process.env.FEE_BPS = '30';
 process.env.ALPACA_PAPER_KEY_ID = 'test-key';
 process.env.ALPACA_PAPER_SECRET = 'test-secret';
+process.env.LOCK_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'bot-locks-'));
 
 const memory = await import('../src/memory.ts');
 const locks = await import('../src/locks.ts');
@@ -51,7 +52,7 @@ test('a live process holding the ledger lock blocks writers; a dead one is taken
   const lockFile = path.join(process.env.DATA_DIR as string, '.ledger.lock');
   const child = spawn('sleep', ['5']);
   await new Promise((r) => setTimeout(r, 50));
-  fs.writeFileSync(lockFile, JSON.stringify({ pid: child.pid, at: Date.now() }));
+  fs.writeFileSync(lockFile, JSON.stringify({ pid: child.pid, at: Date.now(), token: 'other' }));
   assert.throws(() => locks.withLedgerLock(() => 1, 200), /locked by another process/);
   child.kill('SIGKILL');
   await new Promise((r) => child.once('exit', r));
@@ -71,3 +72,41 @@ test('run lock: a second holder is refused while the first lives', () => {
   assert.ok(again);
   again();
 });
+
+test('an empty lock file left by a crash is taken over once it is a few seconds old', () => {
+  const lockFile = path.join(process.env.DATA_DIR as string, '.ledger.lock');
+  fs.writeFileSync(lockFile, '');
+  assert.throws(() => locks.withLedgerLock(() => 1, 200), /locked by another process/, 'a fresh empty file may be a lock being written');
+  const old = new Date(Date.now() - 60_000);
+  fs.utimesSync(lockFile, old, old);
+  assert.equal(locks.withLedgerLock(() => 2, 2000), 2);
+  assert.equal(fs.existsSync(lockFile), false);
+});
+
+test('a writer whose lock was taken over refuses to write', () => {
+  memory.resetMemory();
+  const lockFile = path.join(process.env.DATA_DIR as string, '.ledger.lock');
+  assert.throws(
+    () =>
+      locks.withLedgerLock(() => {
+        // Simulate a stall long enough for another process to break the lock and take it.
+        fs.writeFileSync(lockFile, JSON.stringify({ pid: process.pid, at: Date.now(), token: 'someone-else' }));
+        memory.appendLedgerRow(row({ timestamp: '2026-08-01T00:00:00.000Z', symbol: 'A' }));
+      }),
+    /Lost the ledger lock/
+  );
+  assert.equal(memory.loadLedger().length, 0, 'nothing was written');
+  assert.equal(fs.existsSync(lockFile), true, "release leaves another holder's lock in place");
+  fs.rmSync(lockFile);
+});
+
+test('the ledger lock refuses an async callback', () => {
+  assert.throws(() => locks.withLedgerLock(async () => 1), /synchronous/);
+});
+
+test('run locks are shared per broker account, outside the data directory', () => {
+  const p = locks.runLockPath('book');
+  assert.ok(p.startsWith(process.env.LOCK_DIR as string));
+  assert.match(path.basename(p), /^book-[0-9a-f]{12}\.lock$/);
+});
+
