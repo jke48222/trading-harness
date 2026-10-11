@@ -11,7 +11,7 @@
   <array>
     <string>/bin/zsh</string>
     <string>-lc</string>
-    <string>cd __ROOT__ || exit 1; __NPM__ run tsmom:monitor &gt;&gt; data/monitor.log 2&gt;&amp;1</string>
+    <string>cd __ROOT__ || { /usr/bin/osascript -e 'display notification "The regime monitor cannot reach its folder" with title "Trading bot alert"'; exit 1; }; __NPM__ run tsmom:monitor &gt;&gt; data/monitor.log 2&gt;&amp;1 || { rc=$?; /usr/bin/osascript -e 'display notification "The regime monitor failed: see data/monitor.log" with title "Trading bot alert"'; exit $rc; }</string>
   </array>
   <key>StartCalendarInterval</key>
   <array>
@@ -57,6 +57,6 @@
     </dict>
   </array>
   <key>StandardErrorPath</key>
-  <string>__ROOT__/data/monitor-launchd.err.log</string>
+  <string>__LOGS__/tsmom-monitor.err.log</string>
 </dict>
 </plist>

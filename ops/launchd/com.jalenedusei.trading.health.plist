@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- Every 30 min: npm run health. Any PROBLEM exits 1 and posts a macOS notification. Not run at load:
+<!-- Every 30 min: npm run health. A PROBLEM posts a macOS notification and exits 2; exit 1 means it crashed
+     or could not post, and only then does this job post its own fallback notification. Not run at load:
      installed next to the book agent, it would check before the book's first heartbeat and raise a false alarm. -->
 <plist version="1.0">
 <dict>
@@ -10,13 +11,13 @@
   <array>
     <string>/bin/zsh</string>
     <string>-lc</string>
-    <string>cd __ROOT__ || { /usr/bin/osascript -e 'display notification "The health check cannot reach its folder" with title "Trading bot alert"'; exit 1; }; __NPM__ run health &gt;&gt; data/health.log 2&gt;&amp;1 || /usr/bin/osascript -e 'display notification "Health check failed: see data/health.log" with title "Trading bot alert"'</string>
+    <string>cd __ROOT__ || { /usr/bin/osascript -e 'display notification "The health check cannot reach its folder" with title "Trading bot alert"'; exit 1; }; __NPM__ run health &gt;&gt; data/health.log 2&gt;&amp;1; rc=$?; case $rc in 0|2) ;; *) /usr/bin/osascript -e 'display notification "Health check failed: see data/health.log" with title "Trading bot alert"' ;; esac; exit $rc</string>
   </array>
   <key>StartInterval</key>
   <integer>1800</integer>
   <key>RunAtLoad</key>
   <false/>
   <key>StandardErrorPath</key>
-  <string>__ROOT__/data/health-launchd.err.log</string>
+  <string>__LOGS__/health.err.log</string>
 </dict>
 </plist>

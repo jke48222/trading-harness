@@ -13,6 +13,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 NPM="$(command -v npm)"
 DEST="$HOME/Library/LaunchAgents"
+# launchd's own stderr for each job. Outside the checkout on purpose: launchd
+# creates this file's folder before the job starts, so under the checkout it
+# would recreate part of a moved or deleted one, and the job's own check for
+# a missing folder (and its notification) would never fire.
+LOGS="$HOME/Library/Logs/trading-harness"
 DOMAIN="gui/$(id -u)"
 AGENTS=(tsmom-daily health tsmom-monitor)
 RETIRED=(scan)
@@ -21,7 +26,7 @@ label() { echo "com.jalenedusei.trading.$1"; }
 
 # The paths go into a sed replacement, an XML plist and a shell command line.
 # Refuse anything outside a plain character set rather than escape all three.
-for p in "$ROOT" "$NPM"; do
+for p in "$ROOT" "$NPM" "$LOGS"; do
   if [[ ! "$p" =~ ^[A-Za-z0-9._/-]+$ ]]; then
     echo "refusing: '$p' has characters (spaces, quotes, &, \$ ...) the agents can't run safely; move the checkout to a plain path" >&2
     exit 1
@@ -29,6 +34,17 @@ for p in "$ROOT" "$NPM"; do
 done
 
 running() { launchctl print "$DOMAIN/$(label "$1")" 2>/dev/null | grep -qE '^[[:space:]]+state = running'; }
+
+# Unloading the book mid-scan would kill it between an order and its row.
+wait_for_book_scan() {
+  for _ in $(seq 1 60); do
+    running tsmom-daily || return 0
+    echo "waiting for the running book scan to finish..."
+    sleep 5
+  done
+  echo "the book scan is still running after 5 minutes; try again later" >&2
+  return 1
+}
 
 wait_until_gone() {
   for _ in $(seq 1 50); do
@@ -41,26 +57,17 @@ wait_until_gone() {
 
 case "${1:-status}" in
   install)
-    mkdir -p "$DEST"
+    mkdir -p "$DEST" "$LOGS"
     for a in "${RETIRED[@]}"; do
       launchctl bootout "$DOMAIN/$(label "$a")" 2>/dev/null || true
       launchctl disable "$DOMAIN/$(label "$a")"
       echo "retired $(label "$a")"
     done
-    # Unloading the book mid-scan would kill it between an order and its row.
-    for _ in $(seq 1 60); do
-      running tsmom-daily || break
-      echo "waiting for the running book scan to finish..."
-      sleep 5
-    done
-    if running tsmom-daily; then
-      echo "the book scan is still running after 5 minutes; try again later" >&2
-      exit 1
-    fi
+    wait_for_book_scan || exit 1
     for a in "${AGENTS[@]}"; do
       src="$ROOT/ops/launchd/$(label "$a").plist"
       dst="$DEST/$(label "$a").plist"
-      sed -e "s#__ROOT__#$ROOT#g" -e "s#__NPM__#$NPM#g" "$src" > "$dst.tmp"
+      sed -e "s#__ROOT__#$ROOT#g" -e "s#__NPM__#$NPM#g" -e "s#__LOGS__#$LOGS#g" "$src" > "$dst.tmp"
       plutil -lint "$dst.tmp" > /dev/null
       mv "$dst.tmp" "$dst"
       launchctl bootout "$DOMAIN/$(label "$a")" 2>/dev/null || true
@@ -80,6 +87,7 @@ case "${1:-status}" in
     done
     ;;
   uninstall)
+    wait_for_book_scan || exit 1
     for a in "${AGENTS[@]}"; do
       launchctl bootout "$DOMAIN/$(label "$a")" 2>/dev/null || true
       rm -f "$DEST/$(label "$a").plist"
