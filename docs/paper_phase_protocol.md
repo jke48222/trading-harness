@@ -1,54 +1,61 @@
-# Paper Phase Protocol (pre-registered 2026-07-15)
+# Paper phase protocol
 
-The operating rules for the autonomous paper-trading phase: what runs, how it is judged, and the gates between here and the planned **$300 real budget**. Written before the phase produces results, per house discipline.
+Registered 2026-07-15, before the paper phase produced results; amended as listed at the end. These are the operating rules for the autonomous paper book: what runs, what "working" means, and the gates between here and any real money. The real-money decision is Jalen's alone.
 
-## What runs (the machine)
+## What runs
 
-| Agent | Cadence | What it does |
-|---|---|---|
-| `com.jalenedusei.trading.scan` | every 5 min | 5m sma-cross universe (BTC/ETH/SOL/SPY/QQQ), **simulation only** — the family is rejected; its remaining value is exercising the pipeline and measuring the memory system's counterfactuals |
-| `com.jalenedusei.trading.tsmom-daily` | hourly | **The book (amended 2026-07-15 per user: full $100k for breadth discovery):** REAL paper orders across the 56-symbol universe (32 Alpaca-tradable cryptos ∩ Binance data + 24 top-liquidity stocks/ETFs), running the **state construction that passed Trial 07** — long whenever 28d momentum is positive, exit when it flips; $2,000/position, max 50 positions, $100k cap. Also runs the registered flip-entry watch tests (ETH/BNB/ADA/LINK) and SOL both-sides in simulation, unchanged. |
-| `com.jalenedusei.trading.tsmom-monitor` | monthly (1st) | Recomputes the Trial 07 portfolio construction → `data/monitor_tsmom.csv` |
+| Agent (launchd label) | Cadence | Heartbeat | What it does |
+|---|---|---|---|
+| `com.jalenedusei.trading.tsmom-daily` | hourly | `book`, `watch-flip`, `watch-sol` | **The book:** real orders on the Alpaca paper account across the 56-symbol universe (`SYMBOLS=@book`: 32 cryptos, 24 US stocks and ETFs), running Trial 07's state construction: long while 28-day momentum is positive, sell when it turns. $2,000 per position before volatility scaling, at most 50 positions, $100,000 budget. Then two simulations: the flip-entry watch test (ETH, BNB, ADA, LINK, long only) and SOL both sides. |
+| `com.jalenedusei.trading.health` | every 30 min | none | `npm run health`; a macOS notification on any PROBLEM |
+| `com.jalenedusei.trading.tsmom-monitor` | 06:00 local on the 1st | none | Recomputes Trial 07's construction into `data/monitor_tsmom.csv` and checks the regime alarm |
 
-Execution safety: orders go only to the hardcoded paper host; no pyramiding, one action per signal candle, exits automatic (state-flip for the book, horizon for flip-entry rows). Every fill logs slippage vs signal close (for daily state entries this includes intraday drift since the signal candle — systematic and measured, not a bug); every exit logs actual P&L next to the model score. `npm run report` shows the per-symbol book with sample sizes — **per-symbol "best" rankings are noise until a symbol has dozens of completed trips (the Trial 06 lesson applies to forward data too).**
+The plists live in `ops/launchd/`; `scripts/agents.sh install` renders and loads them. The 5m crossover scanner (`com.jalenedusei.trading.scan`) was retired on 2026-10-11.
 
-## Daily operational criteria (what "working" means)
+Execution safety: orders go only to the hardcoded paper host. Every order settles (filled, partly filled, or canceled after `ORDER_TIMEOUT_SEC`); nothing rests at the broker between scans. One action per signal candle, no pyramiding, one book scan at a time (run lock). Entries skip when the quoted spread exceeds `MAX_SPREAD_BPS`. New crypto entries only fire in the two hours after the 00:00 UTC close; stock orders wait for the open.
 
-1. Agents fired on schedule, or the gap is explained (Mac sleep — tolerated for daily, noted for 5m).
-2. Every signal was acted on exactly once (dedup) or skipped with a stated reason.
-3. Matured trades scored against real candles; broker exits fired at horizon (or deferred to market open with a log line).
-4. No unhandled `BLOCKED:` errors; no invented data anywhere.
-5. Budget guards held: never >3 positions or >$300 deployed.
+## Daily criteria (what "working" means)
 
-## Weekly review checklist
+1. The book's heartbeat is under 130 minutes old, or the gap is explained (the Mac was asleep).
+2. Every signal was acted on once or skipped with a stated reason. No order was refused by the broker.
+3. No bot order is resting at the broker, and every broker position has an open ledger entry.
+4. Exits fired on the momentum flip, or were deferred to the next stock open with a log line.
+5. No invented data anywhere: a symbol whose data is missing is reported and skipped.
 
-- `npm run positions` — open positions vs budget.
-- `tail data/tsmom-scan.log data/scan.log` — errors, gaps, refused duplicates.
-- Ledger integrity: every `alpaca-paper` entry eventually gets a model score AND an `alpaca-paper-exit` actual; compare the pair (model vs actual gap = measured execution cost).
-- Slippage stats: average fill slippage vs signal close (crypto ~spread; stocks include overnight gap — expected, measured, not a bug).
-- `data/monitor_tsmom.csv` — regime status.
+`npm run health` checks 1 to 4 and pages when they fail.
 
-## Pre-registered regime alarm (Trial 07's forward role)
+## Weekly review
 
-- **ALARM:** trailing-12-month portfolio timing excess < 0 → the historical effect is not visible in the last year; the family's evidentiary basis is failing forward. Consequence: real-money promotion is frozen regardless of other gates.
-- Warning: trailing-6 < 0 with trailing-12 ≥ 0 → note it, no action.
+- `npm run health` and `npm run positions`.
+- `npm run reconcile`: the ledger should agree with broker fills (the three July setup trips are reported as manual and stay as they are).
+- `npm run report`: round trips by sleeve, the gap between the model and the fills, fees.
+- `npm run perf`: the account against BTC, SPY and an equal-weight hold of the universe.
+- `data/monitor_tsmom.csv`: regime status.
 
-## Promotion gates to the real $300 (process guidance — the decision itself is the user's)
+## Regime alarm (Trial 07's forward role)
 
-All of the following, sustained, before the $300 conversation is evidence-based rather than hope-based:
-1. **≥4 consecutive weeks of clean operations** (daily criteria met; incidents fixed and documented).
-2. **≥10 completed real-fill round trips** with the model-vs-actual gap quantified (execution cost budget known, not assumed).
-3. **Regime monitor: no ALARM** at decision time.
-4. **Evidence status reviewed honestly:** as of registration, every strategy is *watch* (Trial 06) with portfolio-level historical support only (Trial 07, OOS-era statistically silent). The base rates from three research runs stand: most retail algo traders lose; costs are the dominant force at this account size.
-5. **A final fidelity period before any real deployment:** the last 2+ weeks of paper run at the actual planned real scale (e.g., $300 total, $100/position) so the habits being promoted are the ones that transfer — the $100k breadth phase discovers, the fidelity phase rehearses.
-6. **The user consciously amends §2** (paper-only) in `trading_bot_instructions.md`, holds the keys, and owns the switch. No prompt, agent, or assistant flips it — and the assistant never executes real trades.
+- **ALARM:** the trailing-12-month portfolio timing excess is below 0. The historical effect is not visible in the last year, so real-money promotion is frozen whatever the other gates say.
+- Warning: trailing-6 below 0 while trailing-12 is at or above 0. Note it; no action.
 
-## Reliability & deferred decisions (recorded 2026-07-15)
+## Promotion gates to the planned $300 real budget
 
-- **Risk controls active** (see instructions): daily-loss halt, vol sizing, crypto-cluster cap, catastrophe stop. The launchd agents inherit these via config defaults — no plist change needed.
-- **Deadman's switch:** `com.jalenedusei.trading.health` runs `npm run health` every 30 min and posts a macOS notification on any PROBLEM (stale heartbeat = Mac asleep / agent dead, regime ALARM, unreconciled broker position).
-- **DEFERRED — SQLite migration of the ledger.** Justified but NOT done: three agents write `data/ledger.csv` hourly and 11 real positions reference it by row; migrating a live-written file risks the one irreplaceable asset (the real forward record). Instead the write path was made atomic (temp+rename). Do the DB migration only during a deliberate maintenance stop with all agents unloaded.
-- **Cost/timing levers (built + tested 2026-07-15):** `ENTRY_WINDOW_MIN=120` and `LIMIT_SLIPPAGE_BPS=30` are LIVE on the daily agent — entries now cluster within 120 min after the 00:00 UTC daily close (fills near the signal price) via a bounded marketable limit capped at +30 bps.
-- **KEY EMPIRICAL FINDING — maker orders can't be validated on paper.** `ORDER_MODE=maker` (passive limit below the mark) is fully built and tested, but **the Alpaca paper simulator does not fill a resting below-mark limit** (verified: a 5-bps-below and an at-mark $10 BTC limit both went unfilled/canceled; a +20-bps marketable limit filled instantly). So maker-fee capture (~the real cost win) is a **real-money-only** optimization — enabling maker mode on paper would halt entries. It stays OFF on the paper agent, ready for live. Graceful non-fill (cancel + retry, no ledger row) and stale-order cleanup are verified. The paper-appropriate improvement is the bounded marketable limit (fills + caps bad fills), which is what's enabled.
+All of these, sustained, before a real-money conversation rests on evidence:
 
-Also recorded for the real-money day: the real account should be a **cash account** (no PDT flag; 28-day holds make T+1 settlement cycling a non-issue), and Alpaca's $10 minimum notional means $300 supports the $100×3 structure exactly.
+1. **At least 4 consecutive weeks of clean operations** (the daily criteria), with every incident fixed and written up in `docs/incidents.md`. The clock restarted on 2026-10-11 after the resting-order incident.
+2. **At least 10 completed real-fill round trips with the model-to-fill gap measured.** Met on 2026-10-11: 108 closed round trips, mean gross gap -0.05% (median -0.17%), entry fills a mean 23 bps above the signal close, exit fills a mean 17 bps above the model's exit close (`npm run report`).
+3. **No regime ALARM** at decision time.
+4. **An honest evidence review.** Every strategy is on watch (Trial 06); the only support is portfolio-level and historical (Trial 07, with a recent era that is not significant on its own). Trial 08 tests whether that support survives this account's costs. The base rates from three research reports stand: most retail algorithmic traders lose, and at this account size costs are the dominant force.
+5. **A final fidelity period:** the last two weeks or more of paper at the real planned scale ($300 total, $100 a position), so the habits being promoted are the ones that transfer.
+6. **Jalen amends the paper-only rule** in `trading_bot_instructions.md`, holds the keys, and owns the switch. No prompt, agent or assistant flips it, and the assistant never places a real trade.
+
+For a real account later: a cash account (no pattern-day-trader flag; 28-day holds make settlement a non-issue). Alpaca's $10 crypto minimum means $300 supports exactly three $100 positions.
+
+## Findings that shape operations
+
+- **Alpaca paper does not fill resting below-market limits.** A limit 5 bps under the mark and one at the mark on $10 of BTC both went unfilled; a limit 20 bps above filled at once. Maker-fee savings can only be measured with real money, so `ORDER_MODE=maker` stays off on paper.
+- **Ledger storage.** Moving the ledger to SQLite is still deferred; instead every write takes a file lock and repairs go through `npm run reconcile`, which backs the ledger up first.
+
+## Amendments
+
+- **2026-07-15:** budget raised from $300 to the full $100,000 paper account for breadth across 56 symbols (Jalen's call); the $300 scale moved to the fidelity period in gate 5.
+- **2026-10-11:** after the resting-order incident (`docs/incidents.md`): orders settle and never rest; reconcile against broker fills; health pages on refused, resting or unattributed orders; per-agent heartbeats; the 5m scanner retired; agent definitions moved into `ops/launchd/`; gate 2 recorded as met; the operations clock in gate 1 restarted.
