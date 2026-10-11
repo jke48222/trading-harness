@@ -335,7 +335,7 @@ function renderPositions(){
 
 async function closePos(sym){
   if(!confirm('Close '+sym+' at market on the paper account?')) return;
-  try{ const r=await fetch('/api/close',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({symbol:sym})});
+  try{ const r=await fetch('/api/close',{method:'POST',headers:{'content-type':'application/json','x-dashboard':'1'},body:JSON.stringify({symbol:sym})});
     const d=await r.json(); if(!r.ok) throw new Error(d.error);
     flashConsole(sym+' closed @ '+d.exitFill+' — actual '+fmtPct(d.actualPct));
     refreshAll();
@@ -461,7 +461,7 @@ $('cmdbar').innerHTML = CMDS.map(c=>`<button class="icon-btn" data-cmd="${c.name
 document.querySelectorAll('[data-cmd]').forEach(b=>b.onclick=async()=>{
   document.querySelectorAll('[data-cmd]').forEach(x=>x.disabled=true);
   flashConsole('running '+b.dataset.cmd+'…');
-  try{ const r=await fetch('/api/command',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:b.dataset.cmd})});
+  try{ const r=await fetch('/api/command',{method:'POST',headers:{'content-type':'application/json','x-dashboard':'1'},body:JSON.stringify({name:b.dataset.cmd})});
     const d=await r.json(); flashConsole((d.ok?'✓ ':'✕ ')+b.dataset.cmd+'\n'+(d.output||d.error||'')); refreshAll();
   }catch(e){ flashConsole('✕ '+e.message); }
   finally{ document.querySelectorAll('[data-cmd]').forEach(x=>x.disabled=false); }

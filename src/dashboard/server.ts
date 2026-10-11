@@ -3,9 +3,10 @@ import * as http from 'node:http';
 import * as path from 'node:path';
 import { execFile } from 'node:child_process';
 import { CONFIG } from '../config';
-import { loadLedger, appendLedgerRow } from '../memory';
+import { appendLedgerRow, entryFillOf, loadLedger, openEntryFor, orderIdOf } from '../memory';
 import { closePaperPosition, getAccount, getBrokerPositions, getPortfolioHistory, positionMatches } from '../broker/orders';
 import type { LedgerRow } from '../types';
+import { requestAllowed } from './guard';
 
 /**
  * Local dashboard for the paper-trading bot. Binds to 127.0.0.1 ONLY.
@@ -301,12 +302,11 @@ async function manualClose(botSymbol: string): Promise<unknown> {
   const positions = await getBrokerPositions();
   const pos = positions.find((p) => positionMatches(p.symbol, botSymbol));
   if (!pos) throw new Error(`No open position matches ${botSymbol}.`);
-  const rows = loadLedger();
-  const entry = [...rows].reverse().find((r) => r.mode === 'alpaca-paper' && positionMatches(pos.symbol, r.symbol) && r.action === 'BUY');
+  // Attribute by timestamp to the symbol's open entry, the same rule the exit manager uses.
+  const entry = openEntryFor(loadLedger(), botSymbol);
   const order = await closePaperPosition(botSymbol);
   const exitFill = Number(order.filled_avg_price);
-  const entryFillMatch = entry?.reason.match(/broker fill ([0-9.eE-]+)/);
-  const entryFill = entryFillMatch ? Number(entryFillMatch[1]) : entry ? Number(entry.price) : exitFill;
+  const entryFill = entry ? (entryFillOf(entry) ?? Number(entry.price)) : exitFill;
   const actualPct = ((exitFill - entryFill) / entryFill) * 100;
   appendLedgerRow({
     timestamp: new Date().toISOString(),
@@ -314,7 +314,7 @@ async function manualClose(botSymbol: string): Promise<unknown> {
     action: 'SELL',
     price: String(exitFill),
     quantity: order.filled_qty,
-    reason: `[actual:${entry ? tagOf(entry) : 'manual'}] Manual close via dashboard; entry fill ${entryFill}; ACTUAL round-trip P&L from real paper fills, gross of Alpaca fees.`,
+    reason: `[actual:${entry ? tagOf(entry) : 'manual'}] Manual close via dashboard; entry fill ${entryFill} (order ${entry ? (orderIdOf(entry) ?? 'unknown') : 'none: no open ledger entry'}); ACTUAL round-trip P&L from real paper fills, gross of Alpaca fees.`,
     mode: 'alpaca-paper-exit',
     outcome: actualPct > 0 ? 'win' : actualPct < 0 ? 'loss' : 'flat',
     pnl: actualPct.toFixed(4),
@@ -332,6 +332,7 @@ async function readBody(req: http.IncomingMessage): Promise<string> {
 
 const server = http.createServer(async (req, res) => {
   try {
+    if (!requestAllowed(req.method ?? 'GET', req.headers, PORT)) return json(res, 403, { error: 'Forbidden: the dashboard only answers its own page on this machine.' });
     const url = new URL(req.url ?? '/', `http://127.0.0.1:${PORT}`);
     if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/index.html')) {
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
