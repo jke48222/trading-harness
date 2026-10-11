@@ -4,70 +4,112 @@ import * as path from 'node:path';
 import { execFile } from 'node:child_process';
 import { CONFIG } from '../config';
 import { appendLedgerRow, entryFillOf, loadLedger, openEntryFor, orderIdOf } from '../memory';
-import { closePaperPosition, getAccount, getBrokerPositions, getPortfolioHistory, positionMatches } from '../broker/orders';
+import {
+  type BrokerAccount,
+  type BrokerOrder,
+  type BrokerPosition,
+  botSymbolOf,
+  closePaperPosition,
+  fetchActivities,
+  getAccount,
+  getBrokerPositions,
+  getOpenOrders,
+  getPortfolioHistory,
+  positionMatches,
+} from '../broker/orders';
+import { reconcile } from '../broker/fills';
+import { EXPECTED_AGENTS, type HealthInput, evaluateHealth, readHeartbeats, readMonitor } from '../health';
+import { attributeTrips, summarizeFees } from '../report';
+import { BOOK_START_ISO, loadBrokerTruth } from '../reconcileRun';
 import type { LedgerRow } from '../types';
+import { BOOK_ENV, COMMANDS, isCommand } from './commands';
 import { requestAllowed } from './guard';
+import { acquireRunLock } from '../locks';
+import {
+  OPS_CLOCK_START,
+  type HealthPayload,
+  type PerfPayload,
+  type ReportPayload,
+  isRetiredScannerRow,
+  opsGate,
+  shapeHealth,
+  shapePerf,
+  shapeReport,
+  swrCache,
+  tripsGate,
+} from './payloads';
 
 /**
  * Local dashboard for the paper-trading bot. Binds to 127.0.0.1 ONLY.
- * Reads real data (live Alpaca paper account, the ledger, trials, monitor)
- * and can run a whitelisted set of the bot's own npm commands. All order
- * activity goes through the same hardcoded-paper-host adapter as the agents.
+ * Reads real data (live Alpaca paper account, broker fills, the ledger, agent
+ * heartbeats, data/perf.json, the regime monitor) and can run a whitelisted set
+ * of the bot's own npm commands. All order activity goes through the same
+ * hardcoded-paper-host adapter as the agents.
  */
 const PORT = Number(process.env.DASH_PORT ?? 8787);
 const ROOT = process.cwd();
 const PAGE = path.join(ROOT, 'public', 'dashboard.html');
+const dataFile = (name: string): string => path.join(CONFIG.dataDir, name);
+
+/** The fee the book's ledger scores are net of; attribution adds it back so model and actual are both gross. */
+const BOOK_FEE_BPS = Number(BOOK_ENV.FEE_BPS);
+
+const firstLine = (err: unknown): string => (err instanceof Error ? err.message : String(err)).split('\n')[0];
 
 function json(res: http.ServerResponse, code: number, body: unknown): void {
   const s = JSON.stringify(body);
-  res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+  res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
   res.end(s);
 }
+
+/**
+ * The page may run inline script and style and call this server, nothing else:
+ * no third-party code, no framing by another site (its buttons place paper
+ * orders), no referrer leaking the local URL.
+ */
+const PAGE_HEADERS = {
+  'content-type': 'text/html; charset=utf-8',
+  'cache-control': 'no-store',
+  'x-content-type-options': 'nosniff',
+  'x-frame-options': 'DENY',
+  'referrer-policy': 'no-referrer',
+  'content-security-policy':
+    "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+};
 
 function tagOf(row: LedgerRow): string {
   const m = row.reason.match(/^\[([^\]]+)\]/);
   return m ? m[1] : '';
 }
 
-function readTail(file: string, bytes = 6000): string {
-  try {
-    const size = fs.statSync(file).size;
-    const fd = fs.openSync(file, 'r');
-    const start = Math.max(0, size - bytes);
-    const buf = Buffer.alloc(size - start);
-    fs.readSync(fd, buf, 0, buf.length, start);
-    fs.closeSync(fd);
-    return buf.toString('utf8');
-  } catch {
-    return '';
-  }
+// ---- broker snapshot (account, positions, open orders) ----
+
+interface BrokerSnapshot {
+  account: BrokerAccount;
+  positions: BrokerPosition[];
+  openOrders: BrokerOrder[];
 }
 
-function agentHealth(): unknown[] {
-  const agents = [
-    { id: 'tsmom-daily', label: 'Daily book (real orders, hourly)', log: 'data/tsmom-scan.log' },
-    { id: 'scan-5m', label: '5m sim scanner (pipeline exerciser)', log: 'data/scan.log' },
-    { id: 'monitor', label: 'Regime monitor (monthly)', log: 'data/monitor.log' },
-  ];
-  return agents.map((a) => {
-    const p = path.join(ROOT, a.log);
-    let lastWrite: string | null = null;
-    let lastError: string | null = null;
-    try {
-      lastWrite = fs.statSync(p).mtime.toISOString();
-      const tail = readTail(p);
-      const err = tail.split('\n').reverse().find((l) => l.includes('BLOCKED'));
-      lastError = err ? err.slice(0, 200) : null;
-    } catch {
-      /* no log yet */
-    }
-    return { ...a, lastWrite, lastError };
-  });
+/** One broker round shared by /api/summary and /api/health, so a page refresh asks once and both panels agree. */
+const brokerSnapshot = swrCache<BrokerSnapshot>(
+  async () => {
+    const [account, positions, openOrders] = await Promise.all([getAccount(), getBrokerPositions(), getOpenOrders()]);
+    return { account, positions, openOrders };
+  },
+  { ttlMs: 10_000, retryMs: 5_000, staleWhileRevalidate: false }
+);
+
+async function snapshot(): Promise<BrokerSnapshot> {
+  const c = await brokerSnapshot.get();
+  if (c.error || !c.value) throw new Error(c.error ?? 'The broker did not answer.');
+  return c.value;
 }
 
-function monitorStatus(): { rows: unknown[]; latest: unknown | null } {
+// ---- local files ----
+
+function monitorStatus(): { rows: { month: string; excess: number; symbols: number; trailing12: number | null; status: string }[]; latest: unknown | null } {
   try {
-    const lines = fs.readFileSync(path.join(ROOT, 'data', 'monitor_tsmom.csv'), 'utf8').split('\n').filter((l) => l.trim());
+    const lines = fs.readFileSync(dataFile('monitor_tsmom.csv'), 'utf8').split('\n').filter((l) => l.trim());
     const rows = lines.slice(1).map((l) => {
       const [month, excess, symbols, t12, status] = l.split(',');
       return { month, excess: Number(excess), symbols: Number(symbols), trailing12: t12 === '' ? null : Number(t12), status };
@@ -80,7 +122,7 @@ function monitorStatus(): { rows: unknown[]; latest: unknown | null } {
 
 function dailyRisk(equity: number): { dayStart: number | null; pnlPct: number | null; halted: boolean } {
   try {
-    const st = JSON.parse(fs.readFileSync(path.join(ROOT, 'data', 'risk_state.json'), 'utf8')) as { utcDay: string; dayStartEquity: number };
+    const st = JSON.parse(fs.readFileSync(dataFile('risk_state.json'), 'utf8')) as { utcDay: string; dayStartEquity: number };
     if (st.utcDay !== new Date().toISOString().slice(0, 10)) return { dayStart: null, pnlPct: null, halted: false };
     const pnlPct = st.dayStartEquity > 0 ? ((equity - st.dayStartEquity) / st.dayStartEquity) * 100 : 0;
     return { dayStart: st.dayStartEquity, pnlPct, halted: pnlPct <= -CONFIG.maxDailyLossPct };
@@ -89,27 +131,46 @@ function dailyRisk(equity: number): { dayStart: number | null; pnlPct: number | 
   }
 }
 
+/** data/perf.json, written by src/perf.ts. Absent or unreadable is a normal state the page explains, never a 404. */
+function perf(): PerfPayload {
+  let text: string;
+  try {
+    text = fs.readFileSync(dataFile('perf.json'), 'utf8');
+  } catch {
+    return { missing: true };
+  }
+  try {
+    return shapePerf(JSON.parse(text), Date.now());
+  } catch (err) {
+    return { missing: true, error: `data/perf.json could not be read: ${firstLine(err)}` };
+  }
+}
+
+// ---- endpoints ----
+
 async function summary(): Promise<unknown> {
-  const [account, positions] = await Promise.all([getAccount(), getBrokerPositions()]);
+  const { account, positions } = await snapshot();
   const rows = loadLedger();
-  const entries = rows.filter((r) => r.mode === 'alpaca-paper' && r.action === 'BUY');
   const enriched = positions.map((p) => {
-    const entry = [...entries].reverse().find((e) => positionMatches(p.symbol, e.symbol));
-    const fill = entry?.reason.match(/broker fill ([0-9.eE-]+)/);
+    const sym = botSymbolOf(p.symbol);
+    // The position belongs to the symbol's open entry by timestamp, the rule the exit manager uses.
+    const entry = openEntryFor(rows, sym);
+    const fill = entry ? entryFillOf(entry) : null;
     const slip = entry?.reason.match(/slippage ([+-][0-9.]+) bps/);
+    const cost = Number(p.market_value) - Number(p.unrealized_pl);
     return {
       symbol: p.symbol,
-      botSymbol: entry?.symbol ?? (p.symbol.endsWith('USD') && p.symbol.length > 4 ? `${p.symbol.slice(0, -3)}USDT` : p.symbol),
+      botSymbol: sym,
       qty: Number(p.qty),
-      entry: fill ? Number(fill[1]) : Number(p.avg_entry_price),
+      entry: fill ?? Number(p.avg_entry_price),
       now: Number(p.current_price),
       value: Number(p.market_value),
       unrealized: Number(p.unrealized_pl),
-      unrealizedPct: (Number(p.unrealized_pl) / (Number(p.market_value) - Number(p.unrealized_pl))) * 100,
+      unrealizedPct: cost ? (Number(p.unrealized_pl) / cost) * 100 : 0,
       openedAt: entry?.timestamp ?? null,
       tag: entry ? tagOf(entry) : null,
       slippageBps: slip ? Number(slip[1]) : null,
-      kind: p.symbol.endsWith('USD') && p.symbol.length > 4 ? 'crypto' : 'stock',
+      kind: sym.endsWith('USDT') ? 'crypto' : 'stock',
     };
   });
   const deployed = enriched.reduce((a, p) => a + Math.abs(p.value), 0);
@@ -131,22 +192,92 @@ async function summary(): Promise<unknown> {
       cryptoClusterCapPct: CONFIG.cryptoClusterCapPct,
     },
     positions: enriched.sort((a, b) => b.value - a.value),
-    agents: agentHealth(),
     monitor: monitorStatus().latest,
     ledgerRows: rows.length,
   };
 }
 
-async function equityCurve(): Promise<unknown> {
-  try {
+/**
+ * Agent heartbeats, the regime monitor and (when keys are set) live broker
+ * state, judged by the same rules as `npm run health`. Read-only: unlike the
+ * CLI it never rotates logs.
+ */
+async function health(): Promise<HealthPayload> {
+  const nowMs = Date.now();
+  const input: HealthInput = { nowMs, heartbeats: readHeartbeats(), rows: loadLedger(), monitor: readMonitor() };
+  const brokerChecked = Boolean(process.env.ALPACA_PAPER_KEY_ID);
+  if (brokerChecked) {
+    const c = await brokerSnapshot.get();
+    if (c.value && !c.error) input.broker = c.value;
+    else input.brokerError = c.error ?? 'The broker did not answer.';
+  }
+  return shapeHealth({
+    nowMs,
+    expected: EXPECTED_AGENTS,
+    heartbeats: input.heartbeats,
+    report: evaluateHealth(input),
+    monitor: input.monitor,
+    broker: input.broker
+      ? { positions: input.broker.positions.length, openOrders: input.broker.openOrders.length, equity: Number(input.broker.account.equity) }
+      : null,
+    brokerChecked,
+    brokerError: input.brokerError ?? null,
+  });
+}
+
+/** The book from broker fills: every order since the book start, rebuilt into round trips. Several paginated GETs, so cached. */
+async function loadReport(): Promise<ReportPayload> {
+  const [truth, fees] = await Promise.all([
+    loadBrokerTruth(),
+    fetchActivities('CFEE', BOOK_START_ISO).then(
+      (acts) => ({ fees: summarizeFees(acts), feesError: null }),
+      (err: unknown) => ({ fees: null, feesError: firstLine(err) })
+    ),
+  ]);
+  const rows = loadLedger();
+  const findings = reconcile({
+    rows,
+    trips: truth.trips,
+    positions: truth.positions,
+    filledBotClientIds: new Set(truth.fills.filter((f) => f.bot).map((f) => f.clientOrderId)),
+    sinceMs: Date.parse(BOOK_START_ISO),
+  });
+  return shapeReport({
+    asOfMs: Date.now(),
+    bookStart: BOOK_START_ISO.slice(0, 10),
+    feeBps: BOOK_FEE_BPS,
+    attributions: attributeTrips(truth.trips, rows, BOOK_FEE_BPS),
+    positions: truth.positions,
+    unmatchedSells: truth.unmatchedSells.length,
+    fees: fees.fees,
+    feesError: fees.feesError,
+    findings,
+  });
+}
+
+const REPORT_TTL_MS = 5 * 60_000;
+const brokerReport = swrCache(loadReport, { ttlMs: REPORT_TTL_MS, retryMs: 60_000, staleWhileRevalidate: true });
+
+async function report(): Promise<{ code: number; body: unknown }> {
+  const c = await brokerReport.get();
+  if (!c.value) return { code: 502, body: { error: `Broker truth unavailable: ${c.error ?? 'no answer from the broker'}` } };
+  return { code: 200, body: { ...c.value, cache: { ttlSec: REPORT_TTL_MS / 1000, refreshing: c.refreshing, refreshError: c.error } } };
+}
+
+const equityHistory = swrCache(
+  async () => {
     const h = await getPortfolioHistory('1M', '1D');
     const points = h.timestamp
       .map((t, i) => ({ t: t * 1000, equity: h.equity[i], plPct: h.profit_loss_pct[i] }))
       .filter((p) => p.equity != null);
     return { points };
-  } catch (err) {
-    return { points: [], error: (err as Error).message };
-  }
+  },
+  { ttlMs: 60_000, retryMs: 30_000, staleWhileRevalidate: true }
+);
+
+async function equityCurve(): Promise<unknown> {
+  const c = await equityHistory.get();
+  return c.value ?? { points: [], error: c.error };
 }
 
 function book(): unknown {
@@ -178,8 +309,12 @@ function book(): unknown {
   }));
 }
 
+/** The newest ledger rows, without the retired 5-minute scanner's history. */
 function activity(limit: number): unknown {
-  const rows = loadLedger().slice(-limit).reverse();
+  const rows = loadLedger()
+    .filter((r) => !isRetiredScannerRow(r))
+    .slice(-limit)
+    .reverse();
   return rows.map((r) => {
     let kind = 'other';
     if (r.mode === 'alpaca-paper' && r.action === 'BUY') kind = 'entry';
@@ -204,7 +339,7 @@ function activity(limit: number): unknown {
 
 function trials(limit: number): unknown {
   try {
-    const lines = fs.readFileSync(path.join(ROOT, 'data', 'trials.csv'), 'utf8').split('\n').filter((l) => l.trim());
+    const lines = fs.readFileSync(dataFile('trials.csv'), 'utf8').split('\n').filter((l) => l.trim());
     const parse = (line: string): string[] => {
       const out: string[] = [];
       let f = '';
@@ -228,7 +363,8 @@ function trials(limit: number): unknown {
     };
     const recent = lines.slice(1).slice(-limit).reverse().map((l) => {
       const c = parse(l);
-      return { runAt: c[0], source: c[1], command: c[2], symbol: c[3], strategy: c[5], notes: c[18]?.slice(0, 200) ?? '' };
+      const notes = c[18] ?? '';
+      return { runAt: c[0], source: c[1], command: c[2], symbol: c[3], strategy: c[5], notes: notes.length > 200 ? `${notes.slice(0, 199)}…` : notes };
     });
     return { total: lines.length - 1, recent };
   } catch {
@@ -236,50 +372,29 @@ function trials(limit: number): unknown {
   }
 }
 
-function gates(): unknown {
+/** The promotion gates of docs/paper_phase_protocol.md, with live progress where a number exists. */
+async function gates(): Promise<unknown> {
   const rows = loadLedger();
-  const firstBroker = rows.find((r) => r.mode === 'alpaca-paper');
-  const opsDays = firstBroker ? Math.floor((Date.now() - Date.parse(firstBroker.timestamp)) / 86_400_000) : 0;
-  const roundTrips = rows.filter((r) => r.mode === 'alpaca-paper-exit').length;
+  const ledgerExits = rows.filter((r) => r.mode === 'alpaca-paper-exit').length;
+  const truth = await brokerReport.get();
   const mon = monitorStatus().latest as { status?: string; trailing12?: number } | null;
   return {
     gates: [
-      { id: 'ops', label: '≥ 4 weeks clean operations', progress: `${opsDays}/28 days`, done: opsDays >= 28 },
-      { id: 'trips', label: '≥ 10 real-fill round trips (cost gap measured)', progress: `${roundTrips}/10 trips`, done: roundTrips >= 10 },
-      { id: 'alarm', label: 'Regime monitor: no ALARM', progress: mon ? `${mon.status} · trailing-12 ${mon.trailing12 ?? '—'}%/mo` : 'no data yet', done: !!mon && mon.status !== 'ALARM' },
-      { id: 'evidence', label: 'Evidence review (all strategies currently WATCH)', progress: 'Trial 06: watch · Trial 07: portfolio pass, OOS-era silent', done: false },
+      opsGate(Date.now(), OPS_CLOCK_START),
+      tripsGate(truth.value, truth.error, ledgerExits),
+      { id: 'alarm', label: 'Regime monitor: no ALARM', progress: mon ? `${mon.status} · trailing-12 ${mon.trailing12 ?? 'n/a'}%/mo` : 'no data yet', done: !!mon && mon.status !== 'ALARM' },
+      {
+        id: 'evidence',
+        label: 'Evidence review (all strategies currently WATCH)',
+        progress: 'Trial 06: watch · Trial 07: portfolio pass, recent era silent · Trial 08: crypto holds at real costs, stocks fail',
+        done: false,
+      },
       { id: 'fidelity', label: 'Final fidelity period at real scale ($300)', progress: CONFIG.budgetUsd <= 500 ? 'in fidelity mode' : `discovery mode ($${CONFIG.budgetUsd.toLocaleString()})`, done: false },
       { id: 'amend', label: 'User amends §2 and owns the switch', progress: 'paper-only per constitution', done: false },
     ],
-    note: 'Process guidance from docs/paper_phase_protocol.md — the real-money decision is the user\'s alone.',
+    note: "Process guidance from docs/paper_phase_protocol.md. The real-money decision is the user's alone.",
   };
 }
-
-/** Whitelisted commands — each runs one of the bot's own npm scripts with fixed env. */
-const COMMANDS: Record<string, { label: string; args: string[]; env: Record<string, string> }> = {
-  'scan-book': {
-    label: 'Scan the book now (state construction, real paper orders)',
-    args: ['run', 'scan'],
-    env: {
-      TSMOM_STATE: 'on',
-      EXECUTION: 'alpaca-paper',
-      STRATEGY: 'tsmom',
-      INTERVAL: '1d',
-      TSMOM_LOOKBACK: '28',
-      EVAL_HORIZON: '28',
-      FEE_BPS: '30',
-      LONG_ONLY: 'on',
-      SYMBOLS:
-        'AAVEUSDT,ADAUSDT,ARBUSDT,AVAXUSDT,BATUSDT,BCHUSDT,BONKUSDT,BTCUSDT,CRVUSDT,DOGEUSDT,DOTUSDT,ETHUSDT,FILUSDT,GRTUSDT,LDOUSDT,LINKUSDT,LTCUSDT,ONDOUSDT,PAXGUSDT,PEPEUSDT,POLUSDT,RENDERUSDT,SHIBUSDT,SKYUSDT,SOLUSDT,SUSHIUSDT,TRUMPUSDT,UNIUSDT,WIFUSDT,XRPUSDT,XTZUSDT,YFIUSDT,SPY,QQQ,IWM,DIA,AAPL,MSFT,NVDA,AMZN,GOOGL,META,TSLA,AVGO,AMD,NFLX,JPM,V,UNH,XOM,LLY,COST,WMT,JNJ,PG,BAC',
-    },
-  },
-  'score-daily': {
-    label: 'Score matured daily trades',
-    args: ['run', 'score'],
-    env: { STRATEGY: 'tsmom', INTERVAL: '1d', TSMOM_LOOKBACK: '28', EVAL_HORIZON: '28', FEE_BPS: '30' },
-  },
-  monitor: { label: 'Recompute regime monitor', args: ['run', 'tsmom:monitor'], env: {} },
-};
 
 let commandBusy: string | null = null;
 
@@ -289,7 +404,8 @@ function runCommand(name: string): Promise<{ ok: boolean; output: string }> {
     execFile(
       'npm',
       cmd.args,
-      { cwd: ROOT, env: { ...process.env, ...cmd.env }, timeout: 300_000, maxBuffer: 4 * 1024 * 1024 },
+      // A book scan settles every order it places; never kill one mid-order.
+      { cwd: ROOT, env: { ...process.env, ...cmd.env }, timeout: 15 * 60_000, maxBuffer: 4 * 1024 * 1024 },
       (err, stdout, stderr) => {
         const output = (stdout + '\n' + stderr).trim().split('\n').slice(-30).join('\n');
         resolve({ ok: !err, output });
@@ -298,7 +414,25 @@ function runCommand(name: string): Promise<{ ok: boolean; output: string }> {
   });
 }
 
+/** After anything that can trade, re-read the broker instead of serving the pre-trade picture. */
+function invalidateBrokerCaches(): void {
+  brokerSnapshot.invalidate();
+  brokerReport.invalidate();
+  equityHistory.invalidate();
+}
+
 async function manualClose(botSymbol: string): Promise<unknown> {
+  // A book scan may be exiting or repairing this symbol right now; one at a time.
+  const release = acquireRunLock('book');
+  if (!release) throw new Error('A book scan is running; try the close again in a minute.');
+  try {
+    return await closeAndRecord(botSymbol);
+  } finally {
+    release();
+  }
+}
+
+async function closeAndRecord(botSymbol: string): Promise<unknown> {
   const positions = await getBrokerPositions();
   const pos = positions.find((p) => positionMatches(p.symbol, botSymbol));
   if (!pos) throw new Error(`No open position matches ${botSymbol}.`);
@@ -322,46 +456,72 @@ async function manualClose(botSymbol: string): Promise<unknown> {
   return { closed: botSymbol, exitFill, actualPct };
 }
 
+const MAX_BODY_BYTES = 16 * 1024;
+
 async function readBody(req: http.IncomingMessage): Promise<string> {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     let b = '';
-    req.on('data', (c) => (b += c));
+    req.on('data', (c: Buffer) => {
+      b += c;
+      if (b.length > MAX_BODY_BYTES) {
+        reject(new Error('Request body too large.'));
+        req.destroy();
+      }
+    });
     req.on('end', () => resolve(b));
+    req.on('error', reject);
   });
 }
 
 const server = http.createServer(async (req, res) => {
   try {
-    if (!requestAllowed(req.method ?? 'GET', req.headers, PORT)) return json(res, 403, { error: 'Forbidden: the dashboard only answers its own page on this machine.' });
+    // The guard runs first, for every request: own Host only, and POSTs only from this page.
+    if (!requestAllowed(req.method ?? 'GET', req.headers, PORT, new URL(req.url ?? '/', `http://127.0.0.1:${PORT}`).pathname)) {
+      return json(res, 403, { error: 'Forbidden: the dashboard only answers its own page on this machine.' });
+    }
     const url = new URL(req.url ?? '/', `http://127.0.0.1:${PORT}`);
     if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/index.html')) {
-      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+      res.writeHead(200, PAGE_HEADERS);
       res.end(fs.readFileSync(PAGE));
       return;
     }
     if (req.method === 'GET' && url.pathname === '/api/summary') return json(res, 200, await summary());
+    if (req.method === 'GET' && url.pathname === '/api/health') return json(res, 200, await health());
+    if (req.method === 'GET' && url.pathname === '/api/report') {
+      const r = await report();
+      return json(res, r.code, r.body);
+    }
+    if (req.method === 'GET' && url.pathname === '/api/perf') return json(res, 200, perf());
     if (req.method === 'GET' && url.pathname === '/api/book') return json(res, 200, book());
-    if (req.method === 'GET' && url.pathname === '/api/activity') return json(res, 200, activity(Number(url.searchParams.get('limit') ?? 60)));
+    if (req.method === 'GET' && url.pathname === '/api/activity') {
+      const limit = Math.min(500, Math.max(1, Math.floor(Number(url.searchParams.get('limit') ?? 60)) || 60));
+      return json(res, 200, activity(limit));
+    }
     if (req.method === 'GET' && url.pathname === '/api/equity') return json(res, 200, await equityCurve());
     if (req.method === 'GET' && url.pathname === '/api/monitor') return json(res, 200, monitorStatus());
     if (req.method === 'GET' && url.pathname === '/api/trials') return json(res, 200, trials(10));
-    if (req.method === 'GET' && url.pathname === '/api/gates') return json(res, 200, gates());
+    if (req.method === 'GET' && url.pathname === '/api/gates') return json(res, 200, await gates());
     if (req.method === 'POST' && url.pathname === '/api/command') {
       const { name } = JSON.parse((await readBody(req)) || '{}') as { name?: string };
-      if (!name || !COMMANDS[name]) return json(res, 400, { error: 'Unknown command.' });
-      if (commandBusy) return json(res, 409, { error: `Busy running ${commandBusy} — wait for it to finish.` });
+      if (!isCommand(name)) return json(res, 400, { error: 'Unknown command.' });
+      if (commandBusy) return json(res, 409, { error: `Busy running ${commandBusy}. Wait for it to finish.` });
       commandBusy = name;
       try {
         const result = await runCommand(name);
         return json(res, 200, result);
       } finally {
         commandBusy = null;
+        invalidateBrokerCaches();
       }
     }
     if (req.method === 'POST' && url.pathname === '/api/close') {
       const { symbol } = JSON.parse((await readBody(req)) || '{}') as { symbol?: string };
-      if (!symbol) return json(res, 400, { error: 'symbol required' });
-      return json(res, 200, await manualClose(symbol));
+      if (!symbol || typeof symbol !== 'string') return json(res, 400, { error: 'symbol required' });
+      try {
+        return json(res, 200, await manualClose(symbol));
+      } finally {
+        invalidateBrokerCaches();
+      }
     }
     json(res, 404, { error: 'not found' });
   } catch (err) {
@@ -370,5 +530,5 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, '127.0.0.1', () => {
-  console.log(`Dashboard: http://127.0.0.1:${PORT} (localhost only; paper account only — the order host is hardcoded to paper).`);
+  console.log(`Dashboard: http://127.0.0.1:${PORT} (localhost only; paper account only, the order host is hardcoded to paper).`);
 });
