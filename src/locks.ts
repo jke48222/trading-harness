@@ -13,16 +13,17 @@ import { CONFIG } from './config';
  * it would silently drop any row another process appended in that minute.
  * Holding a lock across load -> modify -> write closes that window.
  *
- * Protocol:
- * - A lock file is created complete or not at all: the content is written to
- *   a private temp file, which is then hard-linked to the lock path. link()
- *   fails with EEXIST when the lock exists, so there is never an empty lock.
- * - Each acquisition carries a random token. Release removes the lock only if
- *   it still holds our token, and a writer checks its token before writing.
- * - A lock is abandoned when its process is gone, it is older than staleMs,
- *   or it is unreadable and more than a few seconds old. Breaking one takes a
- *   short-lived break lock and re-checks under it, so two waiters can't both
- *   break it and both get in.
+ * On macOS the kernel holds the lock: the file is opened with O_EXLOCK, and
+ * the lock lasts exactly as long as the descriptor. It goes away when the
+ * holder closes it or dies, and a stalled holder keeps it. There is nothing to
+ * break and no staleness to guess, and the lock file is never deleted (a
+ * waiter on the old inode and a newcomer on a new one would both get in).
+ *
+ * Elsewhere (Linux CI) a lock file is created complete or not at all, by
+ * hard-linking a written temp file; it carries a random token, is released
+ * only by its owner, and an abandoned one (dead pid, older than staleMs, or
+ * unreadable and a few seconds old) is broken under a short-lived break lock
+ * with a re-check. Writers verify they still hold it before they write.
  */
 
 interface LockInfo {
@@ -30,6 +31,10 @@ interface LockInfo {
   at: number;
   token: string;
 }
+
+/** O_EXLOCK from <fcntl.h> on darwin: an exclusive flock taken atomically with the open. */
+const O_EXLOCK = 0x20;
+const KERNEL_LOCKS = process.platform === 'darwin' && process.env.LOCK_MODE !== 'link';
 
 function pidAlive(pid: number): boolean {
   try {
@@ -53,6 +58,31 @@ function readLock(file: string): LockInfo | null {
   }
 }
 
+function newToken(): string {
+  return `${process.pid}-${crypto.randomUUID()}`;
+}
+
+// ---------------------------------------------------------------- kernel locks (macOS)
+
+/** Try once to take the kernel lock on `file`. Returns the open descriptor, or null if another holder has it. */
+function kernelTry(file: string, token: string): number | null {
+  let fd: number;
+  try {
+    fd = fs.openSync(file, fs.constants.O_CREAT | fs.constants.O_RDWR | O_EXLOCK | fs.constants.O_NONBLOCK, 0o644);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'EAGAIN' || code === 'EWOULDBLOCK') return null;
+    throw err;
+  }
+  // Record who holds it, for messages only; the lock itself is the descriptor.
+  const info = Buffer.from(JSON.stringify({ pid: process.pid, at: Date.now(), token }));
+  fs.ftruncateSync(fd, 0);
+  fs.writeSync(fd, info, 0, info.length, 0);
+  return fd;
+}
+
+// ---------------------------------------------------------------- link locks (elsewhere)
+
 function ageMs(file: string): number {
   try {
     return Date.now() - fs.statSync(file).mtimeMs;
@@ -61,16 +91,15 @@ function ageMs(file: string): number {
   }
 }
 
-/** Create `file` holding a fresh token, atomically. Returns the token, or null if it already exists. */
-function linkCreate(file: string): string | null {
-  const token = `${process.pid}-${crypto.randomUUID()}`;
+/** Create `file` holding `token`, atomically. Returns false if it already exists. */
+function linkCreate(file: string, token: string): boolean {
   const tmp = `${file}.${token}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify({ pid: process.pid, at: Date.now(), token }));
   try {
+    fs.writeFileSync(tmp, JSON.stringify({ pid: process.pid, at: Date.now(), token }));
     fs.linkSync(tmp, file);
-    return token;
+    return true;
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'EEXIST') return null;
+    if ((err as NodeJS.ErrnoException).code === 'EEXIST') return false;
     throw err;
   } finally {
     fs.rmSync(tmp, { force: true });
@@ -96,14 +125,20 @@ function fingerprint(file: string): string {
   }
 }
 
+/** Remove `file` only if it is still the same file that was judged removable. */
+function removeIfUnchanged(file: string, seen: string): void {
+  if (fingerprint(file) === seen) fs.rmSync(file, { force: true });
+}
+
 /** Remove an abandoned lock, serialized through a short-lived break lock. */
 function breakIfAbandoned(file: string, staleMs: number): void {
   const before = fingerprint(file);
   const brk = `${file}.break`;
-  const brkToken = linkCreate(brk);
-  if (!brkToken) {
-    // Someone else is breaking it. A break lock is held for microseconds, so an old one was left by a crash.
-    if (ageMs(brk) > UNREADABLE_GRACE_MS) fs.rmSync(brk, { force: true });
+  const brkToken = newToken();
+  if (!linkCreate(brk, brkToken)) {
+    // Someone else is breaking it. A break lock lives for microseconds, so an
+    // old one was left by a crash; remove that one only, never a fresh one.
+    if (ageMs(brk) > UNREADABLE_GRACE_MS) removeIfUnchanged(brk, fingerprint(brk));
     return;
   }
   try {
@@ -113,25 +148,53 @@ function breakIfAbandoned(file: string, staleMs: number): void {
   }
 }
 
-function tryAcquire(file: string, staleMs: number): string | null {
-  const token = linkCreate(file);
-  if (token) return token;
+function linkTry(file: string, token: string, staleMs: number): boolean {
+  if (linkCreate(file, token)) return true;
   if (abandoned(file, staleMs)) {
     breakIfAbandoned(file, staleMs);
-    return linkCreate(file);
+    return linkCreate(file, token);
   }
-  return null;
+  return false;
 }
 
-function releaseIfOurs(file: string, token: string): void {
-  if (readLock(file)?.token === token) fs.rmSync(file, { force: true });
+// ---------------------------------------------------------------- common
+
+interface Held {
+  file: string;
+  token: string;
+  fd: number | null;
+}
+
+function tryAcquire(file: string, staleMs: number): Held | null {
+  const token = newToken();
+  if (KERNEL_LOCKS) {
+    const fd = kernelTry(file, token);
+    return fd == null ? null : { file, token, fd };
+  }
+  return linkTry(file, token, staleMs) ? { file, token, fd: null } : null;
+}
+
+function release(held: Held): void {
+  if (held.fd != null) {
+    // Clear the holder record so runLockHolder reads "free"; the kernel drops
+    // the lock on close, and the file itself stays.
+    fs.ftruncateSync(held.fd, 0);
+    fs.closeSync(held.fd);
+    return;
+  }
+  if (readLock(held.file)?.token === held.token) fs.rmSync(held.file, { force: true });
+}
+
+function stillHeld(held: Held): boolean {
+  if (held.fd != null) return true; // a kernel lock can't be taken from a live descriptor
+  return readLock(held.file)?.token === held.token;
 }
 
 function ledgerLockPath(): string {
   return path.join(CONFIG.dataDir, '.ledger.lock');
 }
 
-let ledgerToken: string | null = null;
+let ledgerHeld: Held | null = null;
 let ledgerDepth = 0;
 
 /**
@@ -152,21 +215,21 @@ export function withLedgerLock<T>(fn: () => T, waitMs = 30_000, staleMs = 120_00
   fs.mkdirSync(CONFIG.dataDir, { recursive: true });
   const file = ledgerLockPath();
   const deadline = Date.now() + waitMs;
-  let token: string | null;
-  while (!(token = tryAcquire(file, staleMs))) {
+  let held: Held | null;
+  while (!(held = tryAcquire(file, staleMs))) {
     if (Date.now() > deadline) {
       throw new Error(`The ledger has been locked by another process for over ${waitMs / 1000}s; not writing rather than risk losing a row.`);
     }
     sleepSync(50);
   }
-  ledgerToken = token;
+  ledgerHeld = held;
   ledgerDepth = 1;
   try {
     return guardSync(fn());
   } finally {
     ledgerDepth = 0;
-    ledgerToken = null;
-    releaseIfOurs(file, token);
+    ledgerHeld = null;
+    release(held);
   }
 }
 
@@ -179,11 +242,12 @@ function guardSync<T>(v: T): T {
 
 /**
  * Throws unless this process holds the ledger lock right now. Writers call it
- * just before they touch the file: a holder that stalled past staleMs may have
- * had its lock broken, and must not write over the new holder's work.
+ * just before they touch the file: with link locks, a holder that stalled past
+ * staleMs may have had its lock broken, and must not write over the new
+ * holder's work.
  */
 export function assertLedgerLockHeld(): void {
-  if (!ledgerToken || readLock(ledgerLockPath())?.token !== ledgerToken) {
+  if (!ledgerHeld || !stillHeld(ledgerHeld)) {
     throw new Error('Lost the ledger lock (held too long, so another process took it over); not writing.');
   }
 }
@@ -208,20 +272,28 @@ export function runLockPath(name: string): string {
 export function acquireRunLock(name: string, staleMs = 3 * 3_600_000): (() => void) | null {
   const file = runLockPath(name);
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  const token = tryAcquire(file, staleMs);
-  if (!token) return null;
+  const held = tryAcquire(file, staleMs);
+  if (!held) return null;
   let released = false;
-  const release = (): void => {
+  const done = (): void => {
     if (released) return;
     released = true;
-    releaseIfOurs(file, token);
+    release(held);
   };
-  process.once('exit', release);
-  return release;
+  process.once('exit', done);
+  return done;
 }
 
-/** Who holds a run lock right now (for messages), or null. */
+/**
+ * Who holds a run lock right now (for messages and health), or null when it
+ * is free. Reads the holder record and never takes the lock itself: a probe
+ * that held it even briefly could make a starting book scan skip its hour. A
+ * released lock has an empty record; a crashed holder's pid is gone.
+ */
 export function runLockHolder(name: string): { pid: number; at: number } | null {
   const info = readLock(runLockPath(name));
   return info && pidAlive(info.pid) ? { pid: info.pid, at: info.at } : null;
 }
+
+/** Which lock mechanism this process uses (for tests and messages). */
+export const LOCK_MECHANISM: 'kernel' | 'link' = KERNEL_LOCKS ? 'kernel' : 'link';

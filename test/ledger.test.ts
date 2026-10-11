@@ -18,6 +18,8 @@ process.env.FEE_BPS = '30';
 process.env.ALPACA_PAPER_KEY_ID = 'test-key';
 process.env.ALPACA_PAPER_SECRET = 'test-secret';
 process.env.LOCK_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'bot-locks-'));
+// These tests cover the portable link protocol (Linux, CI); test/locks-kernel.test.ts covers macOS kernel locks.
+process.env.LOCK_MODE = 'link';
 
 const memory = await import('../src/memory.ts');
 const locks = await import('../src/locks.ts');
