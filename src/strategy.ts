@@ -1,5 +1,6 @@
 import type { Candle, Signal } from './types';
 import { CONFIG } from './config';
+import { describeRule, isSingleLookback, maxLookback, stateTag, votesAt } from './voteRule';
 
 /** Simple moving average of the `period` closes ending at endIndex (inclusive). */
 export function sma(closes: number[], period: number, endIndex: number): number | null {
@@ -26,6 +27,32 @@ export function tsmomSignalAt(candles: Candle[], index: number): Signal {
   const { tsmomLookback: L, longOnly, interval } = CONFIG;
   const price = candles[index].close;
   const time = candles[index].closeTime;
+  const pct = (x: number): string => (x * 100).toFixed(2) + '%';
+
+  // The state construction (Trial 07, voted since Trial 09): long while the
+  // rule's vote is at or above its entry count. The broker's no-pyramiding
+  // check turns this into "enter once"; exits are the state-exit manager's in
+  // bot.ts, at the rule's exit count, so between the two the position holds.
+  if (CONFIG.tsmomState) {
+    const rule = CONFIG.tsmomRule;
+    const maxL = maxLookback(rule);
+    if (index < maxL + 1) {
+      return { action: 'HOLD', setupTag: 'warmup', reason: `Not enough closed candles yet for ${describeRule(rule)}.`, price, time };
+    }
+    const closes = candles.map((c) => c.close);
+    if (isSingleLookback(rule)) {
+      const mom = price / candles[index - rule.lookbacks[0]].close - 1;
+      return mom > 0
+        ? { action: 'BUY', setupTag: stateTag(rule, interval), reason: `Trailing ${rule.lookbacks[0]}-candle return is positive (${pct(mom)}) — state construction holds long while momentum is positive.`, price, time }
+        : { action: 'HOLD', setupTag: 'state-flat', reason: `HOLD: trailing ${rule.lookbacks[0]}-candle return is ${pct(mom)} — state construction stays flat while momentum is non-positive.`, price, time };
+    }
+    const votes = votesAt(closes, index, rule.lookbacks);
+    const tally = rule.lookbacks.map((lb) => `${lb}d ${pct(price / candles[index - lb].close - 1)}`).join(', ');
+    return votes >= rule.enter
+      ? { action: 'BUY', setupTag: stateTag(rule, interval), reason: `${votes} of ${rule.lookbacks.length} lookbacks positive (${tally}) — the vote enters at ${rule.enter} and holds until ${rule.exit} or fewer.`, price, time }
+      : { action: 'HOLD', setupTag: 'state-flat', reason: `HOLD: ${votes} of ${rule.lookbacks.length} lookbacks positive (${tally}) — entry needs ${rule.enter}.`, price, time };
+  }
+
   if (index < L + 1) {
     return {
       action: 'HOLD',
@@ -38,29 +65,6 @@ export function tsmomSignalAt(candles: Candle[], index: number): Signal {
   const momNow = price / candles[index - L].close - 1;
   const momPrev = candles[index - 1].close / candles[index - 1 - L].close - 1;
   const tagBase = `tsmom${L}-${interval}`;
-  const pct = (x: number): string => (x * 100).toFixed(2) + '%';
-
-  // Trial 07 state construction: long WHENEVER momentum is positive (the
-  // broker's no-pyramiding check turns this into "enter once, hold while
-  // positive"); exits are handled by the state-exit manager in bot.ts.
-  if (CONFIG.tsmomState) {
-    if (momNow > 0) {
-      return {
-        action: 'BUY',
-        setupTag: `${tagBase}-state-long`,
-        reason: `Trailing ${L}-candle return is positive (${pct(momNow)}) — state construction holds long while momentum is positive.`,
-        price,
-        time,
-      };
-    }
-    return {
-      action: 'HOLD',
-      setupTag: 'state-flat',
-      reason: `HOLD: trailing ${L}-candle return is ${pct(momNow)} — state construction stays flat while momentum is non-positive.`,
-      price,
-      time,
-    };
-  }
 
   if (momPrev <= 0 && momNow > 0) {
     return {

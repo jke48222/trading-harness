@@ -1,4 +1,5 @@
 import * as fs from 'node:fs';
+import { stateTag } from './voteRule';
 import * as path from 'node:path';
 import { CONFIG } from './config';
 import { closedCandles, fetchSeriesSince, intervalToMs } from './market';
@@ -68,8 +69,9 @@ export async function signalCloseFor(fill: Fill, tag: string): Promise<number | 
   }
 }
 
+/** The tag an adopted fill gets when no nearby row names one: the live rule's state tag. */
 function bookTag(): string {
-  return `tsmom${CONFIG.tsmomLookback}-${CONFIG.interval}-state-long`;
+  return stateTag(CONFIG.tsmomRule, CONFIG.interval);
 }
 
 export interface RepairResult {

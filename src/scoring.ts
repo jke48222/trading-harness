@@ -2,6 +2,7 @@ import { CONFIG } from './config';
 import { closedCandles, fetchSeriesSince, intervalToMs } from './market';
 import { ledgerPath, learningsPath, loadLedger, rowKey, updateLedger, upsertLesson } from './memory';
 import type { LedgerRow } from './types';
+import { isSingleLookback, maxLookback, ruleOfStateTag, votesAt, type VoteRule } from './voteRule';
 
 /**
  * Scores matured paper trades so the forward record has real win/loss
@@ -10,9 +11,11 @@ import type { LedgerRow } from './types';
  *
  *   flip / horizon rows   exit EVAL_HORIZON trading candles later (index-based,
  *                         so stock overnight gaps behave exactly like replay)
- *   state rows (...-state-long, the Trial 07 book)
- *                         exit at the first close where trailing momentum is
- *                         no longer positive, the rule the live book follows
+ *   state rows (...-state-long, the book)
+ *                         exit at the first close where the rule the row's tag
+ *                         names reaches its exit: momentum no longer positive
+ *                         under Trial 07's rule, the vote at its exit count
+ *                         under a vote (Trial 09)
  *
  * Rows store wall-clock execution time, not the signal candle, so the scorer
  * derives the signal candle from the candle grid and VERIFIES it against the
@@ -34,10 +37,9 @@ function setupTagOf(row: LedgerRow): string | null {
   return m ? m[1] : null;
 }
 
-/** Trailing-momentum lookback of a state tag ("tsmom28-1d-state-long" -> 28), else null. */
-export function stateLookbackOf(tag: string | null): number | null {
-  const m = tag?.match(/^tsmom(\d+)-\w+-state-long$/);
-  return m ? Number(m[1]) : null;
+/** The rule a state row was entered under, from its tag; null for any other row. */
+export function stateRuleOf(tag: string | null): VoteRule | null {
+  return ruleOfStateTag(tag);
 }
 
 /**
@@ -72,16 +74,17 @@ function priceMatches(recordedStr: string, candleClose: number): boolean {
 }
 
 /**
- * Index of the state-construction exit: the first candle after entry whose
- * trailing L-candle return is not positive. Null when momentum is still
- * positive on every candle so far (the model trade is still open).
- * 'insufficient' when the series starts too late to test the first candle
- * after entry: silently skipping it once made stock exits days late.
+ * Index of the state-construction exit: the first candle after entry where
+ * the rule's vote is at or below its exit count (for Trial 07's rule: the
+ * trailing return is not positive). Null when the rule still holds on every
+ * candle so far (the model trade is still open). 'insufficient' when the
+ * series starts too late to test the first candle after entry: silently
+ * skipping it once made stock exits days late.
  */
-export function stateExitIndex(closes: number[], entryIdx: number, L: number): number | null | 'insufficient' {
-  if (entryIdx + 1 - L < 0) return 'insufficient';
+export function stateExitIndex(closes: number[], entryIdx: number, rule: VoteRule): number | null | 'insufficient' {
+  if (entryIdx + 1 - maxLookback(rule) < 0) return 'insufficient';
   for (let j = entryIdx + 1; j < closes.length; j++) {
-    if (closes[j] / closes[j - L] - 1 <= 0) return j;
+    if (votesAt(closes, j, rule.lookbacks) <= rule.exit) return j;
   }
   return null;
 }
@@ -118,7 +121,7 @@ interface Update {
  */
 function needsStateRescore(r: LedgerRow): boolean {
   return (
-    stateLookbackOf(setupTagOf(r)) !== null &&
+    stateRuleOf(setupTagOf(r)) !== null &&
     (r.outcome === 'win' || r.outcome === 'loss' || r.outcome === 'flat') &&
     !r.reason.includes(MODEL_V2)
   );
@@ -161,14 +164,14 @@ export async function scoreMaturedScanTrades(log: (msg: string) => void = consol
         .filter((r) => r.symbol === symbol)
         .map((row) => {
           const tag = setupTagOf(row);
-          const stateL = stateLookbackOf(tag);
-          return { row, tag, stateL, signalBoundary: Math.floor(Date.parse(row.timestamp) / iMs) * iMs };
+          const stateRule = stateRuleOf(tag);
+          return { row, tag, stateRule, signalBoundary: Math.floor(Date.parse(row.timestamp) / iMs) * iMs };
         });
 
       // Calendar lower bound for fixed-horizon rows: nothing can mature before
       // signal + horizon x interval, so skip the fetch (keeps the cycle cheap).
       // State rows can exit on the very next candle, so they always qualify.
-      const ready = plans.filter((p) => p.stateL !== null || now >= p.signalBoundary + evalHorizon * iMs);
+      const ready = plans.filter((p) => p.stateRule !== null || now >= p.signalBoundary + evalHorizon * iMs);
       for (const p of plans.filter((x) => !ready.includes(x))) {
         const minsLeft = Math.ceil((p.signalBoundary + evalHorizon * iMs - now) / 60_000);
         log(
@@ -181,7 +184,7 @@ export async function scoreMaturedScanTrades(log: (msg: string) => void = consol
 
       // State rows need L candles before the entry to test the first candle
       // after it. Stocks trade about 5 days in 7, so reach back twice as far.
-      const maxL = Math.max(0, ...ready.map((p) => p.stateL ?? 0));
+      const maxL = Math.max(0, ...ready.map((p) => (p.stateRule ? maxLookback(p.stateRule) : 0)));
       const reach = symbol.endsWith('USDT') ? 1 : 2;
       const earliest = Math.min(...ready.map((p) => p.signalBoundary)) - (maxL + 5) * reach * iMs;
       const candles = closedCandles(await fetchSeriesSince(symbol, interval, earliest));
@@ -214,9 +217,11 @@ export async function scoreMaturedScanTrades(log: (msg: string) => void = consol
         let exitIdx: number;
         let rule: string;
         const seen = { seenOutcome: p.row.outcome, seenReason: p.row.reason };
-        if (p.stateL !== null) {
-          const found = stateExitIndex(closes, entryIdx, p.stateL);
-          rule = `state exit (trailing ${p.stateL}-candle return turned non-positive)`;
+        if (p.stateRule !== null) {
+          const found = stateExitIndex(closes, entryIdx, p.stateRule);
+          rule = isSingleLookback(p.stateRule)
+            ? `state exit (trailing ${p.stateRule.lookbacks[0]}-candle return turned non-positive)`
+            : `state exit (votes over ${p.stateRule.lookbacks.join('/')} fell to ${p.stateRule.exit} or fewer)`;
           if (found === 'insufficient') {
             unmatched++;
             log(`Scoring: ${symbol} ${p.row.timestamp} — fetched history starts too late to test the state exit; row left as it is.`);
@@ -253,7 +258,7 @@ export async function scoreMaturedScanTrades(log: (msg: string) => void = consol
         const pnlPct = grossPct - cost / 100;
         const outcome = pnlPct > 0 ? 'win' : pnlPct < 0 ? 'loss' : 'flat';
         let reasonSuffix = '';
-        if (p.stateL !== null) {
+        if (p.stateRule !== null) {
           // Date from the candle's open: an Alpaca session bar closes at 03:59 UTC the next day.
           const exitDay = new Date(candles[exitIdx].openTime).toISOString().slice(0, 10);
           reasonSuffix = ` ${MODEL_V2} state exit ${exitDay} at ${exitClose}, net of ${cost} bps`;

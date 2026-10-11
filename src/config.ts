@@ -2,6 +2,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { expandSymbols } from './universe';
+import { ruleProblem, type VoteRule } from './voteRule';
 
 // Minimal .env loader (no dependency): real environment variables win over .env values.
 // Tests never read it: it holds the real paper keys and the live DATA_DIR, and
@@ -41,6 +42,13 @@ function num(name: string, fallback: number): number {
 
 const primarySymbol = process.env.SYMBOL ?? 'BTCUSDT';
 
+/** TSMOM_LOOKBACKS as numbers (a comma list), or null when unset. */
+function lookbackList(): number[] | null {
+  const raw = (process.env.TSMOM_LOOKBACKS ?? '').trim();
+  if (!raw) return null;
+  return raw.split(',').map((x) => Number(x.trim()));
+}
+
 export const CONFIG = {
   symbol: primarySymbol,
   /**
@@ -71,6 +79,17 @@ export const CONFIG = {
   strategyName: process.env.STRATEGY ?? 'sma-cross',
   /** Trial 04: time-series momentum lookback in candles (locked default 28 days). */
   tsmomLookback: num('TSMOM_LOOKBACK', 28),
+  /**
+   * The state construction's rule (Trial 09): a vote across TSMOM_LOOKBACKS,
+   * entering at TSMOM_ENTER_VOTES positive lookbacks and exiting at
+   * TSMOM_EXIT_VOTES or fewer. Unset, it is Trial 07's rule: TSMOM_LOOKBACK
+   * alone, enter at 1, exit at 0. The flip strategy still uses TSMOM_LOOKBACK.
+   */
+  tsmomRule: {
+    lookbacks: lookbackList() ?? [num('TSMOM_LOOKBACK', 28)],
+    enter: num('TSMOM_ENTER_VOTES', 1),
+    exit: num('TSMOM_EXIT_VOTES', 0),
+  } as VoteRule,
   /**
    * TSMOM state mode (the exact Trial 07 construction): long whenever the
    * trailing momentum is positive, exit when it flips non-positive. Requires
@@ -194,6 +213,11 @@ export function validateConfig(): void {
   if (CONFIG.maxOpenPositions < 1) die('MAX_OPEN_POSITIONS must be at least 1.');
   if (CONFIG.feeBps < 0 || CONFIG.feeBpsCrypto < 0 || CONFIG.feeBpsStocks < 0) die('FEE_BPS, FEE_BPS_CRYPTO and FEE_BPS_STOCKS cannot be negative.');
   if (CONFIG.tsmomLookback < 2) die('TSMOM_LOOKBACK must be at least 2.');
+  const ruleIssue = ruleProblem(CONFIG.tsmomRule);
+  if (ruleIssue) die(`TSMOM_LOOKBACKS / TSMOM_ENTER_VOTES / TSMOM_EXIT_VOTES: ${ruleIssue}.`);
+  if (CONFIG.tsmomRule.lookbacks.length > 1 && (process.env.TSMOM_ENTER_VOTES === undefined || process.env.TSMOM_EXIT_VOTES === undefined)) {
+    die('TSMOM_LOOKBACKS lists several lookbacks; set TSMOM_ENTER_VOTES and TSMOM_EXIT_VOTES too.');
+  }
   if (CONFIG.volSizeFloor <= 0 || CONFIG.volSizeFloor > 1) die('VOL_SIZE_FLOOR must be in (0,1].');
   if (CONFIG.cryptoClusterCapPct <= 0 || CONFIG.cryptoClusterCapPct > 100) die('CRYPTO_CLUSTER_CAP_PCT must be in (0,100].');
   if (CONFIG.orderTimeoutSec < 5) die('ORDER_TIMEOUT_SEC must be at least 5.');

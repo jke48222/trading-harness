@@ -145,6 +145,9 @@ test('a broker that answers with an error status is reachable: the scan runs and
   assert.match(hb.stepFailures.join(' | '), /clock: .*HTTP 503/);
 });
 
+/** Trial 07's rule with a 3-candle lookback. */
+const L3 = { lookbacks: [3], enter: 1, exit: 0 };
+
 test('stopCooldownActive: holds after a stop until momentum turns, and only after a stop', () => {
   const day = (i: number): number => Date.parse('2026-01-01T00:00:00Z') + i * DAY;
   const candles = Array.from({ length: 40 }, (_, i) => ({ openTime: day(i), open: 1, high: 1, low: 1, close: 100 + i, volume: 1, closeTime: day(i + 1) - 1 }));
@@ -153,11 +156,11 @@ test('stopCooldownActive: holds after a stop until momentum turns, and only afte
     row({ timestamp: new Date(day(10)).toISOString(), symbol: 'X' }),
     row({ timestamp: stopAt, symbol: 'X', action: 'SELL', mode: 'alpaca-paper-exit', reason: '[actual:t] Exit: CATASTROPHE STOP: position down -31%' }),
   ];
-  assert.equal(stopCooldownActive(stopRows, 'X', candles, 3), true, 'momentum stayed positive since the stop');
+  assert.equal(stopCooldownActive(stopRows, 'X', candles, L3), true, 'momentum stayed positive since the stop');
   const turned = candles.map((c, i) => (i === 35 ? { ...c, close: 10 } : c));
-  assert.equal(stopCooldownActive(stopRows, 'X', turned, 3), false, 'one non-positive close after the stop ends the cooldown');
+  assert.equal(stopCooldownActive(stopRows, 'X', turned, L3), false, 'one non-positive close after the stop ends the cooldown');
   const flipRows = [stopRows[0], { ...stopRows[1], reason: '[actual:t] Exit: momentum flipped non-positive' }];
-  assert.equal(stopCooldownActive(flipRows, 'X', candles, 3), false, 'an ordinary exit has no cooldown');
+  assert.equal(stopCooldownActive(flipRows, 'X', candles, L3), false, 'an ordinary exit has no cooldown');
 });
 
 test('nextEntryMisses: misses add up, neutral scans keep the count, an entry resets it', () => {

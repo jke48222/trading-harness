@@ -1,4 +1,5 @@
 import * as fs from 'node:fs';
+import { maxLookback, votesAt, type VoteRule } from './voteRule';
 import * as path from 'node:path';
 import { CONFIG } from './config';
 import type { BrokerAccount, BrokerPosition } from './broker/orders';
@@ -183,13 +184,14 @@ export function isStopExit(row: LedgerRow, limitPct: number): boolean {
 }
 
 /**
- * After a catastrophe stop the state signal is usually still BUY: 28-day
- * momentum can stay positive while a position falls 30% from a higher entry.
- * Without a cooldown the next scan would buy straight back, pay another round
- * trip and reset the stop. A stopped (or manually closed) symbol may re-enter
- * only after its momentum has been non-positive on at least one close since.
+ * After a catastrophe stop the state signal is usually still BUY: momentum can
+ * stay positive while a position falls 30% from a higher entry. Without a
+ * cooldown the next scan would buy straight back, pay another round trip and
+ * reset the stop. A stopped (or manually closed) symbol may re-enter only after
+ * the rule's exit condition has held on at least one close since: momentum
+ * non-positive under Trial 07's rule, the vote at its exit count under a vote.
  */
-export function stopCooldownActive(rows: LedgerRow[], symbol: string, candles: Candle[], L: number, limitPct = CONFIG.maxPositionLossPct): boolean {
+export function stopCooldownActive(rows: LedgerRow[], symbol: string, candles: Candle[], rule: VoteRule, limitPct = CONFIG.maxPositionLossPct): boolean {
   let last: LedgerRow | null = null;
   let lastT = -Infinity;
   for (const r of rows) {
@@ -204,9 +206,10 @@ export function stopCooldownActive(rows: LedgerRow[], symbol: string, candles: C
   const reentered = rows.some((r) => r.symbol === symbol && r.mode === 'alpaca-paper' && r.action === 'BUY' && Date.parse(r.timestamp) > lastT);
   if (reentered) return false;
   if (candles.length === 0 || candles[0].closeTime > lastT) return false; // the stop is older than the data held
-  for (let i = L; i < candles.length; i++) {
+  const closes = candles.map((c) => c.close);
+  for (let i = maxLookback(rule); i < candles.length; i++) {
     if (candles[i].closeTime <= lastT) continue;
-    if (candles[i].close / candles[i - L].close - 1 <= 0) return false;
+    if (votesAt(closes, i, rule.lookbacks) <= rule.exit) return false;
   }
   return true;
 }

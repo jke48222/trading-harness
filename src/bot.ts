@@ -31,6 +31,7 @@ import { fmtPrice, repairFromBroker } from './reconcileRun';
 import { boundaryOfClientId } from './broker/fills';
 import { priceEntry } from './entryPricing';
 import { tripCashSince, tripReturnPct } from './exitPricing';
+import { isSingleLookback, maxLookback, votesAt } from './voteRule';
 import type { Candle, Signal } from './types';
 
 function log(msg: string): void {
@@ -265,7 +266,7 @@ async function manageBrokerExits(stats: ScanStats): Promise<void> {
       let series: Candle[] | null = null;
       try {
         const s = closedCandles(await fetchSeries(sym, CONFIG.interval, Math.max(CONFIG.evalHorizon * 3, 90)));
-        if (CONFIG.tsmomState && s.length <= CONFIG.tsmomLookback) throw new Error(`only ${s.length} closed candles; momentum needs ${CONFIG.tsmomLookback + 1}`);
+        if (CONFIG.tsmomState && s.length <= maxLookback(CONFIG.tsmomRule)) throw new Error(`only ${s.length} closed candles; the rule needs ${maxLookback(CONFIG.tsmomRule) + 1}`);
         series = s;
       } catch (err) {
         if (!stopHit) throw err;
@@ -274,12 +275,19 @@ async function manageBrokerExits(stats: ScanStats): Promise<void> {
       if (!series) {
         exitReason = stopReason;
       } else if (CONFIG.tsmomState) {
-        const L = CONFIG.tsmomLookback;
-        const mom = series[series.length - 1].close / series[series.length - 1 - L].close - 1;
-        if (mom <= 0) exitReason = `momentum flipped non-positive (${(mom * 100).toFixed(2)}%) — state exit`;
-        else if (stopHit) exitReason = stopReason;
+        // The live rule decides every held position's exit, whichever rule opened it.
+        const rule = CONFIG.tsmomRule;
+        const closes = series.map((c) => c.close);
+        const last = closes.length - 1;
+        const votes = votesAt(closes, last, rule.lookbacks);
+        const state = isSingleLookback(rule)
+          ? `momentum ${(((closes[last] / closes[last - rule.lookbacks[0]]) - 1) * 100).toFixed(2)}%`
+          : `${votes} of ${rule.lookbacks.length} lookbacks positive`;
+        if (votes <= rule.exit) {
+          exitReason = isSingleLookback(rule) ? `momentum flipped non-positive (${state.replace('momentum ', '')}) — state exit` : `${state}, at or below the exit count of ${rule.exit} — state exit`;
+        } else if (stopHit) exitReason = stopReason;
         else {
-          log(`Broker: ${sym} momentum ${(mom * 100).toFixed(2)}% still positive (unrealized ${Number(pos.unrealized_pl).toFixed(2)} USD) — holding.`);
+          log(`Broker: ${sym} ${state}, still above the exit (unrealized ${Number(pos.unrealized_pl).toFixed(2)} USD) — holding.`);
           continue;
         }
       } else if (stopHit) {
@@ -532,7 +540,7 @@ async function scanSymbol(symbol: string, stockMarketOpen: boolean | null, riskC
     log(`${symbol}: this ${sig.setupTag} signal candle was already acted on in an earlier scan — no duplicate order.`);
     return;
   }
-  if (CONFIG.executionMode === 'alpaca-paper' && sig.action === 'BUY' && stopCooldownActive(rowsNow, symbol, candles, CONFIG.tsmomLookback)) {
+  if (CONFIG.executionMode === 'alpaca-paper' && sig.action === 'BUY' && stopCooldownActive(rowsNow, symbol, candles, CONFIG.tsmomRule)) {
     stats.attempts[symbol] = 'neutral';
     log(`${symbol}: no re-entry yet — a catastrophe stop closed this symbol, and its momentum has not turned non-positive since.`);
     return;

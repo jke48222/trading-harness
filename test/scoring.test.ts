@@ -18,16 +18,25 @@ process.env.ALPACA_PAPER_KEY_ID = 'test-key';
 process.env.ALPACA_PAPER_SECRET = 'test-secret';
 
 const memory = await import('../src/memory.ts');
-const { stateExitIndex, stateLookbackOf, scoreMaturedScanTrades, rowCostBps } = await import('../src/scoring.ts');
+const { stateExitIndex, stateRuleOf, scoreMaturedScanTrades, rowCostBps } = await import('../src/scoring.ts');
+const L3 = { lookbacks: [3], enter: 1, exit: 0 };
 
 test('stateExitIndex: the first candle after entry with non-positive trailing momentum', () => {
   // L=3. Entry at 4. mom[5]=12/10>0, mom[6]=11/11=0 -> exit at 6.
   const closes = [10, 10, 10, 11, 12, 12, 11, 9];
-  assert.equal(stateExitIndex(closes, 4, 3), 6);
-  assert.equal(stateExitIndex([1, 2, 3, 4, 5, 6], 3, 3), null, 'still positive: model trade open');
-  assert.equal(stateExitIndex([1, 2, 3, 4], 0, 3), 'insufficient', 'too little history before the entry is reported, not skipped');
-  assert.equal(stateLookbackOf('tsmom28-1d-state-long'), 28);
-  assert.equal(stateLookbackOf('tsmom28-1d-flip-long'), null);
+  assert.equal(stateExitIndex(closes, 4, L3), 6);
+  assert.equal(stateExitIndex([1, 2, 3, 4, 5, 6], 3, L3), null, 'still positive: model trade open');
+  assert.equal(stateExitIndex([1, 2, 3, 4], 0, L3), 'insufficient', 'too little history before the entry is reported, not skipped');
+  assert.deepEqual(stateRuleOf('tsmom28-1d-state-long'), { lookbacks: [28], enter: 1, exit: 0 });
+  assert.equal(stateRuleOf('tsmom28-1d-flip-long'), null);
+});
+
+test('stateExitIndex under a vote: the exit waits for the vote to reach its exit count', () => {
+  // Lookbacks 1 and 2, enter at 2, exit at 0. Entry at 3 (both up).
+  // j=4: 12 vs 11 up, vs 10 up = 2. j=5: 11.5 vs 12 down, vs 11 up = 1 (hold: above 0). j=6: 11 vs 11.5 down, vs 12 down = 0 -> exit.
+  const vote = { lookbacks: [1, 2], enter: 2, exit: 0 };
+  assert.equal(stateExitIndex([10, 10, 10, 11, 12, 11.5, 11, 13], 3, vote), 6);
+  assert.deepEqual(stateRuleOf('tsmom7/14/28/56-in3out1-1d-state-long'), { lookbacks: [7, 14, 28, 56], enter: 3, exit: 1 });
 });
 
 test('rowCostBps: real paper rows pay their sleeve cost, simulated rows the run cost', () => {
