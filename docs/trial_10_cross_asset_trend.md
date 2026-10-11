@@ -76,3 +76,30 @@ One fund per asset class, plus two Treasury maturities and inflation-protected b
 ## Disclosure
 
 Four configurations are appended to `data/trials.csv`: XA-11 long/flat (H1), long/short (D1), Faber's rule (D3) and inverse-volatility weights (D6). DBMF and KMLM (D5) are outside funds used as a yardstick, not configurations of this harness.
+
+---
+
+## Results (computed 2026-10-11, after registration)
+
+`npx tsx scripts/trial10_cross_asset_trend.ts`, evaluated as of 2026-10-01 00:00 UTC (sessions through 2026-09-30). All 11 funds share one session calendar, with no break longer than a holiday weekend.
+
+| Test | What | Months | Mean monthly excess | t | Bootstrap p | Result |
+|---|---|---|---|---|---|---|
+| H1 | XA-11 long/flat, 5 bps, next open | 2017-01 to 2026-09 (117) | -0.094% (sd 1.08%) | -0.94 | 0.830 | **fail** |
+
+As traded, the sleeve returned +0.299% a month, against +0.559% for holding all 11 in equal weights. Context: the Bonferroni correction against the configurations disclosed at the time gives 1.0.
+
+### Descriptives
+
+- **D1, long/short:** -0.204% a month (p 0.85).
+- **D2, per fund:** 10 of 11 lost to their own average exposure. TLT was worst at -0.357% a month; GLD was the only positive one, at +0.022%. A position changes 9 (SPY) to 22 (TLT) times a year.
+- **D3, Faber's 10-month rule:** +0.007% a month (p 0.48), from 2016-11.
+- **D4:** XA-11's monthly returns correlate 0.22 with the crypto book's.
+- **D5, managed-futures funds, as held:** DBMF returned +0.716% a month (sd 3.41%) from 2019-06, and KMLM +0.726% (sd 3.73%) from 2020-12. Their correlations with XA-11 were 0.25 and -0.09.
+- **D6, inverse-volatility weights:** -0.074% a month (p 0.83).
+
+### Verdict
+
+**No trend sleeve.** Over 2017 to 2026, trend timing on these 11 funds did not beat holding them, long/flat or long/short, by any of the three rules tested. That extends Trial 08's stock-only result to bonds, gold, commodities and the dollar.
+
+The managed-futures funds did better as held. They trade futures across many more markets, with shorts and borrowed exposure; this test can't speak for them, and the paper account can't trade futures. The decade tested overlaps the trend literature's flat 2010s (Babu et al., 2020); this is one window. Under the locked consequence, the budget the stock sleeve held stays in cash.

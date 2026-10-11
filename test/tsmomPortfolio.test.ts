@@ -249,3 +249,87 @@ test('countConfigs: one key per strategy|symbol|params, window ignored, short ro
   assert.equal(tp.countConfigs(text), 2);
   assert.ok(tp.configKeys(text).has(tp.configKey('tsmom', 'ETHUSDT', '{"lookback":28}')));
 });
+
+// ---- Trials 09 to 11: rules beyond one lookback
+
+/** A seeded random walk of closes. */
+function walk(n: number, seed: number, drift = 0.001, vol = 0.03): number[] {
+  const rand = tp.mulberry32(seed);
+  const out = [100];
+  for (let i = 1; i < n; i++) out.push(out[i - 1] * Math.exp(drift + vol * (rand() - 0.5) * 3.4));
+  return out;
+}
+
+test('a one-lookback vote is Trial 07\'s rule, and its series equals buildSymbolSeries exactly', () => {
+  const closes = walk(400, 7);
+  assert.deepEqual(tp.voteSignals(closes, [28], 1, 0), tp.signals(closes, 28));
+  const nowMs = Date.parse('2026-01-01T00:00:00Z');
+  const candles = cryptoCandles('2024-11-01T00:00:00Z', closes);
+  const old = tp.buildSymbolSeries('X', candles, crypto(0.003, 28, nowMs));
+  const pos = tp.voteSignals(closes, [28], 1, 0);
+  const viaPath = tp.seriesFromPath('X', tp.pathFromPositions(candles, pos, { firstIndex: 30, costPerUnit: 0.003, execution: 'close', monthBy: 'closeTime', maxGapDays: 0, nowMs }), { maxGapDays: 0, nowMs });
+  assert.deepEqual(viaPath.months, old.months);
+  for (const m of old.months) {
+    assert.equal(viaPath.stratM.get(m), old.stratM.get(m));
+    assert.equal(viaPath.benchM.get(m), old.benchM.get(m));
+  }
+  assert.equal(viaPath.wbar, old.wbar);
+  assert.equal(viaPath.turnoverPerYear, old.turnoverPerYear);
+});
+
+test('the v2 band: enter on 3 of 4 votes, exit on 1 or none, hold at 2', () => {
+  // Lookbacks 1..4 on a hand-built path, so each vote is easy to read off.
+  const closes = [10, 10, 10, 10, 10, 11, 12, 13, 12.5, 12.2, 11, 10, 10.5, 11];
+  const pos = tp.voteSignals(closes, [1, 2, 3, 4], 3, 1);
+  // i=5: all four up -> enter. i=8: 12.5 vs 13 (down), 12 (up), 11 (up), 10 (up) = 3 -> hold long.
+  // i=9: 12.2 vs 12.5 down, 13 down, 12 up, 11 up = 2 -> hold. i=10: 11 vs 12.2, 12.5, 13, 12 all down = 0 -> exit.
+  assert.deepEqual(pos.slice(4), [0, 1, 1, 1, 1, 1, 0, 0, 0, 0]);
+  // From flat, 2 votes are not enough: i=13: 11 vs 10.5 up, 10 up, 11 flat (not up), 12.2 down = 2.
+  assert.equal(pos[13], 0);
+});
+
+test('long/short votes and the next-open fill for shorts', () => {
+  const closes = [10, 11, 12, 11, 10];
+  assert.deepEqual(tp.voteSignalsLongShort(closes, [1, 2], 2), [0, 0, 1, -1, -1]);
+  // For 0 and 1 the general fill equals the registered table.
+  for (const [a, b] of [[1, 1], [0, 1], [1, 0], [0, 0]]) {
+    assert.ok(close(tp.nextOpenReturnAny(a, b, 100, 102, 105, 0.0005), tp.nextOpenReturn(a, b, 100, 102, 105, 0.0005)), `${a} -> ${b}`);
+  }
+  // Short held through: -2% overnight and -2.94% in the session each pay the short.
+  assert.ok(close(tp.nextOpenReturnAny(-1, -1, 100, 98, 95.12, 0), (1 + 0.02) * (1 - (95.12 / 98 - 1)) - 1));
+  // Long to short at the open: two units of change are charged.
+  assert.ok(close(tp.nextOpenReturnAny(1, -1, 100, 101, 99, 0.0005), (1.01) * (1 - (99 / 101 - 1)) - 1 - 0.001));
+});
+
+test('Faber\'s monthly rule: decided at each month\'s last session, held for the next month', () => {
+  // Month-end closes rise for 3 months, then fall below the 3-month mean.
+  const days = ['2024-01-30', '2024-01-31', '2024-02-28', '2024-02-29', '2024-03-28', '2024-03-29', '2024-04-29', '2024-04-30', '2024-05-30', '2024-05-31'];
+  const closesPx = [10, 10, 11, 11, 12, 12, 13, 13, 9, 9];
+  const bars = days.map((d, i) => stockBar(d, closesPx[i], closesPx[i]));
+  const { pos, firstDefined } = tp.monthEndSmaSignals(bars, 3, (c) => new Date(c.openTime).toISOString().slice(0, 7));
+  assert.equal(firstDefined, 5, 'the third month end (2024-03-29) is the first with 3 month-end closes');
+  // 03-29: 12 > mean(10, 11, 12) = 11 -> 1. 04-30: 13 > 12 -> 1. 05-31: 9 < 11.33 -> 0.
+  assert.deepEqual(pos, [0, 0, 0, 0, 0, 1, 1, 1, 1, 0]);
+});
+
+test('inverse-volatility weights lean toward the calmer symbol, and correlation and drawdown helpers', () => {
+  const nowMs = Date.parse('2026-01-01T00:00:00Z');
+  const opts = { firstIndex: 30, costPerUnit: 0, execution: 'close' as const, monthBy: 'closeTime' as const, maxGapDays: 0, nowMs };
+  const calm = cryptoCandles('2025-01-01T00:00:00Z', walk(300, 3, 0.001, 0.01));
+  const wild = cryptoCandles('2025-01-01T00:00:00Z', walk(300, 4, 0.001, 0.08));
+  const items = [calm, wild].map((c, k) => {
+    const path = tp.pathFromPositions(c, tp.voteSignals(c.map((x) => x.close), [28], 1, 0), opts);
+    return { series: tp.seriesFromPath(k ? 'WILD' : 'CALM', path, opts), path };
+  });
+  const iv = tp.inverseVolExcess(items);
+  const eq = tp.portfolioExcess(items.map((it) => it.series));
+  const m = iv.months[iv.months.length - 1];
+  const exCalm = (items[0].series.stratM.get(m) as number) - (items[0].series.benchM.get(m) as number);
+  const exEq = eq.excess[eq.months.indexOf(m)];
+  const exIv = iv.excess[iv.months.length - 1];
+  assert.ok(Math.abs(exIv - exCalm) < Math.abs(exEq - exCalm), 'the weighted mean sits nearer the calm symbol than the equal mean does');
+  assert.ok(close(tp.correlation([1, 2, 3], [2, 4, 6]), 1));
+  assert.ok(close(tp.correlation([1, 2, 3], [3, 2, 1]), -1));
+  assert.ok(close(tp.maxDrawdownOf([0.1, -0.5, 0.2]), -0.5));
+  assert.ok(close(tp.maxDrawdownOf([0.1, -0.1, -0.1]), 0.9 * 0.9 - 1));
+});

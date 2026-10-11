@@ -74,3 +74,36 @@ Holm-Bonferroni across H1 and H2 at α = 0.05. The Bonferroni-versus-trials-ledg
 ## Disclosure
 
 Four configurations are appended to `data/trials.csv`: v2 on BOOK-32 (H1), v2 minus v1 on BOOK-32 (H2), v2 on T07-8 (D1), and v2 on BOOK-32 with inverse-volatility weights (D5).
+
+---
+
+## Results (computed 2026-10-11, after registration)
+
+`npx tsx scripts/trial09_crypto_momentum_v2.ts`, evaluated as of 2026-10-01 00:00 UTC (months through 2026-09). No crypto days were missing; Binance's 2018-02-08 halt candle was kept, as in Trials 07 and 08.
+
+| Test | What | Months | Mean monthly | t | Bootstrap p | Holm |
+|---|---|---|---|---|---|---|
+| H1 | v2's excess, BOOK-32, 30 bps | 2021-01 to 2026-09 (69) | +3.274% (sd 12.99%) | 2.09 | 0.0101 | **pass** (adjusted 0.0202) |
+| H2 | v2 minus v1, BOOK-32, 30 bps | 2021-01 to 2026-09 (69) | +0.374% (sd 3.04%) | 1.02 | 0.1485 | fail |
+
+**The switch rule.** v2 minus v1 is +0.374% a month in the decision window and +0.543% a month over every month both rules cover (2017-11 to 2026-09, 107 months, p = 0.065). Both are positive, so **the book switches to v2**.
+
+Context, not the rule: against the 61 configurations disclosed at the time, a Bonferroni correction gives 0.62 for H1. Like Trial 08's crypto results, it would not survive a correction for every look this project has taken.
+
+### Descriptives
+
+- **D1, T07-8:**
+  - Decision window: v1 +3.996% a month (p 0.014), v2 +4.271% (p 0.009), v2 minus v1 +0.275% (p 0.26).
+  - Every month: v1 +3.715%, v2 +4.199%, v2 minus v1 +0.484% (p 0.12).
+- **D2, BOOK-32 over every month:** v1 +2.875% a month (p 0.0019), v2 +3.418% (p 0.0004).
+- **D3, cost:**
+  - v2's lead over v1 in the decision window grows with the cost per change: +0.125% a month at 0 bps, +0.167% at 5, +0.250% at 15, +0.374% at 30 and +0.538% at 50.
+  - v2 breaks even at 240 bps per unit change.
+- **D4, trading:** v2 changes a position 20.2 times a coin per year against v1's 29.6, a third fewer. Mean exposure is about the same (0.44 against 0.45).
+- **D5, inverse-volatility weights:** +2.500% a month in the decision window (p 0.010) and +2.987% over every month (p 0.0005). The mean is lower than with equal weights, and so is the volatility.
+
+### Verdict
+
+**The book moves to v2.** Its advantage comes mostly from trading less: before costs it leads v1 by about a tenth of a percent a month, and the lead grows with each basis point of cost. That v2 beats v1 is not established (p = 0.15). This was a choice between two pre-specified versions under a rule fixed in advance, not a claim of new edge.
+
+v2 does show a significant edge on the book's coins from 2021 on (H1). Trial 08's subsample from 2023-12 alone was not significant, so the recent era still deserves caution.

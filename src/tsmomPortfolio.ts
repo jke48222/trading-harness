@@ -354,3 +354,211 @@ export function breakEvenCost(meanExcessAt: (cost: number) => number, lo: number
   }
   return { status: 'root', cost: (a + b) / 2 };
 }
+
+// ---------------------------------------------------------------- rules beyond one lookback (Trials 09 to 11)
+//
+// New code paths, so the functions above (and the Trial 07, Trial 08 and
+// monitor numbers they produce) stay exactly as they were. A test ties the two
+// together: a one-lookback vote through this path equals buildSymbolSeries.
+
+/** How many of the lookbacks have close_i / close_{i-L} - 1 > 0. */
+export function countVotes(closes: number[], i: number, lookbacks: number[]): number {
+  let votes = 0;
+  for (const L of lookbacks) if (closes[i] / closes[i - L] - 1 > 0) votes++;
+  return votes;
+}
+
+/**
+ * A vote across lookbacks with a band between entry and exit (Trials 09, 10):
+ * from flat, go long when votes >= enter; from long, go flat when votes <= exit;
+ * otherwise keep the previous position. Flat until the longest lookback exists.
+ * One lookback with enter 1 and exit 0 is Trial 07's rule.
+ */
+export function voteSignals(closes: number[], lookbacks: number[], enter: number, exit: number): number[] {
+  const maxL = Math.max(...lookbacks);
+  const pos: number[] = new Array(closes.length).fill(0);
+  for (let i = maxL; i < closes.length; i++) {
+    const votes = countVotes(closes, i, lookbacks);
+    pos[i] = pos[i - 1] === 0 ? (votes >= enter ? 1 : 0) : votes <= exit ? 0 : 1;
+  }
+  return pos;
+}
+
+/** Long or short (Trial 10, D1): +1 when votes >= longAt, else -1; 0 until the longest lookback exists. */
+export function voteSignalsLongShort(closes: number[], lookbacks: number[], longAt: number): number[] {
+  const maxL = Math.max(...lookbacks);
+  const pos: number[] = new Array(closes.length).fill(0);
+  for (let i = maxL; i < closes.length; i++) pos[i] = countVotes(closes, i, lookbacks) >= longAt ? 1 : -1;
+  return pos;
+}
+
+/**
+ * Faber's monthly rule (Trial 10, D3): at each month's last session, s = 1 if
+ * the close is above the mean of the last `months` month-end closes (this one
+ * included), else 0, held until the next month's last session. The final
+ * candle counts as a month end. Returns the positions and the first index where
+ * the rule is defined (0 before it).
+ */
+export function monthEndSmaSignals(candles: Candle[], months: number, monthOf: (c: Candle) => string): { pos: number[]; firstDefined: number } {
+  const pos: number[] = new Array(candles.length).fill(0);
+  const ends: number[] = [];
+  let firstDefined = -1;
+  let current = 0;
+  for (let i = 0; i < candles.length; i++) {
+    const isEnd = i === candles.length - 1 || monthOf(candles[i + 1]) !== monthOf(candles[i]);
+    if (isEnd) {
+      ends.push(candles[i].close);
+      if (ends.length >= months) {
+        const window = ends.slice(-months);
+        current = candles[i].close > mean(window) ? 1 : 0;
+        if (firstDefined < 0) firstDefined = i;
+      }
+    }
+    pos[i] = firstDefined >= 0 ? current : 0;
+  }
+  return { pos, firstDefined };
+}
+
+/**
+ * Next-open fill for any position, long or short: the old position carries the
+ * overnight move, the new one the session, compounded. For 0 and 1 it equals
+ * the registered table in nextOpenReturn (up to float rounding).
+ */
+export function nextOpenReturnAny(sPrev: number, sCur: number, closePrev: number, open: number, close: number, cost: number): number {
+  return (1 + sPrev * (open / closePrev - 1)) * (1 + sCur * (close / open - 1)) - 1 - cost * Math.abs(sCur - sPrev);
+}
+
+export interface PositionPathOptions {
+  /** Candle index of the first return day: two after the first defined signal, so s_t and s_{t-1} are both real. */
+  firstIndex: number;
+  costPerUnit: number;
+  /** 'next-open' uses the registered long-only table; 'next-open-any' allows shorts. */
+  execution: Execution | 'next-open-any';
+  monthBy: 'closeTime' | 'openTime';
+  maxGapDays: number;
+  nowMs: number;
+}
+
+/** Daily returns for a given position path, s_t decided at close t (as dailyPath, for any rule). */
+export function pathFromPositions(candles: Candle[], pos: number[], o: PositionPathOptions): DailyPath {
+  const c = candles.map((x) => x.close);
+  const t = candles.map((x) => (o.monthBy === 'openTime' ? x.openTime : x.closeTime));
+  const out: DailyPath = { index: [], time: [], rAsset: [], rStrat: [], exposure: [], change: [] };
+  for (let i = Math.max(o.firstIndex, 2); i < c.length; i++) {
+    const rAsset = c[i] / c[i - 1] - 1;
+    let rStrat: number;
+    if (o.execution === 'close') rStrat = closeExecutionReturn(pos[i - 2], pos[i - 1], c[i - 1], c[i], o.costPerUnit);
+    else if (o.execution === 'next-open') rStrat = nextOpenReturn(pos[i - 2], pos[i - 1], c[i - 1], candles[i].open, c[i], o.costPerUnit);
+    else rStrat = nextOpenReturnAny(pos[i - 2], pos[i - 1], c[i - 1], candles[i].open, c[i], o.costPerUnit);
+    out.index.push(i);
+    out.time.push(t[i]);
+    out.rAsset.push(rAsset);
+    out.rStrat.push(rStrat);
+    out.exposure.push(pos[i - 1]);
+    out.change.push(Math.abs(pos[i - 1] - pos[i - 2]));
+  }
+  return out;
+}
+
+/** Per-symbol monthly series from a daily path (the arithmetic of buildSymbolSeries). */
+export function seriesFromPath(symbol: string, d: DailyPath, o: { maxGapDays: number; nowMs: number }): SymbolSeries {
+  const n = d.rStrat.length;
+  if (n === 0) return { symbol, months: [], stratM: new Map(), benchM: new Map(), bhM: new Map(), wbar: NaN, turnoverPerYear: NaN, nDays: 0 };
+  const stratAcc = new Map<string, number>();
+  const bhAcc = new Map<string, number>();
+  let turnover = 0;
+  for (let k = 0; k < n; k++) {
+    turnover += d.change[k];
+    const key = ymOf(d.time[k]);
+    stratAcc.set(key, (stratAcc.get(key) ?? 1) * (1 + d.rStrat[k]));
+    bhAcc.set(key, (bhAcc.get(key) ?? 1) * (1 + d.rAsset[k]));
+  }
+  const wbar = mean(d.exposure);
+  const benchAcc = new Map<string, number>();
+  for (let k = 0; k < n; k++) {
+    const key = ymOf(d.time[k]);
+    benchAcc.set(key, (benchAcc.get(key) ?? 1) * (1 + wbar * d.rAsset[k]));
+  }
+  const complete = new Set(completeMonths(d.time, o.nowMs, o.maxGapDays));
+  const months = [...stratAcc.keys()].sort().filter((k) => complete.has(k));
+  const stratM = new Map<string, number>();
+  const benchM = new Map<string, number>();
+  const bhM = new Map<string, number>();
+  for (const k of months) {
+    stratM.set(k, (stratAcc.get(k) as number) - 1);
+    benchM.set(k, (benchAcc.get(k) as number) - 1);
+    bhM.set(k, (bhAcc.get(k) as number) - 1);
+  }
+  const years = (d.time[n - 1] - d.time[0]) / (365.25 * 86_400_000);
+  return { symbol, months, stratM, benchM, bhM, wbar, turnoverPerYear: turnover / years, nDays: n };
+}
+
+/** Start of a YYYY-MM month, ms UTC. */
+export function monthStartMs(month: string): number {
+  const [y, m] = month.split('-').map(Number);
+  return Date.UTC(y, m - 1, 1);
+}
+
+/**
+ * Portfolio excess with inverse-volatility weights (Trial 09 D5, Trial 10 D6):
+ * each symbol live in a month is weighted by 1 / sd of its last `window` daily
+ * asset returns before the month starts. A symbol with fewer than `minDays`
+ * such returns sits that month out.
+ */
+export function inverseVolExcess(items: { series: SymbolSeries; path: DailyPath }[], window = 60, minDays = 20): { months: string[]; excess: number[] } {
+  const all = new Set<string>();
+  for (const it of items) for (const m of it.series.months) all.add(m);
+  const months: string[] = [];
+  const excess: number[] = [];
+  for (const m of [...all].sort()) {
+    const start = monthStartMs(m);
+    let wSum = 0;
+    let acc = 0;
+    for (const it of items) {
+      if (!it.series.stratM.has(m)) continue;
+      const before: number[] = [];
+      for (let k = 0; k < it.path.time.length && it.path.time[k] < start; k++) before.push(it.path.rAsset[k]);
+      const recent = before.slice(-window);
+      if (recent.length < minDays) continue;
+      const vol = sd(recent);
+      if (!(vol > 0)) continue;
+      const w = 1 / vol;
+      wSum += w;
+      acc += w * ((it.series.stratM.get(m) as number) - (it.series.benchM.get(m) as number));
+    }
+    if (wSum > 0) {
+      months.push(m);
+      excess.push(acc / wSum);
+    }
+  }
+  return { months, excess };
+}
+
+/** Pearson correlation of two equal-length series. */
+export function correlation(xs: number[], ys: number[]): number {
+  if (xs.length !== ys.length || xs.length < 2) throw new Error('correlation needs two series of the same length, at least 2.');
+  const mx = mean(xs);
+  const my = mean(ys);
+  let sxy = 0;
+  let sxx = 0;
+  let syy = 0;
+  for (let i = 0; i < xs.length; i++) {
+    sxy += (xs[i] - mx) * (ys[i] - my);
+    sxx += (xs[i] - mx) ** 2;
+    syy += (ys[i] - my) ** 2;
+  }
+  return sxy / Math.sqrt(sxx * syy);
+}
+
+/** Worst peak-to-trough fall of a compounded series of monthly returns, as a negative fraction. */
+export function maxDrawdownOf(monthly: number[]): number {
+  let wealth = 1;
+  let peak = 1;
+  let worst = 0;
+  for (const r of monthly) {
+    wealth *= 1 + r;
+    peak = Math.max(peak, wealth);
+    worst = Math.min(worst, wealth / peak - 1);
+  }
+  return worst;
+}
