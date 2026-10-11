@@ -16,71 +16,33 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { CONFIG } from '../src/config';
 import { closedCandles, fetchCandlesSince, intervalToMs } from '../src/market';
-import { completeMonths } from '../src/months';
+import { buildSymbolSeries, mean, portfolioExcess, type SymbolSeries } from '../src/tsmomPortfolio';
 import { TRIAL07_CRYPTO } from '../src/universe';
 
 const UNIVERSE = TRIAL07_CRYPTO;
 const L = 28;
 const COST_PER_UNIT = 0.0015;
 
-const mean = (xs: number[]): number => xs.reduce((a, b) => a + b, 0) / xs.length;
-
-interface MonthMaps {
-  months: string[];
-  stratM: Map<string, number>;
-  benchM: Map<string, number>;
-}
-
-async function buildSeries(symbol: string): Promise<MonthMaps> {
+async function buildSeries(symbol: string): Promise<SymbolSeries> {
   const candles = closedCandles(await fetchCandlesSince(symbol, '1d', Date.now() - 9600 * intervalToMs('1d')));
-  const c = candles.map((x) => x.close);
-  const t = candles.map((x) => x.closeTime);
-  const pos: number[] = new Array(c.length).fill(0);
-  for (let i = L; i < c.length; i++) pos[i] = c[i] / c[i - L] - 1 > 0 ? 1 : 0;
-  const ym = (ms: number): string => new Date(ms).toISOString().slice(0, 7);
-  const stratAcc = new Map<string, number>();
-  const wUsed: number[] = [];
-  const start = L + 2;
-  for (let i = start; i < c.length; i++) {
-    const rAsset = c[i] / c[i - 1] - 1;
-    wUsed.push(pos[i - 1]);
-    const rStrat = pos[i - 1] * rAsset - COST_PER_UNIT * Math.abs(pos[i - 1] - pos[i - 2]);
-    const key = ym(t[i]);
-    stratAcc.set(key, (stratAcc.get(key) ?? 1) * (1 + rStrat));
-  }
-  const wbar = mean(wUsed);
-  const benchAcc = new Map<string, number>();
-  for (let i = start; i < c.length; i++) {
-    const rAsset = c[i] / c[i - 1] - 1;
-    const key = ym(t[i]);
-    benchAcc.set(key, (benchAcc.get(key) ?? 1) * (1 + wbar * rAsset));
-  }
-  const keys = [...stratAcc.keys()].sort();
   // Keep only months the return series fully covers (crypto trades daily, so no gap allowed).
-  const complete = new Set(completeMonths(t.slice(start), Date.now(), 0));
-  const full = keys.filter((k) => complete.has(k));
-  const stratM = new Map<string, number>();
-  const benchM = new Map<string, number>();
-  for (const k of full) {
-    stratM.set(k, (stratAcc.get(k) as number) - 1);
-    benchM.set(k, (benchAcc.get(k) as number) - 1);
-  }
-  return { months: full, stratM, benchM };
+  return buildSymbolSeries(symbol, candles, {
+    lookback: L,
+    costPerUnit: COST_PER_UNIT,
+    execution: 'close',
+    monthBy: 'closeTime',
+    maxGapDays: 0,
+    nowMs: Date.now(),
+  });
 }
 
 (async () => {
-  const series: MonthMaps[] = [];
+  const series: SymbolSeries[] = [];
   for (const sym of UNIVERSE) series.push(await buildSeries(sym));
 
-  const all = new Set<string>();
-  for (const s of series) for (const m of s.months) all.add(m);
-  const months = [...all].sort();
-  const rows: { month: string; excess: number; n: number }[] = [];
-  for (const m of months) {
-    const have = series.filter((s) => s.stratM.has(m));
-    if (have.length === 0) continue;
-    rows.push({ month: m, excess: mean(have.map((s) => (s.stratM.get(m) as number) - (s.benchM.get(m) as number))), n: have.length });
-  }
+  // Equal-weight portfolio excess across the symbols live each month.
+  const port = portfolioExcess(series);
+  const rows = port.months.map((month, i) => ({ month, excess: port.excess[i], n: port.live[i] }));
 
   const csv = ['month,portfolio_excess_pct,symbols,trailing12_mean_pct,status'];
   for (let i = 0; i < rows.length; i++) {
