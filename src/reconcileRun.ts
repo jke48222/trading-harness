@@ -74,6 +74,17 @@ function bookTag(): string {
   return stateTag(CONFIG.tsmomRule, CONFIG.interval);
 }
 
+/**
+ * The tag for an adopted late fill. A fill from the last two days was placed
+ * under the live rule, whatever the newest entry row says (just after a rule
+ * change, the newest row can still carry the old one). An older fill takes the
+ * tag running when it was submitted.
+ */
+function adoptionTag(rows: LedgerRow[], fill: Fill): string {
+  const submitted = Date.parse(fill.submittedAt);
+  return Date.now() - submitted < 2 * 86_400_000 ? bookTag() : tagRunningAt(rows, submitted, bookTag());
+}
+
 export interface RepairResult {
   adopted: number;
   exitsAdded: number;
@@ -115,7 +126,7 @@ export async function repairFromBroker(log: (m: string) => void, symbols: Set<st
     if (!symbols.has(f.botSymbol) || f.trip?.manual) continue;
     if (exitStillHeld(f, held)) continue;
     if (f.kind === 'missing-entry-row' && f.fill) {
-      const tag = tagRunningAt(rows, Date.parse(f.fill.submittedAt), bookTag());
+      const tag = adoptionTag(rows, f.fill);
       add.push(adoptionRow(f.fill, tag, await signalCloseFor(f.fill, tag), fmtPrice, today));
       log(`Broker: adopting late fill ${f.fill.clientOrderId} (${f.fill.qty} ${f.fill.brokerSymbol} @ ${f.fill.price}, filled ${f.fill.filledAt}): it had no ledger row.`);
       result.adopted++;
@@ -175,7 +186,7 @@ export async function runReconcile(apply: boolean): Promise<Finding[]> {
   const adoptions: LedgerRow[] = [];
   for (const f of findings.filter((x) => x.kind === 'missing-entry-row' && x.fill && !x.trip?.manual)) {
     const fill = f.fill as Fill;
-    const tag = tagRunningAt(rows, Date.parse(fill.submittedAt), bookTag());
+    const tag = adoptionTag(rows, fill);
     adoptions.push(adoptionRow(fill, tag, await signalCloseFor(fill, tag), fmtPrice, today));
   }
   const corrections = new Map<string, LedgerRow>();

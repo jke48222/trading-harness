@@ -224,6 +224,7 @@ test('executionStats uses the same cut as npm run report: closed bot trips only'
     modelGrossPct: model,
     entrySlipBps: entry,
     exitSlipBps: exit,
+    ruleChanged: false,
   });
   const x = perf.executionStats([
     a({ grossPct: 1 }, 2, 10, -5), // gap -1

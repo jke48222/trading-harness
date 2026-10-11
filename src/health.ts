@@ -14,6 +14,8 @@ import {
 } from './broker/orders';
 import { loadLedger, openEntryFor } from './memory';
 import { runLockHolder } from './locks';
+import { plistRunEnv } from './dashboard/commands';
+import { stateTag, type VoteRule } from './voteRule';
 import type { ScanStats } from './bot';
 import type { LedgerRow } from './types';
 
@@ -63,6 +65,12 @@ export interface HealthInput {
   brokerFailStreak?: number;
   /** A book scan holds its run lock right now (positions and ledger may be mid-update). */
   bookScanRunning?: boolean;
+  /**
+   * The state rule (setup tag) the book run is defined with in this checkout's
+   * launchd template. Null when the template can't be read or the book doesn't
+   * run the state construction.
+   */
+  expectedBookRule?: string | null;
   rows: LedgerRow[];
   monitor: MonitorReading | null;
   /** Present only when broker keys are configured and the broker answered. */
@@ -167,6 +175,15 @@ export function evaluateHealth(input: HealthInput): HealthReport {
     if (hb.swept) warnings.push(`[${hb.label}] swept ${hb.swept} stale order(s) at the start of the last scan.`);
   }
 
+  // The book must trade the rule its checked-out definition names. The rule is
+  // baked into the installed plist, so a checkout without `agents.sh install`
+  // leaves it on the old one, and a stale dashboard can run another: two rules
+  // on one account sell and rebuy each other's positions.
+  const bookHb = byLabel.get('book');
+  if (bookHb?.rule && input.expectedBookRule && bookHb.rule !== input.expectedBookRule) {
+    problems.push(`[book] scanned under ${bookHb.rule}, but this checkout's agent definition says ${input.expectedBookRule}. Run \`scripts/agents.sh install\`, and restart the dashboard if it is open.`);
+  }
+
   // 2. Regime alarm and monitor freshness.
   if (!input.monitor) {
     warnings.push('No regime monitor data — run `npm run tsmom:monitor`.');
@@ -252,6 +269,7 @@ export function normalizeHeartbeat(h: Partial<ScanStats> & { label: string; at: 
     offline: false,
     offlineStreak: 0,
     universe: [],
+    rule: '',
     ...h,
   } as ScanStats;
 }
@@ -364,6 +382,23 @@ function writeHealthState(state: HealthState): void {
   }
 }
 
+/** The book's state rule (setup tag) per this checkout's launchd template, or null. */
+export function expectedBookRule(templatePath = path.join('ops', 'launchd', 'com.jalenedusei.trading.tsmom-daily.plist')): string | null {
+  let env: Record<string, string> | null;
+  try {
+    env = plistRunEnv(fs.readFileSync(templatePath, 'utf8'), 'book');
+  } catch {
+    return null;
+  }
+  if (!env || (env.TSMOM_STATE ?? 'off') !== 'on') return null;
+  const rule: VoteRule = {
+    lookbacks: env.TSMOM_LOOKBACKS ? env.TSMOM_LOOKBACKS.split(',').map(Number) : [Number(env.TSMOM_LOOKBACK ?? 28)],
+    enter: Number(env.TSMOM_ENTER_VOTES ?? 1),
+    exit: Number(env.TSMOM_EXIT_VOTES ?? 0),
+  };
+  return stateTag(rule, env.INTERVAL ?? '1d');
+}
+
 /**
  * Everything the health rules look at. `record` is true for the scheduled
  * check, which counts this run and the broker failure streak; the dashboard
@@ -379,6 +414,7 @@ export async function gatherHealthInput(record: boolean): Promise<{ input: Healt
     monitor: readMonitor(),
     healthRunTimes: record ? [...state.runs, nowMs] : state.runs,
     bookScanRunning: runLockHolder('book') != null,
+    expectedBookRule: expectedBookRule(),
   };
   if (process.env.ALPACA_PAPER_KEY_ID) {
     try {

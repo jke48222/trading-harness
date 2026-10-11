@@ -31,7 +31,7 @@ import { fmtPrice, repairFromBroker } from './reconcileRun';
 import { boundaryOfClientId } from './broker/fills';
 import { priceEntry } from './entryPricing';
 import { tripCashSince, tripReturnPct } from './exitPricing';
-import { isSingleLookback, maxLookback, votesAt } from './voteRule';
+import { isSingleLookback, maxLookback, ruleOfStateTag, stateTag, votesAt } from './voteRule';
 import type { Candle, Signal } from './types';
 
 function log(msg: string): void {
@@ -99,6 +99,8 @@ export interface ScanStats {
   offlineStreak: number;
   /** The symbols this run manages; health pages on a broker position outside them. */
   universe: string[];
+  /** The state rule this run entered under (its setup tag), or '' outside the state construction. */
+  rule: string;
 }
 
 export function runLabel(): string {
@@ -139,6 +141,7 @@ function newStats(): ScanStats {
     offline: false,
     offlineStreak: 0,
     universe: [...CONFIG.symbolsList],
+    rule: CONFIG.tsmomState ? stateTag(CONFIG.tsmomRule, CONFIG.interval) : '',
   };
 }
 
@@ -260,13 +263,19 @@ async function manageBrokerExits(stats: ScanStats): Promise<void> {
       const stopHit = CONFIG.maxPositionLossPct > 0 && unrealizedPct <= -CONFIG.maxPositionLossPct;
       const stopReason = `CATASTROPHE STOP: position down ${unrealizedPct.toFixed(1)}% (limit ${CONFIG.maxPositionLossPct}%)`;
       let exitReason: string | null = null;
+      // Crypto exits follow the live rule, whichever rule opened the position
+      // (Trial 09: the crypto run moves to the vote for every decision). Other
+      // positions, the stocks being wound down, exit under the rule they were
+      // opened with, the momentum rule Trial 08's consequence named.
+      const entryRule = ruleOfStateTag(entry.reason.match(/^\[([^\]]+)\]/)?.[1] ?? null);
+      const exitRule = isCryptoSymbol(sym) || !entryRule ? CONFIG.tsmomRule : entryRule;
       // The stop must not depend on market data (a Binance outage, a delisted
       // pair): past the limit, a position exits on the broker's own numbers
       // even when its candles don't load.
       let series: Candle[] | null = null;
       try {
         const s = closedCandles(await fetchSeries(sym, CONFIG.interval, Math.max(CONFIG.evalHorizon * 3, 90)));
-        if (CONFIG.tsmomState && s.length <= maxLookback(CONFIG.tsmomRule)) throw new Error(`only ${s.length} closed candles; the rule needs ${maxLookback(CONFIG.tsmomRule) + 1}`);
+        if (CONFIG.tsmomState && s.length <= maxLookback(exitRule)) throw new Error(`only ${s.length} closed candles; the rule needs ${maxLookback(exitRule) + 1}`);
         series = s;
       } catch (err) {
         if (!stopHit) throw err;
@@ -275,8 +284,7 @@ async function manageBrokerExits(stats: ScanStats): Promise<void> {
       if (!series) {
         exitReason = stopReason;
       } else if (CONFIG.tsmomState) {
-        // The live rule decides every held position's exit, whichever rule opened it.
-        const rule = CONFIG.tsmomRule;
+        const rule = exitRule;
         const closes = series.map((c) => c.close);
         const last = closes.length - 1;
         const votes = votesAt(closes, last, rule.lookbacks);

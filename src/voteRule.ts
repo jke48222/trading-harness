@@ -19,11 +19,51 @@ export interface VoteRule {
   exit: number;
 }
 
-/** How many lookbacks have close_i / close_{i-L} - 1 > 0. The caller ensures i >= the longest lookback. */
+/**
+ * How many lookbacks have close_i / close_{i-L} - 1 > 0. The caller ensures
+ * i >= the longest lookback. A missing or unreadable close throws: counted as
+ * "not positive" it would read as an exit and sell the position.
+ */
 export function votesAt(closes: number[], i: number, lookbacks: number[]): number {
+  if (!(closes[i] > 0)) throw new Error(`unreadable close (${closes[i]}) at candle ${i}`);
   let votes = 0;
-  for (const L of lookbacks) if (closes[i] / closes[i - L] - 1 > 0) votes++;
+  for (const L of lookbacks) {
+    const past = closes[i - L];
+    if (!(past > 0)) throw new Error(`unreadable close (${past}) at candle ${i - L}`);
+    if (closes[i] / past - 1 > 0) votes++;
+  }
   return votes;
+}
+
+/**
+ * The rule's own position at candle `index`, run over the closes it has
+ * (flat until the longest lookback exists): from flat, long at the entry
+ * count; from long, flat at the exit count. `since` is the candle where the
+ * current long began, or null when flat. The book buys whenever this is long
+ * and it holds nothing, so an entry it missed (no cash, a closed window, the
+ * Mac asleep) is made at the next chance, as Trial 09's backtest assumes.
+ */
+export function ruleStateAt(closes: number[], index: number, rule: VoteRule): { long: boolean; since: number | null } {
+  let long = false;
+  let since: number | null = null;
+  for (let i = maxLookback(rule); i <= index; i++) {
+    const votes = votesAt(closes, i, rule.lookbacks);
+    if (!long && votes >= rule.enter) {
+      long = true;
+      since = i;
+    } else if (long && votes <= rule.exit) {
+      long = false;
+      since = null;
+    }
+  }
+  return { long, since };
+}
+
+/** Which rule wrote a state exit's reason: 'single' (Trial 07), 'vote', or null for any other exit. */
+export function exitRuleKind(reason: string): 'single' | 'vote' | null {
+  if (/lookbacks positive, at or below the exit count of \d+ — state exit/.test(reason)) return 'vote';
+  if (/momentum flipped non-positive .*— state exit/.test(reason)) return 'single';
+  return null;
 }
 
 export function maxLookback(rule: VoteRule): number {

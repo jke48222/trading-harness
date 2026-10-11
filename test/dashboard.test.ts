@@ -51,7 +51,7 @@ const NOW = Date.parse('2026-10-11T04:00:00Z');
 
 function hb(p: Partial<ScanStats>): ScanStats {
   const at = p.at ?? iso(NOW);
-  return { label: 'book', at, startedAt: at, interval: '1d', execution: 'alpaca-paper', symbols: 56, failures: [], entries: [], partials: [], unfilled: [], unknown: [], rejects: [], spreadSkips: [], exits: [], exitFailures: [], orphans: [], swept: 0, adopted: 0, exitsAdded: 0, needsReview: [], stepFailures: [], exitsRan: true, entriesBlocked: null, attempts: {}, entryMisses: {}, lastCryptoWindowScan: new Date().toISOString(), offline: false, offlineStreak: 0, universe: [], ...p };
+  return { label: 'book', at, startedAt: at, interval: '1d', execution: 'alpaca-paper', symbols: 56, failures: [], entries: [], partials: [], unfilled: [], unknown: [], rejects: [], spreadSkips: [], exits: [], exitFailures: [], orphans: [], swept: 0, adopted: 0, exitsAdded: 0, needsReview: [], stepFailures: [], exitsRan: true, entriesBlocked: null, attempts: {}, entryMisses: {}, lastCryptoWindowScan: new Date().toISOString(), offline: false, offlineStreak: 0, universe: [], rule: '', ...p };
 }
 
 test('health payload: expected agents first, each fresh, stale, missing or unscheduled', () => {

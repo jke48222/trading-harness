@@ -12,7 +12,7 @@ import type { Candle } from '../src/types.ts';
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'bot-vote-'));
 process.env.LOCK_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'bot-vote-locks-'));
 Object.assign(process.env, {
-  RUN_LABEL: 'book', SYMBOLS: 'AAPL', EXECUTION: 'alpaca-paper', TSMOM_STATE: 'on', LONG_ONLY: 'on', STRATEGY: 'tsmom',
+  RUN_LABEL: 'book', SYMBOLS: 'SOLUSDT,AAPL', EXECUTION: 'alpaca-paper', TSMOM_STATE: 'on', LONG_ONLY: 'on', STRATEGY: 'tsmom',
   INTERVAL: '1d', TSMOM_LOOKBACK: '28', TSMOM_LOOKBACKS: '7,14,28,56', TSMOM_ENTER_VOTES: '3', TSMOM_EXIT_VOTES: '1',
   EVAL_HORIZON: '28', FEE_BPS: '30', BUDGET: '100000', PER_TRADE_USD: '2000', MAX_OPEN_POSITIONS: '50',
   ENTRY_WINDOW_MIN: '120', LIMIT_SLIPPAGE_BPS: '30', ORDER_TIMEOUT_SEC: '5',
@@ -98,27 +98,39 @@ test('after a stop, v2\'s wait lasts until a close with one vote or none', () =>
   assert.equal(stopCooldownActive(rows, 'X', daily(rising({ 7: 230, 14: 230, 28: 230 })), V2), false);
 });
 
-/** One book scan with a held AAPL position (entered under v1) and the given daily closes. */
-async function scanWithHeld(closes: number[]): Promise<{ exited: boolean; rows: ReturnType<typeof memory.loadLedger> }> {
+/** Binance klines for daily candles. */
+function klines(c: Candle[]): unknown[] {
+  return c.map((x) => [x.openTime, String(x.open), String(x.high), String(x.low), String(x.close), '1', x.closeTime]);
+}
+
+/**
+ * One book scan with the given held positions (both entered under Trial 07's
+ * 28-day rule) and daily closes per symbol. Returns which positions were sold
+ * and the ledger rows.
+ */
+async function scan(closesBy: { SOLUSDT: number[]; AAPL: number[] }, held: ('SOLUSDT' | 'AAPL')[]): Promise<{ sold: string[]; rows: ReturnType<typeof memory.loadLedger> }> {
   memory.resetMemory();
-  memory.appendLedgerRow(row({ timestamp: iso(now - 30 * DAY), symbol: 'AAPL', price: '100.00', reason: '[tsmom28-1d-state-long] up || broker fill 100 qty 10, order bot-AAPL-1790000000000-m1' }));
-  const bars = daily(closes).map((c) => ({ t: new Date(c.openTime).toISOString(), o: c.open, h: c.high, l: c.low, c: c.close, v: 1000 }));
-  let closed = false;
+  for (const sym of held) memory.appendLedgerRow(row({ timestamp: iso(now - 30 * DAY), symbol: sym, price: '100.00', reason: `[tsmom28-1d-state-long] up || broker fill 100 qty 10, order bot-${sym}-1790000000000-m1` }));
+  const sold: string[] = [];
+  const brokerSym = (s: string): string => (s === 'SOLUSDT' ? 'SOLUSD' : s);
+  const fill = (s: string) => order({ id: `close-${s}`, symbol: brokerSym(s), side: 'sell', status: 'filled', filled_qty: '10', filled_avg_price: '100' });
   const m = mockFetch((url, init) => {
     const method = init?.method ?? 'GET';
-    if (url.includes('/v2/stocks/AAPL/bars')) return { body: { bars, next_page_token: null } };
-    if (url.includes('/quotes/latest')) return { body: { quote: { bp: 99.9, ap: 100.1, t: new Date().toISOString() } } };
+    if (url.includes('klines') && url.includes('symbol=SOLUSDT')) return { body: klines(daily(closesBy.SOLUSDT)) };
+    if (url.includes('/v2/stocks/AAPL/bars')) return { body: { bars: daily(closesBy.AAPL).map((c) => ({ t: new Date(c.openTime).toISOString(), o: c.open, h: c.high, l: c.low, c: c.close, v: 1000 })), next_page_token: null } };
     if (url.endsWith('/v2/clock')) return { body: { is_open: true, next_open: iso(now + DAY), next_close: iso(now + 3_600_000) } };
     if (url.includes('/v2/orders?status=')) return { body: [] };
-    if (url.endsWith('/v2/account')) return { body: { account_number: 'x', status: 'ACTIVE', cash: '90000', equity: '100000', portfolio_value: '100000', buying_power: '90000' } };
+    if (url.endsWith('/v2/account')) return { body: { account_number: 'x', status: 'ACTIVE', cash: '90000', equity: '100000', portfolio_value: '100000', buying_power: '90000', non_marginable_buying_power: '90000' } };
     if (url.endsWith('/v2/positions') && method === 'GET') {
-      return { body: closed ? [] : [{ symbol: 'AAPL', qty: '10', avg_entry_price: '100', market_value: '1000', unrealized_pl: '0', current_price: '100' }] };
+      return { body: held.filter((h) => !sold.includes(h)).map((h) => ({ symbol: brokerSym(h), qty: '10', avg_entry_price: '100', market_value: '1000', unrealized_pl: '0', current_price: '100' })) };
     }
-    if (method === 'DELETE' && url.endsWith('/v2/positions/AAPL')) {
-      closed = true;
-      return { body: order({ id: 'v2close', symbol: 'AAPL', side: 'sell', status: 'filled', filled_qty: '10', filled_avg_price: '100' }) };
+    for (const h of held) {
+      if (method === 'DELETE' && url.endsWith(`/v2/positions/${brokerSym(h)}`)) {
+        sold.push(h);
+        return { body: fill(h) };
+      }
+      if (url.endsWith(`/v2/orders/close-${h}`)) return { body: fill(h) };
     }
-    if (url.endsWith('/v2/orders/v2close')) return { body: order({ id: 'v2close', symbol: 'AAPL', side: 'sell', status: 'filled', filled_qty: '10', filled_avg_price: '100' }) };
     if (method === 'POST' && url.endsWith('/v2/orders')) return { status: 500, body: { message: 'no entry should be placed' } };
     return { status: 404, body: { message: `unmocked ${method} ${url}` } };
   });
@@ -131,19 +143,90 @@ async function scanWithHeld(closes: number[]): Promise<{ exited: boolean; rows: 
     m.restore();
     process.exitCode = 0;
   }
-  return { exited: closed, rows: memory.loadLedger().filter((r) => r.symbol === 'AAPL') };
+  return { sold, rows: memory.loadLedger() };
 }
 
-test('the book holds a position at two votes, above v2\'s exit count', async () => {
-  const { exited, rows } = await scanWithHeld(closesWith({ 7: 95, 14: 96, 28: 101, 56: 102 }));
-  assert.equal(exited, false, 'two votes is inside the band: hold');
-  assert.equal(rows.length, 1);
+/** Flat closes for the symbol not under test: the vote stays flat and the 28-day rule holds nothing. */
+const quietCloses = closesWith({});
+
+test('a crypto position opened under the 28-day rule holds at two votes, inside the vote\'s band', async () => {
+  const { sold, rows } = await scan({ SOLUSDT: closesWith({ 7: 95, 14: 96, 28: 101, 56: 102 }), AAPL: quietCloses }, ['SOLUSDT']);
+  assert.deepEqual(sold, [], 'two votes: hold, though the 28-day return is negative');
+  assert.equal(rows.filter((r) => r.mode === 'alpaca-paper-exit').length, 0);
 });
 
-test('the book exits at one vote, whichever rule opened the position', async () => {
-  const { exited, rows } = await scanWithHeld(closesWith({ 7: 95, 14: 101, 28: 101, 56: 102 }));
-  assert.equal(exited, true);
+test('a crypto position exits at one vote, under the live rule', async () => {
+  const { sold, rows } = await scan({ SOLUSDT: closesWith({ 7: 95, 14: 101, 28: 101, 56: 102 }), AAPL: quietCloses }, ['SOLUSDT']);
+  assert.deepEqual(sold, ['SOLUSDT']);
   const exit = rows.find((r) => r.mode === 'alpaca-paper-exit');
   assert.ok(exit);
   assert.match(exit.reason, /1 of 4 lookbacks positive, at or below the exit count of 1 — state exit/);
+});
+
+test('a stock being wound down exits under the rule it was opened with', async () => {
+  // Two votes (the vote would hold) but a negative 28-day return (the 28-day rule exits).
+  const { sold, rows } = await scan({ SOLUSDT: quietCloses, AAPL: closesWith({ 7: 95, 14: 96, 28: 101, 56: 102 }) }, ['AAPL']);
+  assert.deepEqual(sold, ['AAPL']);
+  assert.match((rows.find((r) => r.mode === 'alpaca-paper-exit') as { reason: string }).reason, /momentum flipped non-positive \(-0\.99%\) — state exit/);
+});
+
+test('an entry the book missed is made while the vote stays long, even at two votes', () => {
+  // A rising run takes the vote long (four votes); the last close sits at two votes, inside the band.
+  const closes = Array.from({ length: 120 }, (_, i) => 100 + i);
+  closes[119 - 7] = 230;
+  closes[119 - 14] = 230;
+  const c = daily(closes);
+  const sig = tsmomSignalAt(c, c.length - 1);
+  assert.equal(sig.action, 'BUY', 'the rule is long, so a flat book buys');
+  assert.match(sig.reason, /2 of 4 lookbacks positive .* the vote has been long since/);
+});
+
+test('health raises a problem when the book scanned under a different rule from the checkout\'s', async () => {
+  const { evaluateHealth, expectedBookRule, expectedMonitorMonth } = await import('../src/health.ts');
+  assert.equal(expectedBookRule(), 'tsmom7/14/28/56-in3out1-1d-state-long', 'read from this checkout\'s book plist');
+  const base = { label: 'book', at: new Date().toISOString(), startedAt: '', interval: '1d', execution: 'alpaca-paper', symbols: 56, failures: [], entries: [], partials: [], unfilled: [], unknown: [], rejects: [], spreadSkips: [], exits: [], exitFailures: [], orphans: [], swept: 0, adopted: 0, exitsAdded: 0, needsReview: [], stepFailures: [], exitsRan: true, entriesBlocked: null, attempts: {}, entryMisses: {}, lastCryptoWindowScan: new Date().toISOString(), offline: false, offlineStreak: 0, universe: [], rule: 'tsmom28-1d-state-long' };
+  const watch = (label: string) => ({ ...base, label, execution: 'sim', rule: '' });
+  const input = { nowMs: Date.now(), heartbeats: [base, watch('watch-flip'), watch('watch-sol')], rows: [], monitor: { month: expectedMonitorMonth(Date.now()), status: 'ok', trailing12: '1' } };
+  const stale = evaluateHealth({ ...input, expectedBookRule: 'tsmom7/14/28/56-in3out1-1d-state-long' });
+  assert.match(stale.problems.join(' | '), /scanned under tsmom28-1d-state-long, but this checkout's agent definition says tsmom7\/14\/28\/56-in3out1-1d-state-long/);
+  assert.deepEqual(evaluateHealth({ ...input, expectedBookRule: 'tsmom28-1d-state-long' }).problems, []);
+});
+
+test('an unreadable close is an error, not zero votes (zero would sell)', () => {
+  assert.throws(() => vr.votesAt([100, 101, Number.NaN, 103], 3, [1, 2]), /unreadable close/);
+  assert.throws(() => vr.votesAt([100, 101, 102, Number.NaN], 3, [1]), /unreadable close/);
+});
+
+test('a trip opened under the 28-day rule and closed under the vote has no model score or exit slippage', async () => {
+  const { attributeTrips } = await import('../src/report.ts');
+  const t = { botSymbol: 'SOLUSDT', brokerSymbol: 'SOLUSD', entries: [{ orderId: 'b', clientOrderId: 'bot-SOLUSDT-1790000000000-m1', brokerSymbol: 'SOLUSD', botSymbol: 'SOLUSDT', side: 'buy' as const, qty: 10, price: 100, filledAt: iso(now - 9 * DAY), submittedAt: iso(now - 9 * DAY), bot: true }], exits: [], open: false, entryQty: 10, entryVwap: 100, exitQty: 10, exitVwap: 110, openedAt: iso(now - 9 * DAY), closedAt: iso(now - DAY), grossPct: 10, cashPnlUsd: 100, manual: false };
+  const entryRow = row({ timestamp: iso(now - 9 * DAY), symbol: 'SOLUSDT', price: '100', outcome: 'win', pnl: '8', reason: '[tsmom28-1d-state-long] up || broker fill 100 qty 10, order bot-SOLUSDT-1790000000000-m1 || model v2: state exit 2026-10-01 at 108, net of 60 bps' });
+  const exitUnderVote = row({ timestamp: iso(now - DAY), symbol: 'SOLUSDT', action: 'SELL', mode: 'alpaca-paper-exit', reason: '[actual:t] Exit: 1 of 4 lookbacks positive, at or below the exit count of 1 — state exit; entry fill 100' });
+  const switched = attributeTrips([t], [entryRow, exitUnderVote], 30)[0];
+  assert.equal(switched.ruleChanged, true);
+  assert.equal(switched.modelGrossPct, null);
+  assert.equal(switched.exitSlipBps, null);
+  assert.ok(switched.entrySlipBps !== null, 'the entry was made under its own rule: its slippage stands');
+  const exitUnderOld = { ...exitUnderVote, reason: '[actual:t] Exit: momentum flipped non-positive (-1.20%) — state exit; entry fill 100' };
+  const same = attributeTrips([t], [entryRow, exitUnderOld], 30)[0];
+  assert.equal(same.ruleChanged, false);
+  assert.equal(same.modelGrossPct, 8.6);
+});
+
+test('a stop older than the first close the vote can check no longer blocks re-entry', () => {
+  const rows = [
+    row({ timestamp: iso(now - 200 * DAY), symbol: 'X' }),
+    // The window below holds 120 daily closes; the vote can first check candle 56, about 63 days back.
+    row({ timestamp: iso(now - 100 * DAY), symbol: 'X', action: 'SELL', mode: 'alpaca-paper-exit', reason: '[actual:t] Exit: CATASTROPHE STOP: position down -31%' }),
+  ];
+  const rising = daily(Array.from({ length: 120 }, (_, i) => 100 + i));
+  assert.equal(stopCooldownActive(rows, 'X', rising, V2), false);
+});
+
+test('a candle window too short for the vote stops the config check', () => {
+  const configUrl = new URL('../src/config.ts', import.meta.url).href;
+  assert.throws(
+    () => execFileSync(process.execPath, ['--import', import.meta.resolve('tsx'), '--input-type=module', '-e', `const m = await import(${JSON.stringify(configUrl)}); m.validateConfig();`], { env: { ...process.env, SCAN_CANDLES: '58' }, stdio: 'pipe' }),
+    /SCAN_CANDLES is 58; the state rule needs at least 59/
+  );
 });

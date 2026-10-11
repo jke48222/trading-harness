@@ -205,9 +205,12 @@ export function stopCooldownActive(rows: LedgerRow[], symbol: string, candles: C
   if (!last || !isStopExit(last, limitPct)) return false;
   const reentered = rows.some((r) => r.symbol === symbol && r.mode === 'alpaca-paper' && r.action === 'BUY' && Date.parse(r.timestamp) > lastT);
   if (reentered) return false;
-  if (candles.length === 0 || candles[0].closeTime > lastT) return false; // the stop is older than the data held
+  // A stop older than the first close the rule can check (the data held, less
+  // the longest lookback) is treated as served: no close since it can be read.
+  const first = maxLookback(rule);
+  if (candles.length <= first || candles[first].closeTime > lastT) return false;
   const closes = candles.map((c) => c.close);
-  for (let i = maxLookback(rule); i < candles.length; i++) {
+  for (let i = first; i < candles.length; i++) {
     if (candles[i].closeTime <= lastT) continue;
     if (votesAt(closes, i, rule.lookbacks) <= rule.exit) return false;
   }

@@ -1,9 +1,10 @@
 import { CONFIG } from './config';
-import { type RoundTrip } from './broker/fills';
+import { type RoundTrip, exitRowFor } from './broker/fills';
 import { type BrokerActivity, fetchActivities } from './broker/orders';
 import { BOOK_START_ISO, loadBrokerTruth } from './reconcileRun';
 import { loadLedger, orderIdOf } from './memory';
 import type { LedgerRow } from './types';
+import { exitRuleKind, isSingleLookback, ruleOfStateTag } from './voteRule';
 
 /**
  * Trade-level report from broker truth. "Actual" is what the fills say;
@@ -21,6 +22,13 @@ export interface TripAttribution {
   entrySlipBps: number | null;
   /** Exit fill vs the close the model exited at, bps (positive = sold higher). */
   exitSlipBps: number | null;
+  /**
+   * Opened under one state rule and closed under another (the 2026-10-11
+   * switch to Trial 09's vote). Its model score follows the entry's rule and
+   * its exit the live one, so the gap between them would measure the rule
+   * change, not execution: model score and exit slippage are left out.
+   */
+  ruleChanged: boolean;
 }
 
 /**
@@ -56,7 +64,15 @@ export function attributeTrips(trips: RoundTrip[], rows: LedgerRow[], feeBps: nu
       }
       if (exit && trip.exitVwap != null) exitSlipBps = (trip.exitVwap / exit.price - 1) * 10_000;
     }
-    return { trip, entryRow, modelGrossPct, entrySlipBps, exitSlipBps };
+    const entryRule = entryRow ? ruleOfStateTag(entryRow.reason.match(/^\[([^\]]+)\]/)?.[1] ?? null) : null;
+    const exitRow = exitRowFor(rows, trip);
+    const exitKind = exitRow ? exitRuleKind(exitRow.reason) : null;
+    const ruleChanged = !!entryRule && !!exitKind && (isSingleLookback(entryRule) ? exitKind === 'vote' : exitKind === 'single');
+    if (ruleChanged) {
+      modelGrossPct = null;
+      exitSlipBps = null;
+    }
+    return { trip, entryRow, modelGrossPct, entrySlipBps, exitSlipBps, ruleChanged };
   });
 }
 
@@ -109,6 +125,8 @@ export async function runReport(): Promise<void> {
     const gap = withModel.map((a) => (a.trip.grossPct as number) - (a.modelGrossPct as number));
     console.log(`  model mean ${pct(mean(withModel.map((a) => a.modelGrossPct as number)))} · actual mean ${pct(mean(withModel.map((a) => a.trip.grossPct as number)))} · gap mean ${pct(mean(gap))}, median ${pct(median(gap))}`);
   }
+  const switched = closed.filter((a) => a.ruleChanged).length;
+  if (switched) console.log(`  ${switched} trip(s) opened under the 28-day rule and closed under the vote are left out of the model and exit figures (the rule change, not execution).`);
   console.log(`  entry fill vs signal close: mean ${bp(mean(entrySlips))}, median ${bp(median(entrySlips))} (${entrySlips.length} trips; includes drift since the close)`);
   console.log(`  exit fill vs model exit close: mean ${bp(mean(exitSlips))}, median ${bp(median(exitSlips))} (${exitSlips.length} trips)`);
   // Each sleeve is scored at its own cost (FEE_BPS_CRYPTO, FEE_BPS_STOCKS), so measure each on its own.

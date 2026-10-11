@@ -218,6 +218,9 @@ export function validateConfig(): void {
   if (CONFIG.tsmomRule.lookbacks.length > 1 && (process.env.TSMOM_ENTER_VOTES === undefined || process.env.TSMOM_EXIT_VOTES === undefined)) {
     die('TSMOM_LOOKBACKS lists several lookbacks; set TSMOM_ENTER_VOTES and TSMOM_EXIT_VOTES too.');
   }
+  // Under fewer candles every state signal would be a silent warmup HOLD.
+  const needCandles = Math.max(...CONFIG.tsmomRule.lookbacks) + 3;
+  if (CONFIG.tsmomState && CONFIG.scanCandles < needCandles) die(`SCAN_CANDLES is ${CONFIG.scanCandles}; the state rule needs at least ${needCandles}.`);
   if (CONFIG.volSizeFloor <= 0 || CONFIG.volSizeFloor > 1) die('VOL_SIZE_FLOOR must be in (0,1].');
   if (CONFIG.cryptoClusterCapPct <= 0 || CONFIG.cryptoClusterCapPct > 100) die('CRYPTO_CLUSTER_CAP_PCT must be in (0,100].');
   if (CONFIG.orderTimeoutSec < 5) die('ORDER_TIMEOUT_SEC must be at least 5.');

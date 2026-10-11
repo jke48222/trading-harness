@@ -1,6 +1,6 @@
 import type { Candle, Signal } from './types';
 import { CONFIG } from './config';
-import { describeRule, isSingleLookback, maxLookback, stateTag, votesAt } from './voteRule';
+import { describeRule, isSingleLookback, maxLookback, ruleStateAt, stateTag, votesAt } from './voteRule';
 
 /** Simple moving average of the `period` closes ending at endIndex (inclusive). */
 export function sma(closes: number[], period: number, endIndex: number): number | null {
@@ -46,11 +46,17 @@ export function tsmomSignalAt(candles: Candle[], index: number): Signal {
         ? { action: 'BUY', setupTag: stateTag(rule, interval), reason: `Trailing ${rule.lookbacks[0]}-candle return is positive (${pct(mom)}) — state construction holds long while momentum is positive.`, price, time }
         : { action: 'HOLD', setupTag: 'state-flat', reason: `HOLD: trailing ${rule.lookbacks[0]}-candle return is ${pct(mom)} — state construction stays flat while momentum is non-positive.`, price, time };
     }
+    // Buy whenever the vote's own state is long, not only on the day it
+    // crosses the entry count: an entry the book missed is then made at the
+    // next chance, and the book holds what the tested rule holds.
     const votes = votesAt(closes, index, rule.lookbacks);
     const tally = rule.lookbacks.map((lb) => `${lb}d ${pct(price / candles[index - lb].close - 1)}`).join(', ');
-    return votes >= rule.enter
-      ? { action: 'BUY', setupTag: stateTag(rule, interval), reason: `${votes} of ${rule.lookbacks.length} lookbacks positive (${tally}) — the vote enters at ${rule.enter} and holds until ${rule.exit} or fewer.`, price, time }
-      : { action: 'HOLD', setupTag: 'state-flat', reason: `HOLD: ${votes} of ${rule.lookbacks.length} lookbacks positive (${tally}) — entry needs ${rule.enter}.`, price, time };
+    const state = ruleStateAt(closes, index, rule);
+    if (state.long) {
+      const since = new Date(candles[state.since as number].closeTime + 1).toISOString().slice(0, 10);
+      return { action: 'BUY', setupTag: stateTag(rule, interval), reason: `${votes} of ${rule.lookbacks.length} lookbacks positive (${tally}); the vote has been long since the ${since} close — it enters at ${rule.enter} and exits at ${rule.exit} or fewer.`, price, time };
+    }
+    return { action: 'HOLD', setupTag: 'state-flat', reason: `HOLD: ${votes} of ${rule.lookbacks.length} lookbacks positive (${tally}) — the vote is flat, and entry needs ${rule.enter}.`, price, time };
   }
 
   if (index < L + 1) {
