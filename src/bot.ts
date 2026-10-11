@@ -28,6 +28,7 @@ import {
 import { buildRiskContext, evaluateEntry, recordEntry, type RiskContext } from './portfolioRisk';
 import { acquireRunLock, runLockHolder } from './locks';
 import { adoptLateFills, fmtPrice } from './reconcileRun';
+import { priceEntry } from './entryPricing';
 import type { Candle, Signal } from './types';
 
 function log(msg: string): void {
@@ -504,17 +505,22 @@ async function enterPosition(
   }
 
   const quote = await getLatestQuote(symbol);
-  if (quote && CONFIG.maxSpreadBps > 0 && quote.spreadBps > CONFIG.maxSpreadBps) {
-    stats.spreadSkips.push(`${symbol} ${quote.spreadBps.toFixed(0)}bps`);
-    log(
-      `${symbol}: entry skipped — quoted spread ${quote.spreadBps.toFixed(0)} bps (bid ${quote.bid} / ask ${quote.ask}) is wider than ` +
-        `MAX_SPREAD_BPS ${CONFIG.maxSpreadBps}; crossing it costs more than a normal day's edge. Retried next scan.`
-    );
+  // Only ask for the 1m close when the quote can't be used (stocks after hours, a missing book).
+  let pricing = priceEntry({ crypto, quote, mark: null, nowMs: Date.now(), maxSpreadBps: CONFIG.maxSpreadBps });
+  if (pricing.kind === 'price' && pricing.arrival == null) {
+    pricing = priceEntry({ crypto, quote, mark: await currentMark(symbol), nowMs: Date.now(), maxSpreadBps: CONFIG.maxSpreadBps });
+  }
+  if (pricing.kind === 'skip') {
+    stats.spreadSkips.push(`${symbol} ${quote ? quote.spreadBps.toFixed(0) + 'bps' : ''}`.trim());
+    log(`${symbol}: entry skipped — ${pricing.reason}; crossing it costs more than a normal day's edge. Retried next scan.`);
     return;
   }
-  const mark = quote ? null : await currentMark(symbol);
-  const arrival = quote?.mid ?? mark; // reference for execution slippage
-  const touch = quote?.ask ?? mark; // what a marketable buy has to pay
+  const { arrival, touch } = pricing; // arrival: slippage reference; touch: what a marketable buy pays
+  if (CONFIG.limitSlippageBps > 0 && touch == null) {
+    stats.failures.push(`${symbol}: no price to bound the limit order`);
+    log(`${symbol}: entry skipped — no quote and no 1-minute close to bound the limit order; retried next scan.`);
+    return;
+  }
   // A fresh suffix per attempt: a canceled order's id can't be reused, and the
   // per-candle dedup plus the book lock already stop double entries.
   const clientId = `bot-${symbol}-${signalBoundary}-m${Math.floor(Date.now() / 60_000)}`;
@@ -524,7 +530,8 @@ async function enterPosition(
     // Passive limit at or below the bid → rests as maker (lower fee). An
     // unfilled order is canceled and retried next scan at no cost.
     const off = 1 - CONFIG.makerOffsetBps / 10_000;
-    const limitPrice = quote ? Math.min(quote.bid, quote.mid * off) : arrival * off;
+    // Only the crypto book is the venue's own; an IEX stock bid can be a junk $0.01.
+    const limitPrice = crypto && quote ? Math.min(quote.bid, quote.mid * off) : arrival * off;
     res = await submitPaperBuyMaker(symbol, decision.notional, limitPrice, clientId, CONFIG.makerWaitSec);
   } else if (CONFIG.limitSlippageBps > 0 && touch) {
     res = await submitPaperBuyLimit(symbol, decision.notional, touch * (1 + CONFIG.limitSlippageBps / 10_000), clientId);
@@ -550,7 +557,7 @@ async function enterPosition(
   const notional = res.filledQty * fillPrice;
   recordEntry(riskCtx, symbol, orderKey, notional);
   const partialNote = res.state === 'partial' ? ' (partial fill; the rest was canceled)' : '';
-  const ref = quote ? `arrival mid ${fmtPrice(quote.mid)} (spread ${quote.spreadBps.toFixed(1)} bps)` : arrival ? `arrival mark ${fmtPrice(arrival)}` : 'no arrival price';
+  const ref = pricing.source;
   appendLedgerRow({
     timestamp: new Date().toISOString(),
     symbol,
@@ -568,7 +575,7 @@ async function enterPosition(
   (res.state === 'partial' ? stats.partials : stats.entries).push(symbol);
   log(
     `${symbol}: REAL PAPER ORDER ${res.state} — $${notional.toFixed(2)} @ ${fillPrice}${partialNote}, ` +
-      `exec slippage ${slipExec != null ? bps(slipExec) : 'n/a'} bps vs ${quote ? 'arrival mid' : 'arrival mark'}, signal-drift ${bps(slipSignal)} bps.`
+      `exec slippage ${slipExec != null ? bps(slipExec) : 'n/a'} bps vs ${pricing.source}, signal-drift ${bps(slipSignal)} bps.`
   );
   log(`${symbol}: final decision BUY (alpaca-paper) — logged to ${ledgerPath()}.`);
 }
