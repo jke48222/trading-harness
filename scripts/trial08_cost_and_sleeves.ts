@@ -265,9 +265,11 @@ function fmtBreakEven(be: BreakEven): string {
     });
   const ledgerText = fs.readFileSync(trialsPath(), 'utf8');
   const alreadyAppended = ledgerText.split('\n').some((l) => parseCsvLine(l)[2] === COMMAND);
+  // This trial's own keys are counted once, whether or not --append already wrote them.
+  const own = new Set(SPECS.map((spec) => configKey('tsmom-portfolio', spec.universe, paramsOf(spec))));
   const keys = configKeys(ledgerText);
-  const configsBefore = keys.size;
-  for (const spec of SPECS) keys.add(configKey('tsmom-portfolio', spec.universe, paramsOf(spec)));
+  const configsBefore = [...keys].filter((k) => !own.has(k)).length;
+  for (const k of own) keys.add(k);
   const nConfigs = keys.size;
   const bonferroni = (p: number): number => Math.min(1, p * nConfigs);
 
@@ -312,7 +314,7 @@ function fmtBreakEven(be: BreakEven): string {
   });
   say(`VERDICTS: ${H.map((r, i) => `${r.spec.id} ${pass[i] ? 'PASS' : 'FAIL'}`).join(' · ')}`);
   say('');
-  say(`Bonferroni-vs-ledger context (not the rule): ${configsBefore} configurations in data/trials.csv + 4 from this trial (H1, H2, H3, D3) = ${nConfigs}.`);
+  say(`Bonferroni-vs-ledger context (not the rule): ${configsBefore} configurations from earlier trials in data/trials.csv + ${own.size} from this trial (H1, H2, H3, D3) = ${nConfigs}.`);
   H.forEach((r) => say(`  ${r.spec.id}: p x ${nConfigs} = ${bonferroni(r.stats.p).toFixed(3)}${r.stats.p * nConfigs > 1 ? ' (capped at 1)' : ''}`));
 
   say('');

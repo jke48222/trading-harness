@@ -18,10 +18,11 @@ import type { Candle } from './types';
  * ledger's model scores, and public daily closes for the benchmarks.
  *
  * Timing. Alpaca's daily history has one point per US trading day, stamped
- * 00:00 UTC after the session (20:00 New York in summer). Each point is the
- * account's value at that moment, so benchmarks are priced at the same
- * moments: the Binance daily candle that closes at the stamp, and the last US
- * session close before it. Checked 2026-10-11: the account's daily returns
+ * 20:00 New York after the session: 00:00 UTC in summer, 01:00 UTC in winter,
+ * 22:00 UTC after a 13:00 early close (checked 2026-10-11 over a year of this
+ * account's history). Each point is the account's value at that moment, so
+ * benchmarks are priced at the same moments: the last Binance daily close at
+ * or before the stamp, and the last US session close before it. Checked 2026-10-11: the account's daily returns
  * correlate 0.73 with BTC priced this way and 0.12 with the candle that
  * carries the stamp's date (SPY: 0.43 against -0.07).
  *
@@ -358,11 +359,13 @@ export function closeTimeOf(c: Candle, crypto: boolean): number {
 
 /**
  * The last close printed at or before `t`, or null when there is none or it
- * is older than `maxAgeMs`. Crypto must have closed within 12 hours (the
- * candle ending at the stamp); a stock may be up to 4 days old (weekend plus
- * holiday) though a trading-day stamp always finds that day's session.
+ * is older than `maxAgeMs`. Crypto must have closed within 26 hours: the
+ * candle ending at 00:00 UTC is 0 to 1 hour before a normal stamp but 22
+ * hours before an early-close day's 22:00 UTC stamp. A stock may be up to 4
+ * days old (weekend plus holiday), though a trading-day stamp always finds
+ * that day's session.
  */
-export function closeAsOf(candles: Candle[], t: number, crypto: boolean, maxAgeMs = crypto ? DAY_MS / 2 : 4 * DAY_MS): PriceAt | null {
+export function closeAsOf(candles: Candle[], t: number, crypto: boolean, maxAgeMs = crypto ? 26 * 3_600_000 : 4 * DAY_MS): PriceAt | null {
   let best: PriceAt | null = null;
   for (const c of candles) {
     const at = closeTimeOf(c, crypto);

@@ -69,6 +69,7 @@ const median = (xs: number[]): number => {
 };
 const pct = (x: number, d = 2): string => (Number.isFinite(x) ? `${x >= 0 ? '+' : ''}${x.toFixed(d)}%` : 'n/a');
 const bp = (x: number): string => (Number.isFinite(x) ? `${x >= 0 ? '+' : ''}${x.toFixed(0)} bps` : 'n/a');
+const bp1 = (x: number): string => (Number.isFinite(x) ? `${x >= 0 ? '+' : ''}${x.toFixed(1)} bps` : 'n/a');
 
 /** USD charged as crypto fees (CFEE "USD" rows) and the count of fees taken in coin. */
 export function summarizeFees(acts: BrokerActivity[]): { usd: number; inCoin: number } {
@@ -110,6 +111,12 @@ export async function runReport(): Promise<void> {
   }
   console.log(`  entry fill vs signal close: mean ${bp(mean(entrySlips))}, median ${bp(median(entrySlips))} (${entrySlips.length} trips; includes drift since the close)`);
   console.log(`  exit fill vs model exit close: mean ${bp(mean(exitSlips))}, median ${bp(median(exitSlips))} (${exitSlips.length} trips)`);
+  // Each sleeve is scored at its own cost (FEE_BPS_CRYPTO, FEE_BPS_STOCKS), so measure each on its own.
+  for (const [name, set] of [['crypto', crypto], ['stocks', stocks]] as const) {
+    const en = set.map((a) => a.entrySlipBps).filter((x): x is number => x != null);
+    const ex = set.map((a) => a.exitSlipBps).filter((x): x is number => x != null);
+    console.log(`  ${name}: entry ${bp1(mean(en))} (median ${bp1(median(en))}, ${en.length} trips) · exit ${bp1(mean(ex))} (median ${bp1(median(ex))}, ${ex.length} trips)`);
+  }
 
   try {
     const fees = summarizeFees(await fetchActivities('CFEE', BOOK_START_ISO));

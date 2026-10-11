@@ -132,7 +132,10 @@ test('closeAsOf prices a stamp at that moment: the candle ending at 00:00 UTC, t
   assert.equal(perf.closeAsOf(btc, t0, true)?.close, 65043.98, 'the 07-14 candle closes at 2026-07-15 00:00 UTC; the 07-15 candle has not');
   const spy = [alpaca('2026-07-13', 745), alpaca('2026-07-14', 749.97), alpaca('2026-07-15', 752)];
   assert.equal(perf.closeAsOf(spy, t0, false)?.close, 749.97, 'the 07-14 session closed at 20:00 UTC, before the stamp');
-  assert.equal(perf.closeAsOf(btc.slice(0, 1), t0, true), null, 'a crypto close a day old is stale');
+  assert.equal(perf.closeAsOf([binance('2026-07-12', 63000)], t0, true), null, 'a crypto close two days old is stale');
+  // Winter stamps fall at 01:00 UTC, and an early-close day's at 22:00 UTC: both take that day's 00:00 close.
+  assert.equal(perf.closeAsOf(btc, Date.parse('2026-07-15T01:00:00Z'), true)?.close, 65043.98);
+  assert.equal(perf.closeAsOf(btc, Date.parse('2026-07-15T22:00:00Z'), true)?.close, 65043.98, 'an early-close stamp still has a benchmark price');
   assert.equal(perf.closeAsOf([binance('2026-07-20', 1)], t0, true), null, 'listed after the stamp: no price');
   const friday = Date.parse('2026-07-18T00:00:00Z'); // the stamp after Friday 07-17
   const tuesday = Date.parse('2026-07-21T00:00:00Z'); // the stamp after Monday 07-20
