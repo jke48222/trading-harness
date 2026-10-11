@@ -19,7 +19,9 @@ DEST="$HOME/Library/LaunchAgents"
 # a missing folder (and its notification) would never fire.
 LOGS="$HOME/Library/Logs/trading-harness"
 DOMAIN="gui/$(id -u)"
-AGENTS=(tsmom-daily health tsmom-monitor)
+# Health loads first: it does not run at load, and it is what notices a
+# book agent that failed to load.
+AGENTS=(health tsmom-daily tsmom-monitor)
 RETIRED=(scan)
 
 label() { echo "com.jalenedusei.trading.$1"; }
@@ -58,24 +60,43 @@ wait_until_gone() {
 case "${1:-status}" in
   install)
     mkdir -p "$DEST" "$LOGS"
+    # Render and check every plist before touching a loaded agent, so a bad
+    # template stops the install while the old agents are still running.
+    for a in "${AGENTS[@]}"; do
+      new="$DEST/$(label "$a").plist.new"
+      sed -e "s#__ROOT__#$ROOT#g" -e "s#__NPM__#$NPM#g" -e "s#__LOGS__#$LOGS#g" "$ROOT/ops/launchd/$(label "$a").plist" > "$new"
+      if ! plutil -lint "$new" > /dev/null; then
+        echo "refusing: $(label "$a") does not render to a valid plist; nothing was changed" >&2
+        rm -f "$DEST"/com.jalenedusei.trading.*.plist.new
+        exit 1
+      fi
+    done
     for a in "${RETIRED[@]}"; do
       launchctl bootout "$DOMAIN/$(label "$a")" 2>/dev/null || true
       launchctl disable "$DOMAIN/$(label "$a")"
       echo "retired $(label "$a")"
     done
-    wait_for_book_scan || exit 1
+    wait_for_book_scan || { rm -f "$DEST"/com.jalenedusei.trading.*.plist.new; exit 1; }
+    # One agent's failure doesn't stop the rest.
+    failed=0
     for a in "${AGENTS[@]}"; do
-      src="$ROOT/ops/launchd/$(label "$a").plist"
       dst="$DEST/$(label "$a").plist"
-      sed -e "s#__ROOT__#$ROOT#g" -e "s#__NPM__#$NPM#g" -e "s#__LOGS__#$LOGS#g" "$src" > "$dst.tmp"
-      plutil -lint "$dst.tmp" > /dev/null
-      mv "$dst.tmp" "$dst"
+      mv "$dst.new" "$dst"
       launchctl bootout "$DOMAIN/$(label "$a")" 2>/dev/null || true
-      wait_until_gone "$a"
-      launchctl enable "$DOMAIN/$(label "$a")"
-      launchctl bootstrap "$DOMAIN" "$dst"
-      echo "loaded $(label "$a") from $dst"
+      if ! wait_until_gone "$a"; then
+        echo "NOT UPDATED: $(label "$a") is still running its old definition; run install again" >&2
+        failed=1
+        continue
+      fi
+      launchctl enable "$DOMAIN/$(label "$a")" || true
+      if launchctl bootstrap "$DOMAIN" "$dst" || { sleep 2; launchctl bootstrap "$DOMAIN" "$dst"; }; then
+        echo "loaded $(label "$a") from $dst"
+      else
+        echo "NOT LOADED: $(label "$a"); run install again" >&2
+        failed=1
+      fi
     done
+    exit "$failed"
     ;;
   status)
     for a in "${AGENTS[@]}" "${RETIRED[@]}"; do
