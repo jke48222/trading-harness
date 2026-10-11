@@ -1,21 +1,22 @@
 import { CONFIG } from '../config';
 
 /**
- * Alpaca PAPER order adapter — the execution layer §5 reserved for explicit
- * user approval (granted 2026-07-15: "$100k in paper money on alpaca to do a
- * lot of testing and trials").
+ * Alpaca PAPER order adapter: the execution layer reserved for explicit user
+ * approval (granted 2026-07-15: "$100k in paper money on alpaca to do a lot of
+ * testing and trials").
  *
  * Guardrails:
- * - The host is hardcoded to paper-api.alpaca.markets. There is no live host
- *   anywhere in this file or this project; the paper host only serves paper
- *   accounts, so no key or flag can make this code touch real money.
- * - Order placement additionally requires EXECUTION=alpaca-paper in config —
- *   default is local simulation, exactly as before.
- * - Every fill is recorded with its slippage vs the signal price, so paper
- *   trading doubles as the instrumented execution-cost experiment the research
- *   said we owe ourselves.
+ * - Orders go to paper-api.alpaca.markets, hardcoded. That host only serves
+ *   paper accounts, so no key or flag can make this code touch real money.
+ * - Order placement also requires EXECUTION=alpaca-paper in config; the
+ *   default is local simulation.
+ * - No order is ever left resting. Every submit settles: it waits for a final
+ *   state and cancels on timeout. A resting buy reserves cash and can fill
+ *   hours later with no ledger row; from July to October 2026, 35 of them
+ *   locked up ~$64k and blocked every crypto entry (see docs/incidents.md).
  */
 const PAPER_TRADING_HOST = 'https://paper-api.alpaca.markets';
+const DATA_HOST = 'https://data.alpaca.markets';
 
 function authHeaders(): Record<string, string> {
   const key = process.env.ALPACA_PAPER_KEY_ID;
@@ -26,18 +27,31 @@ function authHeaders(): Record<string, string> {
   return { 'APCA-API-KEY-ID': key, 'APCA-API-SECRET-KEY': secret, 'content-type': 'application/json' };
 }
 
-async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
-  const res = await fetch(PAPER_TRADING_HOST + path, {
+/** An HTTP error from the broker, kept structured so callers can tell a rejection from an outage. */
+export class BrokerHttpError extends Error {
+  constructor(
+    readonly method: string,
+    readonly path: string,
+    readonly status: number,
+    readonly body: string
+  ) {
+    super(`${method} ${path} -> HTTP ${status}: ${body}`);
+    this.name = 'BrokerHttpError';
+  }
+}
+
+async function request<T>(method: string, path: string, body?: unknown, host = PAPER_TRADING_HOST): Promise<T> {
+  const res = await fetch(host + path, {
     method,
     headers: authHeaders(),
     body: body === undefined ? undefined : JSON.stringify(body),
     signal: AbortSignal.timeout(15000),
   });
   if (!res.ok) {
-    const text = (await res.text()).slice(0, 300);
-    throw new Error(`${method} ${path} -> HTTP ${res.status}: ${text}`);
+    throw new BrokerHttpError(method, path, res.status, (await res.text()).slice(0, 300));
   }
-  return (await res.json()) as T;
+  const text = await res.text();
+  return (text ? JSON.parse(text) : null) as T;
 }
 
 export interface BrokerOrder {
@@ -46,10 +60,16 @@ export interface BrokerOrder {
   symbol: string;
   status: string;
   side: string;
+  type?: string;
+  time_in_force?: string;
   notional: string | null;
   qty: string | null;
+  limit_price?: string | null;
   filled_qty: string;
   filled_avg_price: string | null;
+  submitted_at?: string;
+  filled_at?: string | null;
+  created_at?: string;
 }
 
 export interface BrokerPosition {
@@ -61,18 +81,6 @@ export interface BrokerPosition {
   current_price: string;
 }
 
-/** BTCUSDT -> BTC/USD for orders; equities pass through. */
-export function toOrderSymbol(symbol: string): string {
-  if (symbol.endsWith('USDT')) return `${symbol.slice(0, -4)}/USD`;
-  if (symbol.endsWith('USD') && !symbol.includes('/')) return `${symbol.slice(0, -3)}/USD`;
-  return symbol;
-}
-
-/** Positions API reports crypto without the slash (BTCUSD); normalize both ways. */
-export function positionMatches(positionSymbol: string, symbol: string): boolean {
-  return positionSymbol.replace('/', '') === toOrderSymbol(symbol).replace('/', '');
-}
-
 export interface BrokerAccount {
   account_number: string;
   status: string;
@@ -80,6 +88,26 @@ export interface BrokerAccount {
   equity: string;
   portfolio_value: string;
   buying_power: string;
+  non_marginable_buying_power?: string;
+}
+
+/** BTCUSDT -> BTC/USD for orders; equities pass through. */
+export function toOrderSymbol(symbol: string): string {
+  if (symbol.endsWith('USDT')) return `${symbol.slice(0, -4)}/USD`;
+  if (symbol.endsWith('USD') && !symbol.includes('/')) return `${symbol.slice(0, -3)}/USD`;
+  return symbol;
+}
+
+/** Broker symbol (BTC/USD, BTCUSD, AAPL) -> the bot's symbol (BTCUSDT, AAPL). */
+export function botSymbolOf(brokerSymbol: string): string {
+  if (brokerSymbol.endsWith('/USD')) return `${brokerSymbol.slice(0, -4)}USDT`;
+  if (brokerSymbol.endsWith('USD') && brokerSymbol.length > 4) return `${brokerSymbol.slice(0, -3)}USDT`;
+  return brokerSymbol;
+}
+
+/** Positions API reports crypto without the slash (BTCUSD); normalize both ways. */
+export function positionMatches(positionSymbol: string, symbol: string): boolean {
+  return positionSymbol.replace('/', '') === toOrderSymbol(symbol).replace('/', '');
 }
 
 export async function getAccount(): Promise<BrokerAccount> {
@@ -105,13 +133,173 @@ export async function getOrder(id: string): Promise<BrokerOrder> {
   return request<BrokerOrder>('GET', `/v2/orders/${id}`);
 }
 
+export async function getOpenOrders(): Promise<BrokerOrder[]> {
+  return request<BrokerOrder[]>('GET', '/v2/orders?status=open&limit=500');
+}
+
+export async function cancelOrder(id: string): Promise<void> {
+  try {
+    await request<unknown>('DELETE', `/v2/orders/${id}`);
+  } catch {
+    /* already gone or filled; settleOrder reads the final state either way */
+  }
+}
+
+/** Every order submitted after `afterIso`, newest first, paging past the 500-row page limit. */
+export async function fetchOrdersSince(afterIso: string): Promise<BrokerOrder[]> {
+  const seen = new Map<string, BrokerOrder>();
+  let until = new Date(Date.now() + 60_000).toISOString();
+  for (let page = 0; page < 40; page++) {
+    const batch = await request<BrokerOrder[]>(
+      'GET',
+      `/v2/orders?status=all&limit=500&direction=desc&after=${encodeURIComponent(afterIso)}&until=${encodeURIComponent(until)}`
+    );
+    for (const o of batch) seen.set(o.id, o);
+    if (batch.length < 500) break;
+    until = batch[batch.length - 1].submitted_at ?? until;
+  }
+  return [...seen.values()];
+}
+
+export interface BrokerActivity {
+  id: string;
+  activity_type: string;
+  date?: string;
+  created_at?: string;
+  transaction_time?: string;
+  net_amount?: string;
+  symbol?: string;
+  qty?: string;
+  price?: string;
+  side?: string;
+  description?: string;
+}
+
+/** Account activities of one type (CFEE, FILL, ...) since `afterIso`, paging by token. */
+export async function fetchActivities(type: string, afterIso: string): Promise<BrokerActivity[]> {
+  const out: BrokerActivity[] = [];
+  let token = '';
+  for (let page = 0; page < 50; page++) {
+    const batch = await request<BrokerActivity[]>(
+      'GET',
+      `/v2/account/activities/${type}?after=${encodeURIComponent(afterIso)}&direction=desc&page_size=100${token ? `&page_token=${encodeURIComponent(token)}` : ''}`
+    );
+    out.push(...batch);
+    if (batch.length < 100) break;
+    token = batch[batch.length - 1].id;
+  }
+  return out;
+}
+
+export interface Quote {
+  bid: number;
+  ask: number;
+  mid: number;
+  spreadBps: number;
+  at: string;
+}
+
+/** Spread and mid from a bid/ask pair, or null when the pair is not a usable two-sided quote. */
+export function makeQuote(bid: number, ask: number, at: string): Quote | null {
+  if (!(bid > 0) || !(ask > 0) || ask < bid) return null;
+  const mid = (bid + ask) / 2;
+  return { bid, ask, mid, spreadBps: ((ask - bid) / mid) * 10_000, at };
+}
+
 /**
- * Submit a notional market BUY on the paper account and wait for the fill.
- * `clientOrderId` should be deterministic per signal candle (idempotency:
- * Alpaca rejects duplicate client_order_ids, a second guard behind our
- * per-signal-candle dedup).
+ * Latest top-of-book quote on the venue the order will hit: Alpaca's crypto
+ * book for crypto, the IEX book for stocks. Null when there is no usable
+ * two-sided quote (callers fall back to the last trade price).
  */
-export async function submitPaperBuy(symbol: string, notionalUsd: number, clientOrderId: string): Promise<BrokerOrder> {
+export async function getLatestQuote(symbol: string): Promise<Quote | null> {
+  try {
+    if (symbol.endsWith('USDT')) {
+      const sym = toOrderSymbol(symbol);
+      const res = await request<{ quotes: Record<string, { bp: number; ap: number; t: string }> }>(
+        'GET',
+        `/v1beta3/crypto/us/latest/quotes?symbols=${encodeURIComponent(sym)}`,
+        undefined,
+        DATA_HOST
+      );
+      const q = res.quotes?.[sym];
+      return q ? makeQuote(q.bp, q.ap, q.t) : null;
+    }
+    const res = await request<{ quote: { bp: number; ap: number; t: string } }>(
+      'GET',
+      `/v2/stocks/${encodeURIComponent(symbol)}/quotes/latest?feed=iex`,
+      undefined,
+      DATA_HOST
+    );
+    return res.quote ? makeQuote(res.quote.bp, res.quote.ap, res.quote.t) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Limit price text the broker accepts. Alpaca's crypto price increment is
+ * 1e-9, so sub-dollar coins get up to 9 decimals (BONK at 0.0000034 keeps its
+ * digits; the old toFixed(6) turned it into 0.000003, 12% below the market).
+ * Stocks: cents at $1 and above, 4 decimals below.
+ */
+export function fmtLimit(price: number, crypto: boolean): string {
+  if (price >= 1) return price.toFixed(2);
+  if (!crypto) return price.toFixed(4);
+  const s = price.toFixed(9).replace(/0+$/, '');
+  return s.endsWith('.') ? s + '0' : s;
+}
+
+const TERMINAL = new Set(['filled', 'canceled', 'expired', 'rejected', 'done_for_day', 'replaced']);
+
+/**
+ * Wait for an order to reach a final state. If it has not by the deadline,
+ * CANCEL it and wait for the cancel to land, so nothing is left resting at the
+ * broker. Returns the last state seen; a non-terminal result means the broker
+ * never confirmed and the caller must treat the order as unknown.
+ */
+export async function settleOrder(orderId: string, timeoutMs = 30_000, pollMs = 500): Promise<BrokerOrder> {
+  const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+  const start = Date.now();
+  let o = await getOrder(orderId);
+  while (!TERMINAL.has(o.status) && Date.now() - start < timeoutMs) {
+    await sleep(pollMs);
+    o = await getOrder(orderId);
+  }
+  if (TERMINAL.has(o.status)) return o;
+  await cancelOrder(orderId);
+  const cancelDeadline = Date.now() + 15_000;
+  do {
+    await sleep(pollMs);
+    o = await getOrder(orderId);
+  } while (!TERMINAL.has(o.status) && Date.now() < cancelDeadline);
+  return o;
+}
+
+export type EntryState = 'filled' | 'partial' | 'unfilled' | 'unknown';
+
+export interface EntryResult {
+  state: EntryState;
+  order: BrokerOrder;
+  filledQty: number;
+  fillPrice: number | null;
+}
+
+/** Classify a settled order. A partial fill that was then canceled is still a real position. */
+export function classifyEntry(order: BrokerOrder): EntryResult {
+  const filledQty = Number(order.filled_qty) || 0;
+  const fillPrice = order.filled_avg_price != null && Number(order.filled_avg_price) > 0 ? Number(order.filled_avg_price) : null;
+  let state: EntryState;
+  if (order.status === 'filled') state = 'filled';
+  else if (!TERMINAL.has(order.status)) state = 'unknown';
+  else state = filledQty > 0 ? 'partial' : 'unfilled';
+  return { state, order, filledQty, fillPrice };
+}
+
+/**
+ * Notional market BUY. `clientOrderId` is deterministic per signal candle, so
+ * Alpaca rejects a duplicate: a second guard behind the per-candle dedup.
+ */
+export async function submitPaperBuy(symbol: string, notionalUsd: number, clientOrderId: string): Promise<EntryResult> {
   const isCrypto = symbol.endsWith('USDT');
   const order = await request<BrokerOrder>('POST', '/v2/orders', {
     symbol: toOrderSymbol(symbol),
@@ -121,17 +309,15 @@ export async function submitPaperBuy(symbol: string, notionalUsd: number, client
     time_in_force: isCrypto ? 'gtc' : 'day',
     client_order_id: clientOrderId,
   });
-  return waitForFill(order.id);
+  return classifyEntry(await settleOrder(order.id, CONFIG.orderTimeoutSec * 1000));
 }
 
 /**
  * Bounded marketable-limit BUY: a limit at `limitPrice` so a fill can never be
- * arbitrarily worse than the cap (LIMIT_SLIPPAGE_BPS above the decision mark).
- * If it doesn't fill inside the wait window it throws — the caller leaves the
- * symbol un-entered and the next scan retries. Notional orders can't carry a
- * limit price, so this sizes qty from the limit price.
+ * worse than the cap. Sized in qty from the limit (notional orders can't carry
+ * a limit). Settles: an order that hasn't filled by the timeout is canceled.
  */
-export async function submitPaperBuyLimit(symbol: string, notionalUsd: number, limitPrice: number, clientOrderId: string): Promise<BrokerOrder> {
+export async function submitPaperBuyLimit(symbol: string, notionalUsd: number, limitPrice: number, clientOrderId: string): Promise<EntryResult> {
   const isCrypto = symbol.endsWith('USDT');
   const qty = notionalUsd / limitPrice;
   const order = await request<BrokerOrder>('POST', '/v2/orders', {
@@ -139,48 +325,19 @@ export async function submitPaperBuyLimit(symbol: string, notionalUsd: number, l
     qty: isCrypto ? qty.toFixed(9) : String(Math.max(1, Math.floor(qty))),
     side: 'buy',
     type: 'limit',
-    limit_price: limitPrice.toFixed(limitPrice >= 1 ? 2 : 6),
+    limit_price: fmtLimit(limitPrice, isCrypto),
     time_in_force: isCrypto ? 'gtc' : 'day',
     client_order_id: clientOrderId,
   });
-  return waitForFill(order.id);
-}
-
-/** Format a limit price with enough precision for the asset (BTC → 2dp, SHIB → 6 sig figs). */
-function fmtLimit(p: number): string {
-  return p >= 1 ? p.toFixed(2) : p.toPrecision(6);
-}
-
-export async function getOpenOrders(): Promise<BrokerOrder[]> {
-  return request<BrokerOrder[]>('GET', '/v2/orders?status=open&limit=200');
-}
-
-export async function cancelOrder(id: string): Promise<void> {
-  try {
-    await request<unknown>('DELETE', `/v2/orders/${id}`);
-  } catch {
-    /* already gone/filled — fine */
-  }
-}
-
-/** Cancel any of the bot's still-open orders (client_order_id starts with "bot-") so none go stale between scans. */
-export async function cancelStaleBotOrders(): Promise<number> {
-  const open = await getOpenOrders();
-  let n = 0;
-  for (const o of open) {
-    if ((o.client_order_id || '').startsWith('bot-')) {
-      await cancelOrder(o.id);
-      n++;
-    }
-  }
-  return n;
+  return classifyEntry(await settleOrder(order.id, CONFIG.orderTimeoutSec * 1000));
 }
 
 /**
- * MAKER entry: a passive limit BUY placed BELOW the mark so it rests (lower fee)
- * instead of crossing the spread. Polls up to `waitSec`; if it does not fill it
- * CANCELS and returns null — the caller writes no ledger row and the next scan
- * retries. Graceful non-fill is the whole point: a missed entry costs nothing.
+ * MAKER entry: a passive limit BUY below the mark, so it rests for the lower
+ * fee instead of crossing the spread. Canceled if not filled within `waitSec`;
+ * the caller writes no row for an unfilled result and the next scan retries.
+ * Alpaca paper does not fill resting below-mark limits, so this is for real
+ * accounts only (docs/paper_phase_protocol.md).
  */
 export async function submitPaperBuyMaker(
   symbol: string,
@@ -188,7 +345,7 @@ export async function submitPaperBuyMaker(
   limitPrice: number,
   clientOrderId: string,
   waitSec: number
-): Promise<BrokerOrder | null> {
+): Promise<EntryResult> {
   const isCrypto = symbol.endsWith('USDT');
   const qty = notionalUsd / limitPrice;
   const order = await request<BrokerOrder>('POST', '/v2/orders', {
@@ -196,45 +353,46 @@ export async function submitPaperBuyMaker(
     qty: isCrypto ? qty.toFixed(9) : String(Math.max(1, Math.floor(qty))),
     side: 'buy',
     type: 'limit',
-    limit_price: fmtLimit(limitPrice),
+    limit_price: fmtLimit(limitPrice, isCrypto),
     time_in_force: isCrypto ? 'gtc' : 'day',
     client_order_id: clientOrderId,
   });
-  const deadline = Date.now() + waitSec * 1000;
-  for (;;) {
-    const o = await getOrder(order.id);
-    if (o.status === 'filled') return o;
-    if (['canceled', 'expired', 'rejected'].includes(o.status)) return null;
-    if (Date.now() > deadline) {
-      await cancelOrder(order.id);
-      return null;
-    }
-    await new Promise((r) => setTimeout(r, 500));
-  }
+  return classifyEntry(await settleOrder(order.id, waitSec * 1000));
 }
 
-/** Close an entire open position at market (Alpaca's close-position endpoint). */
+/**
+ * Cancel the bot's own open orders (client_order_id "bot-...") older than
+ * `minAgeMs`. Entries settle synchronously now, so any survivor is left over
+ * from a crash or an unconfirmed cancel. The age floor keeps a scan from
+ * canceling an order another process placed seconds ago.
+ */
+export async function cancelStaleBotOrders(minAgeMs = 2 * 60_000): Promise<BrokerOrder[]> {
+  const now = Date.now();
+  const stale = (await getOpenOrders()).filter((o) => {
+    if (!(o.client_order_id || '').startsWith('bot-')) return false;
+    const t = Date.parse(o.submitted_at ?? o.created_at ?? '');
+    return !Number.isFinite(t) || now - t >= minAgeMs;
+  });
+  for (const o of stale) await cancelOrder(o.id);
+  return stale;
+}
+
+/**
+ * Close an entire open position at market (Alpaca's close-position endpoint)
+ * and settle it. Throws unless the close fully filled, so the caller records
+ * an exit only for a position that is really gone; anything else is retried
+ * on the next scan.
+ */
 export async function closePaperPosition(symbol: string): Promise<BrokerOrder> {
   const order = await request<BrokerOrder>('DELETE', `/v2/positions/${toOrderSymbol(symbol).replace('/', '')}`);
-  return waitForFill(order.id);
-}
-
-async function waitForFill(orderId: string, timeoutMs = 20000): Promise<BrokerOrder> {
-  const start = Date.now();
-  for (;;) {
-    const o = await getOrder(orderId);
-    if (o.status === 'filled') return o;
-    if (['canceled', 'expired', 'rejected'].includes(o.status)) {
-      throw new Error(`Order ${orderId} ended ${o.status} without filling.`);
-    }
-    if (Date.now() - start > timeoutMs) {
-      throw new Error(`Order ${orderId} not filled after ${timeoutMs / 1000}s (status ${o.status}) — investigate before retrying; no duplicate was sent.`);
-    }
-    await new Promise((r) => setTimeout(r, 500));
+  const final = await settleOrder(order.id, CONFIG.orderTimeoutSec * 1000);
+  if (final.status !== 'filled') {
+    throw new Error(`Close order ${final.id} for ${symbol} ended '${final.status}' (filled ${final.filled_qty}) — exit not recorded; the next scan retries.`);
   }
+  return final;
 }
 
-/** Signed slippage of a fill vs the signal price, in basis points (positive = paid more than signal close). */
-export function slippageBps(fillPrice: number, signalPrice: number): number {
-  return ((fillPrice - signalPrice) / signalPrice) * 10_000;
+/** Signed slippage of a fill vs a reference price, in basis points (positive = paid more). */
+export function slippageBps(fillPrice: number, referencePrice: number): number {
+  return ((fillPrice - referencePrice) / referencePrice) * 10_000;
 }

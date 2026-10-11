@@ -20,8 +20,9 @@ import { closedCandles, fetchSeries } from '../src/market';
 
   console.log('Submitting $10.00 BTC/USD market BUY on the PAPER account (Alpaca minimum crypto order is $10 notional)…');
   const buy = await submitPaperBuy('BTCUSDT', 10, `smoke-${Date.now()}`);
-  const buyFill = Number(buy.filled_avg_price);
-  console.log(`BUY filled: qty ${buy.filled_qty} @ ${buyFill} · slippage vs reference ${slippageBps(buyFill, ref).toFixed(1)} bps`);
+  if (buy.state !== 'filled' || buy.fillPrice == null) throw new Error(`BUY did not fill (${buy.state}, status ${buy.order.status}).`);
+  const buyFill = buy.fillPrice;
+  console.log(`BUY filled: qty ${buy.filledQty} @ ${buyFill} · slippage vs reference ${slippageBps(buyFill, ref).toFixed(1)} bps`);
 
   const open = await getBrokerPositions();
   const pos = open.find((p) => p.symbol.replace('/', '') === 'BTCUSD');

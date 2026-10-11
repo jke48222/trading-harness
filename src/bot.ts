@@ -5,17 +5,19 @@ import { closedCandles, fetchSeries, fetchSeriesSince, intervalToMs, isCryptoSym
 import { latestSignal } from './strategy';
 import { checkRisk } from './risk';
 import { simulatePaperOrder } from './execution';
-import { appendLedgerRow, ensureMemoryFiles, ledgerPath, loadLedger, paperPosition } from './memory';
+import { appendLedgerRow, ensureMemoryFiles, entryFillOf, ledgerPath, loadLedger, openEntryFor, orderIdOf, paperPosition } from './memory';
 import { consultMemory } from './adaptiveFilter';
 import { scoreMaturedScanTrades } from './scoring';
 import { regimeAllows, regimeAt } from './regime';
 import { fetchMarketClock } from './stockdata';
 import {
-  type BrokerOrder,
+  BrokerHttpError,
+  type EntryResult,
   cancelStaleBotOrders,
   closePaperPosition,
   getAccount,
   getBrokerPositions,
+  getLatestQuote,
   positionMatches,
   slippageBps,
   submitPaperBuy,
@@ -24,17 +26,15 @@ import {
   toOrderSymbol,
 } from './broker/orders';
 import { buildRiskContext, evaluateEntry, recordEntry, type RiskContext } from './portfolioRisk';
+import { acquireRunLock, runLockHolder } from './locks';
+import { adoptLateFills, fmtPrice } from './reconcileRun';
+import type { Candle, Signal } from './types';
 
 function log(msg: string): void {
   console.log(`[${new Date().toISOString()}] ${msg}`);
 }
 
-/** Cheap and micro-priced coins need significant digits, not fixed decimals, for scoring's price verification to stay tight. */
-function fmtPrice(p: number): string {
-  return p >= 10 ? p.toFixed(2) : p.toPrecision(6);
-}
-
-/** A fresh intraday mark (last 1-minute close) — the decision-time reference for honest slippage. Null if unavailable. */
+/** Last 1-minute close: the fallback arrival price when the venue has no usable quote. Null if unavailable. */
 async function currentMark(symbol: string): Promise<number | null> {
   try {
     const c = closedCandles(await fetchSeries(symbol, '1m', 2));
@@ -44,24 +44,88 @@ async function currentMark(symbol: string): Promise<number | null> {
   }
 }
 
-function writeHeartbeat(scanned: number, failures: number): void {
+/** What one scan did. Written as this run's heartbeat; health turns the bad parts into alerts. */
+export interface ScanStats {
+  label: string;
+  at: string;
+  startedAt: string;
+  interval: string;
+  execution: string;
+  symbols: number;
+  /** Symbols whose data or logic failed (not broker refusals). */
+  failures: string[];
+  entries: string[];
+  partials: string[];
+  /** Entries that settled with nothing filled and were canceled. Retried next scan. */
+  unfilled: string[];
+  /** Orders the broker never confirmed as final. Swept and adopted next scan. */
+  unknown: string[];
+  /** Orders the broker refused (HTTP 4xx), e.g. insufficient balance. */
+  rejects: string[];
+  spreadSkips: string[];
+  exits: string[];
+  exitFailures: string[];
+  /** Broker positions in this run's universe with no open ledger entry. */
+  orphans: string[];
+  swept: number;
+  adopted: number;
+}
+
+export function runLabel(): string {
+  if (CONFIG.runLabel) return CONFIG.runLabel;
+  const state = CONFIG.tsmomState ? '-state' : '';
+  return `${CONFIG.strategyName}${state}-${CONFIG.interval}-${CONFIG.executionMode}-${CONFIG.symbolsList.length}sym`;
+}
+
+function newStats(): ScanStats {
+  const now = new Date().toISOString();
+  return {
+    label: runLabel(),
+    at: now,
+    startedAt: now,
+    interval: CONFIG.interval,
+    execution: CONFIG.executionMode,
+    symbols: CONFIG.symbolsList.length,
+    failures: [],
+    entries: [],
+    partials: [],
+    unfilled: [],
+    unknown: [],
+    rejects: [],
+    spreadSkips: [],
+    exits: [],
+    exitFailures: [],
+    orphans: [],
+    swept: 0,
+    adopted: 0,
+  };
+}
+
+/** data/heartbeat/<label>.json, one file per agent, so a busy agent can't mask a dead one. */
+export function heartbeatDir(): string {
+  return path.join(CONFIG.dataDir, 'heartbeat');
+}
+
+function writeHeartbeat(stats: ScanStats): void {
   try {
-    fs.writeFileSync(
-      path.join(CONFIG.dataDir, 'heartbeat.json'),
-      JSON.stringify({ at: new Date().toISOString(), interval: CONFIG.interval, execution: CONFIG.executionMode, symbols: scanned, failures })
-    );
+    stats.at = new Date().toISOString();
+    fs.mkdirSync(heartbeatDir(), { recursive: true });
+    const file = path.join(heartbeatDir(), `${stats.label.replace(/[^A-Za-z0-9._-]/g, '_')}.json`);
+    fs.writeFileSync(file + '.tmp', JSON.stringify(stats, null, 1));
+    fs.renameSync(file + '.tmp', file);
   } catch {
     /* non-fatal */
   }
 }
 
 /**
- * Horizon-expiry exit manager for REAL paper positions: any broker position
- * whose entry signal candle is >= EVAL_HORIZON candles old is closed at
- * market, and the ACTUAL round-trip P&L (from real fills, gross of Alpaca
- * fees) is recorded next to the model-scored entry row.
+ * Exit manager for REAL paper positions. Every position is matched to its
+ * open ledger entry by timestamp (never file order); a position with no open
+ * entry is an orphan and is left alone for health to raise. Exits fire on the
+ * state flip (TSMOM_STATE), the catastrophe stop, or the fixed horizon, and
+ * record the ACTUAL round-trip P&L from real fills.
  */
-async function manageBrokerExits(): Promise<void> {
+async function manageBrokerExits(stats: ScanStats): Promise<void> {
   const positions = await getBrokerPositions();
   if (positions.length === 0) {
     log('Broker: no open paper positions.');
@@ -73,79 +137,86 @@ async function manageBrokerExits(): Promise<void> {
   for (const pos of positions) {
     const sym = CONFIG.symbolsList.find((s) => positionMatches(pos.symbol, s));
     if (!sym) continue; // another agent's universe — not ours to touch
-    const entry = [...rows].reverse().find((r) => r.mode === 'alpaca-paper' && r.symbol === sym && r.action === 'BUY');
-    if (!entry) {
-      log(`Broker: ${sym} position has no ledger entry row — left untouched (reconcile by hand; the bot won't close a position it can't attribute).`);
-      continue;
-    }
-    const entryBoundary = Math.floor(Date.parse(entry.timestamp) / iMs) * iMs;
+    try {
+      const entry = openEntryFor(rows, sym);
+      if (!entry) {
+        stats.orphans.push(sym);
+        log(`Broker: ${sym} position has no open ledger entry — left untouched; \`npm run reconcile\` explains it (the bot won't close a position it can't attribute).`);
+        continue;
+      }
+      const entryBoundary = Math.floor(Date.parse(entry.timestamp) / iMs) * iMs;
 
-    // Catastrophe stop-loss: force-exit a position down more than the limit,
-    // regardless of the strategy signal. Wide by default so it never fights the
-    // momentum exit — it only catches a disaster (gap, depeg, bad regime).
-    const unrealizedPct = (Number(pos.unrealized_pl) / (Number(pos.market_value) - Number(pos.unrealized_pl))) * 100;
-    let exitReason: string | null = null;
-    if (CONFIG.maxPositionLossPct > 0 && unrealizedPct <= -CONFIG.maxPositionLossPct) {
-      exitReason = `CATASTROPHE STOP: position down ${unrealizedPct.toFixed(1)}% (limit ${CONFIG.maxPositionLossPct}%)`;
-    }
+      // Catastrophe stop-loss: force-exit a position down more than the limit,
+      // regardless of the strategy signal. Wide by default so it never fights the
+      // momentum exit — it only catches a disaster (gap, depeg, bad regime).
+      const unrealizedPct = (Number(pos.unrealized_pl) / (Number(pos.market_value) - Number(pos.unrealized_pl))) * 100;
+      let exitReason: string | null = null;
+      if (CONFIG.maxPositionLossPct > 0 && unrealizedPct <= -CONFIG.maxPositionLossPct) {
+        exitReason = `CATASTROPHE STOP: position down ${unrealizedPct.toFixed(1)}% (limit ${CONFIG.maxPositionLossPct}%)`;
+      }
 
-    // Age in CLOSED TRADING CANDLES since entry (exact for stocks and crypto —
-    // matches the model's index-based horizon; calendar math would drift for
-    // stocks, where 28 trading candles span ~40 calendar days).
-    const series = exitReason ? [] : closedCandles(await fetchSeries(sym, CONFIG.interval, Math.max(CONFIG.evalHorizon * 3, 90)));
-    if (exitReason) {
-      // stop fired — skip the strategy-signal checks below
-    } else if (CONFIG.tsmomState) {
-      // State construction: exit when trailing momentum flips non-positive.
-      const L = CONFIG.tsmomLookback;
-      const last = series[series.length - 1];
-      const mom = last.close / series[series.length - 1 - L].close - 1;
-      if (mom > 0) {
-        log(`Broker: ${sym} momentum ${(mom * 100).toFixed(2)}% still positive (unrealized ${Number(pos.unrealized_pl).toFixed(2)} USD) — holding.`);
-        continue;
+      // Age in CLOSED TRADING CANDLES since entry (exact for stocks and crypto —
+      // matches the model's index-based horizon; calendar math would drift for
+      // stocks, where 28 trading candles span ~40 calendar days).
+      if (!exitReason) {
+        const series = closedCandles(await fetchSeries(sym, CONFIG.interval, Math.max(CONFIG.evalHorizon * 3, 90)));
+        if (CONFIG.tsmomState) {
+          // State construction: exit when trailing momentum flips non-positive.
+          const L = CONFIG.tsmomLookback;
+          const mom = series[series.length - 1].close / series[series.length - 1 - L].close - 1;
+          if (mom > 0) {
+            log(`Broker: ${sym} momentum ${(mom * 100).toFixed(2)}% still positive (unrealized ${Number(pos.unrealized_pl).toFixed(2)} USD) — holding.`);
+            continue;
+          }
+          exitReason = `momentum flipped non-positive (${(mom * 100).toFixed(2)}%) — state exit`;
+        } else {
+          const ageCandles = series.filter((c) => c.closeTime > entryBoundary).length;
+          if (ageCandles < CONFIG.evalHorizon) {
+            log(`Broker: ${sym} held ${ageCandles}/${CONFIG.evalHorizon} candles (unrealized ${Number(pos.unrealized_pl).toFixed(2)} USD) — holding.`);
+            continue;
+          }
+          exitReason = `horizon exit after ${ageCandles} candles`;
+        }
       }
-      exitReason = `momentum flipped non-positive (${(mom * 100).toFixed(2)}%) — state exit`;
-    } else {
-      const ageCandles = series.filter((c) => c.closeTime > entryBoundary).length;
-      if (ageCandles < CONFIG.evalHorizon) {
-        log(`Broker: ${sym} held ${ageCandles}/${CONFIG.evalHorizon} candles (unrealized ${Number(pos.unrealized_pl).toFixed(2)} USD) — holding.`);
-        continue;
+      if (!isCryptoSymbol(sym)) {
+        if (stockOpen === null) stockOpen = (await fetchMarketClock()).is_open;
+        if (!stockOpen) {
+          log(`Broker: ${sym} exit condition met but the stock market is closed — exit will fire at the next open.`);
+          continue;
+        }
       }
-      exitReason = `horizon exit after ${ageCandles} candles`;
+      const order = await closePaperPosition(sym);
+      const exitFill = Number(order.filled_avg_price);
+      const entryFill = entryFillOf(entry) ?? Number(entry.price);
+      const actualPct = ((exitFill - entryFill) / entryFill) * 100;
+      const tag = entry.reason.match(/^\[([^\]]+)\]/)?.[1] ?? 'unknown';
+      appendLedgerRow({
+        timestamp: new Date().toISOString(),
+        symbol: sym,
+        action: 'SELL',
+        price: fmtPrice(exitFill),
+        quantity: order.filled_qty,
+        reason:
+          `[actual:${tag}] Exit: ${exitReason}; entry fill ${entryFill} (order ${orderIdOf(entry) ?? 'unknown'}); ` +
+          'ACTUAL round-trip P&L from real paper fills, gross of Alpaca fees.',
+        mode: 'alpaca-paper-exit',
+        outcome: actualPct > 0 ? 'win' : actualPct < 0 ? 'loss' : 'flat',
+        pnl: actualPct.toFixed(4),
+      });
+      stats.exits.push(`${sym} ${actualPct >= 0 ? '+' : ''}${actualPct.toFixed(2)}%`);
+      log(`Broker: ${sym} ${exitReason} — sold ${order.filled_qty} @ ${exitFill} (entry fill ${entryFill}) = ${actualPct >= 0 ? '+' : ''}${actualPct.toFixed(3)}% actual, recorded.`);
+    } catch (err) {
+      stats.exitFailures.push(`${sym}: ${(err as Error).message.split('\n')[0]}`);
+      log(`Broker: ${sym} exit check failed — ${(err as Error).message.split('\n')[0]} (retried next scan).`);
     }
-    if (!isCryptoSymbol(sym)) {
-      if (stockOpen === null) stockOpen = (await fetchMarketClock()).is_open;
-      if (!stockOpen) {
-        log(`Broker: ${sym} exit condition met but the stock market is closed — exit will fire at the next open.`);
-        continue;
-      }
-    }
-    const order = await closePaperPosition(sym);
-    const exitFill = Number(order.filled_avg_price);
-    const entryFillMatch = entry.reason.match(/broker fill ([0-9.]+)/);
-    const entryFill = entryFillMatch ? Number(entryFillMatch[1]) : Number(entry.price);
-    const actualPct = ((exitFill - entryFill) / entryFill) * 100;
-    const tagMatch = entry.reason.match(/^\[([^\]]+)\]/);
-    const tag = tagMatch ? tagMatch[1] : 'unknown';
-    appendLedgerRow({
-      timestamp: new Date().toISOString(),
-      symbol: sym,
-      action: 'SELL',
-      price: fmtPrice(exitFill),
-      quantity: order.filled_qty,
-      reason: `[actual:${tag}] Exit: ${exitReason}; entry fill ${entryFill}; ACTUAL round-trip P&L from real paper fills, gross of Alpaca fees (~50 bps RT taker at this tier).`,
-      mode: 'alpaca-paper-exit',
-      outcome: actualPct > 0 ? 'win' : actualPct < 0 ? 'loss' : 'flat',
-      pnl: actualPct.toFixed(4),
-    });
-    log(`Broker: ${sym} ${exitReason} — sold ${order.filled_qty} @ ${exitFill} (entry fill ${entryFill}) = ${actualPct >= 0 ? '+' : ''}${actualPct.toFixed(3)}% actual, recorded.`);
   }
 }
 
 /**
  * One full decision cycle over the configured universe:
- * score matured trades -> for each symbol: market -> signal -> regime ->
- * risk -> memory -> (simulated) execution -> ledger.
+ * score matured trades -> (book only) sweep stale orders, adopt late fills,
+ * manage exits -> for each symbol: market -> signal -> regime -> risk ->
+ * memory -> execution -> ledger. Writes a heartbeat even when it fails.
  *
  * Crypto (…USDT) scans 24/7 via Binance public data; stock symbols use the
  * Alpaca PAPER data API (read-only) and are skipped outside regular hours.
@@ -155,62 +226,88 @@ export async function runScan(): Promise<void> {
   if (CONFIG.tsmomState && (CONFIG.executionMode !== 'alpaca-paper' || !CONFIG.longOnly)) {
     throw new Error('TSMOM_STATE=on requires EXECUTION=alpaca-paper and LONG_ONLY=on (position state lives at the broker).');
   }
-  log(
-    `Scanner started for ${symbolsList.length} symbols on ${interval} ` +
-      `(paper mode — no live order path exists in this project${CONFIG.tsmomState ? '; STATE construction (Trial 07)' : ''}${CONFIG.regimeFilter ? `; regime filter ON: ${CONFIG.htfInterval} SMA${CONFIG.htfMa}` : ''})`
-  );
-
-  // Score earlier paper trades whose horizon has passed, so the forward
-  // record (and the memory system) runs on real outcomes.
-  await scoreMaturedScanTrades(log);
-
-  // Manage real paper positions (exits, stops) before looking for new entries.
-  let riskCtx: RiskContext | null = null;
-  if (CONFIG.executionMode === 'alpaca-paper') {
-    // Cancel any of our own orders left resting from a previous scan (maker
-    // orders that never filled), so none go stale or double-fill.
-    if (CONFIG.orderMode === 'maker') {
-      const canceled = await cancelStaleBotOrders();
-      if (canceled > 0) log(`Broker: canceled ${canceled} stale unfilled maker order(s) from a prior scan.`);
-    }
-    await manageBrokerExits();
-    // Build the risk context ONCE per scan from a fresh post-exit snapshot;
-    // symbols share it and increment its tallies as entries fill (one set of
-    // account/positions calls instead of one per symbol).
-    const [account, positions] = await Promise.all([getAccount(), getBrokerPositions()]);
-    riskCtx = buildRiskContext(account, positions);
-    log(`Risk: ${riskCtx.haltReason} · ${riskCtx.openCount} open · $${riskCtx.deployed.toFixed(0)} deployed ($${riskCtx.cryptoDeployed.toFixed(0)} crypto).`);
-    if (riskCtx.entriesHalted) log('Risk: NEW ENTRIES HALTED this scan (exits and stops still ran).');
+  const broker = CONFIG.executionMode === 'alpaca-paper';
+  // Two book scans at once (the hourly agent and a dashboard click) could
+  // both pass the per-candle dedup before either writes its row.
+  const release = broker ? acquireRunLock('book') : null;
+  if (broker && !release) {
+    log(`Another book scan (pid ${runLockHolder('book')?.pid ?? '?'}) is running — this one exits without trading.`);
+    return;
   }
+  const stats = newStats();
+  try {
+    log(
+      `Scanner started for ${symbolsList.length} symbols on ${interval} [${stats.label}] ` +
+        `(paper only — orders can reach only the Alpaca paper host${CONFIG.tsmomState ? '; STATE construction (Trial 07)' : ''}${CONFIG.regimeFilter ? `; regime filter ON: ${CONFIG.htfInterval} SMA${CONFIG.htfMa}` : ''})`
+    );
 
-  let stockMarketOpen: boolean | null = null;
-  if (symbolsList.some((s) => !isCryptoSymbol(s))) {
-    const clock = await fetchMarketClock();
-    stockMarketOpen = clock.is_open;
-    if (!clock.is_open) {
-      log(
-        CONFIG.interval === '1d'
-          ? `US stock market is closed — daily signals are still evaluated; any orders defer to the next open (${clock.next_open}).`
-          : `US stock market is closed — stock symbols will be skipped this cycle (next open ${clock.next_open}).`
-      );
-    }
-  }
+    // Score earlier paper trades whose horizon has passed, so the forward
+    // record (and the memory system) runs on real outcomes.
+    await scoreMaturedScanTrades(log);
 
-  let failures = 0;
-  for (const symbol of symbolsList) {
-    try {
-      await scanSymbol(symbol, stockMarketOpen, riskCtx);
-    } catch (err) {
-      failures++;
-      log(`${symbol}: BLOCKED — ${(err as Error).message}`);
-      log(`${symbol}: the bot never fakes a result for a symbol it cannot read; continuing with the rest of the universe.`);
+    let riskCtx: RiskContext | null = null;
+    if (broker) {
+      // Nothing should be resting at the broker between scans; anything that is
+      // was left by a crash or an unconfirmed cancel.
+      const swept = await cancelStaleBotOrders();
+      stats.swept = swept.length;
+      if (swept.length > 0) log(`Broker: canceled ${swept.length} stale bot order(s): ${swept.map((o) => o.client_order_id).join(', ')}.`);
+      try {
+        stats.adopted = await adoptLateFills(log, 14, new Set(symbolsList));
+      } catch (err) {
+        stats.failures.push(`adoption: ${(err as Error).message.split('\n')[0]}`);
+        log(`Broker: late-fill adoption failed — ${(err as Error).message.split('\n')[0]}`);
+      }
+      await manageBrokerExits(stats);
+      // Build the risk context ONCE per scan from a fresh post-exit snapshot;
+      // symbols share it and increment its tallies as entries fill (one set of
+      // account/positions calls instead of one per symbol).
+      const [account, positions] = await Promise.all([getAccount(), getBrokerPositions()]);
+      riskCtx = buildRiskContext(account, positions);
+      log(`Risk: ${riskCtx.haltReason} · ${riskCtx.openCount} open · $${riskCtx.deployed.toFixed(0)} deployed ($${riskCtx.cryptoDeployed.toFixed(0)} crypto).`);
+      if (riskCtx.entriesHalted) log('Risk: NEW ENTRIES HALTED this scan (exits and stops still ran).');
     }
+
+    let stockMarketOpen: boolean | null = null;
+    if (symbolsList.some((s) => !isCryptoSymbol(s))) {
+      const clock = await fetchMarketClock();
+      stockMarketOpen = clock.is_open;
+      if (!clock.is_open) {
+        log(
+          CONFIG.interval === '1d'
+            ? `US stock market is closed — daily signals are still evaluated; any orders defer to the next open (${clock.next_open}).`
+            : `US stock market is closed — stock symbols will be skipped this cycle (next open ${clock.next_open}).`
+        );
+      }
+    }
+
+    for (const symbol of symbolsList) {
+      try {
+        await scanSymbol(symbol, stockMarketOpen, riskCtx, stats);
+      } catch (err) {
+        const msg = (err as Error).message.split('\n')[0];
+        if (err instanceof BrokerHttpError && err.path === '/v2/orders') {
+          stats.rejects.push(`${symbol}: HTTP ${err.status} ${err.body.slice(0, 160)}`);
+          log(`${symbol}: ORDER REJECTED by the broker — HTTP ${err.status} ${err.body.slice(0, 200)}`);
+        } else {
+          stats.failures.push(`${symbol}: ${msg}`);
+          log(`${symbol}: BLOCKED — ${msg}`);
+          log(`${symbol}: the bot never fakes a result for a symbol it cannot read; continuing with the rest of the universe.`);
+        }
+      }
+    }
+  } catch (err) {
+    stats.failures.push(`scan: ${(err as Error).message.split('\n')[0]}`);
+    throw err;
+  } finally {
+    writeHeartbeat(stats);
+    release?.();
+    const bad = stats.failures.length + stats.rejects.length + stats.unknown.length + stats.exitFailures.length + stats.orphans.length;
+    if (bad > 0) process.exitCode = 1;
   }
-  writeHeartbeat(symbolsList.length, failures);
-  if (failures > 0) process.exitCode = 1;
 }
 
-async function scanSymbol(symbol: string, stockMarketOpen: boolean | null, riskCtx: RiskContext | null): Promise<void> {
+async function scanSymbol(symbol: string, stockMarketOpen: boolean | null, riskCtx: RiskContext | null, stats: ScanStats): Promise<void> {
   const { interval, scanCandles } = CONFIG;
   const crypto = isCryptoSymbol(symbol);
   const quantity = crypto ? CONFIG.quantity : CONFIG.stockQuantity;
@@ -225,9 +322,7 @@ async function scanSymbol(symbol: string, stockMarketOpen: boolean | null, riskC
 
   const candles = closedCandles(await fetchSeries(symbol, interval, scanCandles));
   const last = candles[candles.length - 1];
-  log(
-    `${symbol}: loaded ${candles.length} real closed candles · last close ${last.close.toFixed(2)} at ${new Date(last.closeTime).toISOString()}`
-  );
+  log(`${symbol}: loaded ${candles.length} real closed candles · last close ${fmtPrice(last.close)} at ${new Date(last.closeTime).toISOString()}`);
 
   const sig = latestSignal(candles);
   log(`${symbol}: signal ${sig.action} — ${sig.reason}`);
@@ -307,27 +402,33 @@ async function scanSymbol(symbol: string, stockMarketOpen: boolean | null, riskC
   }
 
   ensureMemoryFiles();
-  const mem = consultMemory(symbol, sig.setupTag);
-  log(`${symbol}: memory — ${mem.reason}`);
-  if (mem.blocked) {
-    // Logged as a scoreable counterfactual (mode scan-filtered) so the forward
-    // record can measure whether memory's skips actually helped.
-    appendLedgerRow({
-      timestamp: new Date().toISOString(),
-      symbol,
-      action: sig.action,
-      price: sig.price.toFixed(2),
-      quantity: '0',
-      reason: `[${sig.setupTag}] Memory blocked this entry (counterfactual): ${mem.reason}`,
-      mode: 'scan-filtered',
-      outcome: 'open',
-      pnl: '',
-    });
-    log(`${symbol}: final decision SKIP — memory blocked a known bad setup; counterfactual logged to ${ledgerPath()} for honest scoring.`);
-    return;
+  if (CONFIG.tsmomState) {
+    // Trial 07 tested the state construction with no memory filter; adding one
+    // live would change the strategy the evidence is about.
+    log(`${symbol}: memory — not applied to the state construction (Trial 07 rules have no memory filter).`);
+  } else {
+    const mem = consultMemory(symbol, sig.setupTag);
+    log(`${symbol}: memory — ${mem.reason}`);
+    if (mem.blocked) {
+      // Logged as a scoreable counterfactual (mode scan-filtered) so the forward
+      // record can measure whether memory's skips actually helped.
+      appendLedgerRow({
+        timestamp: new Date().toISOString(),
+        symbol,
+        action: sig.action,
+        price: sig.price.toFixed(2),
+        quantity: '0',
+        reason: `[${sig.setupTag}] Memory blocked this entry (counterfactual): ${mem.reason}`,
+        mode: 'scan-filtered',
+        outcome: 'open',
+        pnl: '',
+      });
+      log(`${symbol}: final decision SKIP — memory blocked a known bad setup; counterfactual logged to ${ledgerPath()} for honest scoring.`);
+      return;
+    }
   }
 
-  // REAL PAPER EXECUTION (Alpaca paper host, hardcoded; §5 approval 2026-07-15).
+  // REAL PAPER EXECUTION (Alpaca paper host, hardcoded; approved 2026-07-15).
   if (CONFIG.executionMode === 'alpaca-paper') {
     if (sig.action === 'SELL') {
       log(`${symbol}: SELL entry cannot execute on Alpaca crypto (no shorting) — recording as simulation instead.`);
@@ -339,72 +440,7 @@ async function scanSymbol(symbol: string, stockMarketOpen: boolean | null, riskC
       return;
     } else {
       if (!riskCtx) throw new Error('risk context missing for a broker entry (internal).');
-      const orderKey = toOrderSymbol(symbol).replace('/', '');
-
-      // Entry-timing window: cluster NEW crypto entries near the daily close
-      // (the price the signal was computed on), TZ-independently. Exits are
-      // never windowed. No ledger row is written when deferring, so the next
-      // scan retries — and once inside the window it enters.
-      if (CONFIG.entryWindowMin > 0 && crypto) {
-        const lastClose = Math.floor(Date.now() / 86_400_000) * 86_400_000; // last 00:00 UTC
-        const minsSinceClose = (Date.now() - lastClose) / 60_000;
-        if (minsSinceClose > CONFIG.entryWindowMin) {
-          log(`${symbol}: outside the ${CONFIG.entryWindowMin}-min post-close entry window (${minsSinceClose.toFixed(0)} min in) — deferring to near the next daily close for a fill nearer the signal price.`);
-          return;
-        }
-      }
-
-      const decision = evaluateEntry(symbol, orderKey, candles, riskCtx);
-      if (!decision.allowed) {
-        log(`${symbol}: entry skipped — ${decision.reason}`);
-        return;
-      }
-      // Decision-time mark = a fresh intraday price. Slippage vs THIS is honest
-      // execution quality; slippage vs the (possibly day-old) signal close is
-      // reported separately as signal drift, so the two are never conflated.
-      const decisionRef = await currentMark(symbol);
-      const clientId = `bot-${symbol}-${signalBoundary}`;
-      let filled: BrokerOrder;
-      if (CONFIG.orderMode === 'maker' && decisionRef) {
-        // Passive limit below the mark → rests as maker (lower fee). Non-fill
-        // returns null; we retry next scan at no cost.
-        const limitPrice = decisionRef * (1 - CONFIG.makerOffsetBps / 10_000);
-        const res = await submitPaperBuyMaker(symbol, decision.notional, limitPrice, clientId, CONFIG.makerWaitSec);
-        if (!res) {
-          log(`${symbol}: maker limit @ ${fmtPrice(limitPrice)} did not fill in ${CONFIG.makerWaitSec}s — canceled, will retry next scan (no cost, no row).`);
-          return;
-        }
-        filled = res;
-      } else {
-        filled =
-          CONFIG.limitSlippageBps > 0 && decisionRef
-            ? await submitPaperBuyLimit(symbol, decision.notional, decisionRef * (1 + CONFIG.limitSlippageBps / 10_000), clientId)
-            : await submitPaperBuy(symbol, decision.notional, clientId);
-      }
-      const fillPrice = Number(filled.filled_avg_price);
-      const slipExec = decisionRef ? slippageBps(fillPrice, decisionRef) : null;
-      const slipSignal = slippageBps(fillPrice, sig.price);
-      const bps = (x: number): string => (x >= 0 ? '+' : '') + x.toFixed(1);
-      recordEntry(riskCtx, symbol, orderKey, decision.notional);
-      appendLedgerRow({
-        timestamp: new Date().toISOString(),
-        symbol,
-        action: 'BUY',
-        price: fmtPrice(sig.price),
-        quantity: filled.filled_qty,
-        reason:
-          `[${sig.setupTag}] ${sig.reason} || broker fill ${fillPrice} qty ${filled.filled_qty}, ` +
-          `slippage ${slipExec != null ? bps(slipExec) : 'n/a'} bps vs decision mark${decisionRef ? ` ${fmtPrice(decisionRef)}` : ''}, ` +
-          `signal-drift ${bps(slipSignal)} bps vs signal close, order ${clientId}`,
-        mode: 'alpaca-paper',
-        outcome: 'open',
-        pnl: '',
-      });
-      log(
-        `${symbol}: REAL PAPER ORDER filled — $${decision.notional.toFixed(2)} @ ${fillPrice}, ` +
-          `exec slippage ${slipExec != null ? bps(slipExec) : 'n/a'} bps vs decision mark, signal-drift ${bps(slipSignal)} bps.`
-      );
-      log(`${symbol}: final decision BUY (alpaca-paper) — logged to ${ledgerPath()}.`);
+      await enterPosition(symbol, crypto, sig, candles, signalBoundary, riskCtx, stats);
       return;
     }
   }
@@ -430,4 +466,109 @@ async function scanSymbol(symbol: string, stockMarketOpen: boolean | null, riskC
   });
   log(`${symbol}: execution — PAPER ${sig.action} ${quantity} @ ${sig.price.toFixed(2)} simulated; no real order was sent.`);
   log(`${symbol}: final decision ${sig.action} (paper) — logged to ${ledgerPath()}.`);
+}
+
+/**
+ * Place a real paper BUY and record exactly what happened. The limit is set
+ * off the venue's ask (not another exchange's last trade), entries skip when
+ * the quoted spread alone would eat the edge, and the order always settles:
+ * filled, partly filled, or canceled. Only a fill writes a ledger row.
+ */
+async function enterPosition(
+  symbol: string,
+  crypto: boolean,
+  sig: Signal,
+  candles: Candle[],
+  signalBoundary: number,
+  riskCtx: RiskContext,
+  stats: ScanStats
+): Promise<void> {
+  const orderKey = toOrderSymbol(symbol).replace('/', '');
+
+  // Entry-timing window: cluster NEW crypto entries near the daily close (the
+  // price the signal was computed on), TZ-independently. Exits are never
+  // windowed. No row is written when deferring, so a later scan retries.
+  if (CONFIG.entryWindowMin > 0 && crypto) {
+    const lastClose = Math.floor(Date.now() / 86_400_000) * 86_400_000; // last 00:00 UTC
+    const minsSinceClose = (Date.now() - lastClose) / 60_000;
+    if (minsSinceClose > CONFIG.entryWindowMin) {
+      log(`${symbol}: outside the ${CONFIG.entryWindowMin}-min post-close entry window (${minsSinceClose.toFixed(0)} min in) — deferring to near the next daily close for a fill nearer the signal price.`);
+      return;
+    }
+  }
+
+  const decision = evaluateEntry(symbol, orderKey, candles, riskCtx);
+  if (!decision.allowed) {
+    log(`${symbol}: entry skipped — ${decision.reason}`);
+    return;
+  }
+
+  const quote = await getLatestQuote(symbol);
+  if (quote && CONFIG.maxSpreadBps > 0 && quote.spreadBps > CONFIG.maxSpreadBps) {
+    stats.spreadSkips.push(`${symbol} ${quote.spreadBps.toFixed(0)}bps`);
+    log(
+      `${symbol}: entry skipped — quoted spread ${quote.spreadBps.toFixed(0)} bps (bid ${quote.bid} / ask ${quote.ask}) is wider than ` +
+        `MAX_SPREAD_BPS ${CONFIG.maxSpreadBps}; crossing it costs more than a normal day's edge. Retried next scan.`
+    );
+    return;
+  }
+  const mark = quote ? null : await currentMark(symbol);
+  const arrival = quote?.mid ?? mark; // reference for execution slippage
+  const touch = quote?.ask ?? mark; // what a marketable buy has to pay
+  // A fresh suffix per attempt: a canceled order's id can't be reused, and the
+  // per-candle dedup plus the book lock already stop double entries.
+  const clientId = `bot-${symbol}-${signalBoundary}-m${Math.floor(Date.now() / 60_000)}`;
+
+  let res: EntryResult;
+  if (CONFIG.orderMode === 'maker' && arrival) {
+    // Passive limit at or below the bid → rests as maker (lower fee). An
+    // unfilled order is canceled and retried next scan at no cost.
+    const off = 1 - CONFIG.makerOffsetBps / 10_000;
+    const limitPrice = quote ? Math.min(quote.bid, quote.mid * off) : arrival * off;
+    res = await submitPaperBuyMaker(symbol, decision.notional, limitPrice, clientId, CONFIG.makerWaitSec);
+  } else if (CONFIG.limitSlippageBps > 0 && touch) {
+    res = await submitPaperBuyLimit(symbol, decision.notional, touch * (1 + CONFIG.limitSlippageBps / 10_000), clientId);
+  } else {
+    res = await submitPaperBuy(symbol, decision.notional, clientId);
+  }
+
+  if (res.state === 'unfilled') {
+    stats.unfilled.push(symbol);
+    log(`${symbol}: order ${clientId} did not fill within ${CONFIG.orderTimeoutSec}s and was canceled — nothing rests at the broker; the next scan retries.`);
+    return;
+  }
+  if (res.state === 'unknown') {
+    stats.unknown.push(`${symbol} (${res.order.status})`);
+    log(`${symbol}: order ${clientId} is still '${res.order.status}' after a cancel request — not recorded; the next scan sweeps it and adopts any fill.`);
+    return;
+  }
+
+  const fillPrice = res.fillPrice as number;
+  const slipExec = arrival ? slippageBps(fillPrice, arrival) : null;
+  const slipSignal = slippageBps(fillPrice, sig.price);
+  const bps = (x: number): string => (x >= 0 ? '+' : '') + x.toFixed(1);
+  const notional = res.filledQty * fillPrice;
+  recordEntry(riskCtx, symbol, orderKey, notional);
+  const partialNote = res.state === 'partial' ? ' (partial fill; the rest was canceled)' : '';
+  const ref = quote ? `arrival mid ${fmtPrice(quote.mid)} (spread ${quote.spreadBps.toFixed(1)} bps)` : arrival ? `arrival mark ${fmtPrice(arrival)}` : 'no arrival price';
+  appendLedgerRow({
+    timestamp: new Date().toISOString(),
+    symbol,
+    action: 'BUY',
+    price: fmtPrice(sig.price),
+    quantity: String(res.filledQty),
+    reason:
+      `[${sig.setupTag}] ${sig.reason} || broker fill ${fillPrice} qty ${res.filledQty}${partialNote}, ` +
+      `slippage ${slipExec != null ? bps(slipExec) : 'n/a'} bps vs ${ref}, ` +
+      `signal-drift ${bps(slipSignal)} bps vs signal close, order ${clientId}`,
+    mode: 'alpaca-paper',
+    outcome: 'open',
+    pnl: '',
+  });
+  (res.state === 'partial' ? stats.partials : stats.entries).push(symbol);
+  log(
+    `${symbol}: REAL PAPER ORDER ${res.state} — $${notional.toFixed(2)} @ ${fillPrice}${partialNote}, ` +
+      `exec slippage ${slipExec != null ? bps(slipExec) : 'n/a'} bps vs ${quote ? 'arrival mid' : 'arrival mark'}, signal-drift ${bps(slipSignal)} bps.`
+  );
+  log(`${symbol}: final decision BUY (alpaca-paper) — logged to ${ledgerPath()}.`);
 }

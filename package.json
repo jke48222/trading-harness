@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Paper-trading bot with a two-file memory system. Real market data, simulated orders only — no live trading path exists.",
+  "description": "Paper-trading bot with a two-file memory system. Real market data, simulated orders only \u2014 no live trading path exists.",
   "engines": {
     "node": ">=18"
   },
@@ -15,6 +15,7 @@
     "memory:reset": "tsx src/index.ts memory:reset",
     "positions": "tsx src/index.ts positions",
     "report": "tsx src/index.ts report",
+    "reconcile": "tsx src/index.ts reconcile",
     "dashboard": "tsx src/dashboard/server.ts",
     "test": "node --import tsx --test test/*.test.ts",
     "health": "tsx src/index.ts health",

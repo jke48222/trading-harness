@@ -7,6 +7,8 @@ import { brokerCheck, brokerPreview } from './broker/alpaca';
 import { getBrokerPositions } from './broker/orders';
 import { CONFIG, validateConfig } from './config';
 import { runHealth } from './health';
+import { runReport } from './report';
+import { runReconcile } from './reconcileRun';
 
 const command = process.argv[2];
 
@@ -54,46 +56,12 @@ async function main(): Promise<void> {
       }
       break;
     }
-    case 'report': {
-      interface Agg {
-        n: number;
-        total: number;
-        wins: number;
-      }
-      const actual = new Map<string, Agg>();
-      const model = new Map<string, Agg>();
-      const add = (m: Map<string, Agg>, sym: string, pnl: number): void => {
-        const a = m.get(sym) ?? { n: 0, total: 0, wins: 0 };
-        a.n++;
-        a.total += pnl;
-        if (pnl > 0) a.wins++;
-        m.set(sym, a);
-      };
-      for (const r of loadLedger()) {
-        const pnl = Number(r.pnl);
-        if (r.pnl === '' || !Number.isFinite(pnl)) continue;
-        if (r.mode === 'alpaca-paper-exit') add(actual, r.symbol, pnl);
-        if (r.mode === 'alpaca-paper' && ['win', 'loss', 'flat'].includes(r.outcome)) add(model, r.symbol, pnl);
-      }
-      console.log('Per-symbol book — ACTUAL = real paper fills (gross of fees) · MODEL = signal-close scoring at FEE_BPS:');
-      const syms = [...new Set([...actual.keys(), ...model.keys()])].sort(
-        (a, b) => (actual.get(b)?.total ?? -Infinity) - (actual.get(a)?.total ?? -Infinity)
-      );
-      if (syms.length === 0) console.log('  No completed round trips yet — entries are open or pending.');
-      for (const s of syms) {
-        const a = actual.get(s);
-        const m = model.get(s);
-        console.log(
-          `  ${s.padEnd(11)} actual: ${a ? `${a.n} trips · total ${a.total >= 0 ? '+' : ''}${a.total.toFixed(2)}% · wins ${a.wins}/${a.n}` : '—'.padEnd(8)} · model: ${m ? `${m.n} scored · total ${m.total >= 0 ? '+' : ''}${m.total.toFixed(2)}%` : '—'}`
-        );
-      }
-      console.log('Small samples rank noise, not skill — a symbol needs dozens of trips before "best" means anything (Trial 06).');
-      const positions = await getBrokerPositions();
-      let deployed = 0;
-      for (const p of positions) deployed += Math.abs(Number(p.market_value));
-      console.log(`Open now: ${positions.length} positions · $${deployed.toFixed(2)} deployed of $${CONFIG.budgetUsd} budget.`);
+    case 'report':
+      await runReport();
       break;
-    }
+    case 'reconcile':
+      await runReconcile(process.argv.includes('--apply'));
+      break;
     case 'broker:check':
       await brokerCheck();
       break;
@@ -103,7 +71,10 @@ async function main(): Promise<void> {
     default:
       console.log('Usage:');
       console.log('  npm run scan            one live decision cycle on real public data (paper only; scores matured trades first)');
-      console.log('  npm run score           score open scan trades whose 12-candle horizon has passed (real outcomes only)');
+      console.log('  npm run score           score open trades whose exit has printed (horizon or state flip; real candles only)');
+      console.log('  npm run report          the book from broker fills: round trips, model vs actual, fees, per symbol');
+      console.log('  npm run reconcile       compare broker fills with the ledger (add -- --apply to repair what the broker proves)');
+      console.log('  npm run health          agents, orders, positions and regime; exits 1 on any problem');
       console.log('  npm run replay:raw      honest baseline over real history, memory ignored; seeds memory from real outcomes');
       console.log('  npm run replay:memory   same window with memory consulted; prints raw-vs-memory comparison');
       console.log('  npm run memory:reset    wipe ledger.csv and learnings.md back to empty');
