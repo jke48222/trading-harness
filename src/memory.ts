@@ -18,17 +18,36 @@ export function learningsPath(): string {
   return path.join(CONFIG.dataDir, 'learnings.md');
 }
 
-export function ensureMemoryFiles(): void {
-  fs.mkdirSync(CONFIG.dataDir, { recursive: true });
-  if (!fs.existsSync(ledgerPath())) fs.writeFileSync(ledgerPath(), LEDGER_HEADER + '\n');
-  if (!fs.existsSync(learningsPath())) fs.writeFileSync(learningsPath(), LEARNINGS_HEADER);
+/** Create `file` with `body` unless it exists. Exclusive: a check-then-write could truncate a ledger another process just created and appended to. */
+function createIfMissing(file: string, body: string): void {
+  try {
+    fs.writeFileSync(file, body, { flag: 'wx' });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+  }
 }
 
-/** Write a whole file atomically (temp file + rename), so a reader never sees half of it. */
-function writeAtomic(file: string, body: string): void {
+export function ensureMemoryFiles(): void {
+  fs.mkdirSync(CONFIG.dataDir, { recursive: true });
+  createIfMissing(ledgerPath(), LEDGER_HEADER + '\n');
+  createIfMissing(learningsPath(), LEARNINGS_HEADER);
+}
+
+/**
+ * Write a whole file atomically (temp file + rename), so a reader never sees
+ * half of it. `beforeRename` runs between the two and may throw to abort; the
+ * temp file is removed whenever the rename doesn't happen.
+ */
+export function writeAtomic(file: string, body: string, beforeRename?: () => void): void {
   const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, body);
-  fs.renameSync(tmp, file);
+  try {
+    fs.writeFileSync(tmp, body);
+    beforeRename?.();
+    fs.renameSync(tmp, file);
+  } catch (err) {
+    fs.rmSync(tmp, { force: true });
+    throw err;
+  }
 }
 
 export function resetMemory(): void {
@@ -90,12 +109,11 @@ export function appendLedgerRow(row: LedgerRow): void {
   });
 }
 
-/** Remove ledger temp files left by a crashed writer (older than an hour). */
+/** Remove temp files a killed writer left in data/ (`<file>.<pid>.tmp`, older than an hour). */
 function sweepStaleTemps(): void {
   try {
-    const base = path.basename(ledgerPath());
     for (const name of fs.readdirSync(CONFIG.dataDir)) {
-      if (!name.startsWith(`${base}.`) || !name.endsWith('.tmp')) continue;
+      if (!/\.\d+\.tmp$/.test(name)) continue;
       const file = path.join(CONFIG.dataDir, name);
       if (Date.now() - fs.statSync(file).mtimeMs > 3_600_000) fs.rmSync(file, { force: true });
     }
@@ -116,10 +134,8 @@ export function writeLedger(rows: LedgerRow[]): void {
     sweepStaleTemps();
     const lines = rows.map(rowLine);
     const body = LEDGER_HEADER + '\n' + lines.join('\n') + (lines.length ? '\n' : '');
-    const tmp = `${ledgerPath()}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, body);
-    assertLedgerLockHeld(); // a stalled holder whose lock was taken over must not rename over the new holder's write
-    fs.renameSync(tmp, ledgerPath());
+    // A stalled holder whose lock was taken over must not rename over the new holder's write.
+    writeAtomic(ledgerPath(), body, assertLedgerLockHeld);
   });
 }
 
@@ -265,8 +281,7 @@ export function upsertLesson(tag: string, text: string): void {
       while (lines.length > 0 && lines[lines.length - 1].trim() === '') lines.pop();
       lines.push(lessonLine);
     }
-    assertLedgerLockHeld();
-    writeAtomic(learningsPath(), lines.join('\n').replace(/\n*$/, '\n'));
+    writeAtomic(learningsPath(), lines.join('\n').replace(/\n*$/, '\n'), assertLedgerLockHeld);
   });
 }
 

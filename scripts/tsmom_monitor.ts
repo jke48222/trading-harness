@@ -12,10 +12,10 @@
  * Run monthly (launchd com.jalenedusei.trading.tsmom-monitor) or manually via
  * `npm run tsmom:monitor`.
  */
-import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { CONFIG } from '../src/config';
 import { closedCandles, fetchCandlesSince, intervalToMs } from '../src/market';
+import { writeAtomic } from '../src/memory';
 import { buildSymbolSeries, mean, portfolioExcess, type SymbolSeries } from '../src/tsmomPortfolio';
 import { TRIAL07_CRYPTO } from '../src/universe';
 
@@ -51,7 +51,8 @@ async function buildSeries(symbol: string): Promise<SymbolSeries> {
     const status = Number.isNaN(t12) ? 'warmup' : t12 < 0 ? 'ALARM' : 'ok';
     csv.push(`${rows[i].month},${(rows[i].excess * 100).toFixed(3)},${rows[i].n},${Number.isNaN(t12) ? '' : (t12 * 100).toFixed(3)},${status}`);
   }
-  fs.writeFileSync(path.join(CONFIG.dataDir, 'monitor_tsmom.csv'), csv.join('\n') + '\n');
+  // Atomic: health and the dashboard read this file every few minutes.
+  writeAtomic(path.join(CONFIG.dataDir, 'monitor_tsmom.csv'), csv.join('\n') + '\n');
 
   const last12 = rows.slice(-12);
   const t12 = mean(last12.map((r) => r.excess));

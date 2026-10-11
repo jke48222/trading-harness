@@ -122,3 +122,34 @@ test('insertLedgerRows skips a row already present (two repairs racing)', () => 
   assert.equal(memory.insertLedgerRows([adopted, exitAgain]), 0);
   assert.equal(memory.loadLedger().length, 2);
 });
+
+test('writeAtomic removes its temp file when the write is aborted, and leaves the target alone', () => {
+  const file = path.join(process.env.DATA_DIR as string, 'atomic-target.txt');
+  fs.writeFileSync(file, 'before\n');
+  assert.throws(() => memory.writeAtomic(file, 'after\n', () => { throw new Error('lock lost'); }), /lock lost/);
+  assert.equal(fs.readFileSync(file, 'utf8'), 'before\n');
+  assert.deepEqual(fs.readdirSync(path.dirname(file)).filter((n) => n.startsWith('atomic-target.txt.')), []);
+  memory.writeAtomic(file, 'after\n');
+  assert.equal(fs.readFileSync(file, 'utf8'), 'after\n');
+});
+
+test('a ledger rewrite sweeps hour-old temp files of any data file, never fresh ones', () => {
+  const dir = process.env.DATA_DIR as string;
+  const old = path.join(dir, 'learnings.md.4242.tmp');
+  const fresh = path.join(dir, 'perf.json.4343.tmp');
+  fs.writeFileSync(old, 'x');
+  fs.writeFileSync(fresh, 'x');
+  const twoHoursAgo = new Date(Date.now() - 2 * 3_600_000);
+  fs.utimesSync(old, twoHoursAgo, twoHoursAgo);
+  memory.writeLedger(memory.loadLedger());
+  assert.equal(fs.existsSync(old), false, 'left by a killed writer: swept');
+  assert.equal(fs.existsSync(fresh), true, 'possibly mid-write: kept');
+  fs.rmSync(fresh);
+});
+
+test('ensureMemoryFiles never truncates a ledger that already has rows', () => {
+  memory.resetMemory();
+  memory.appendLedgerRow(row({ symbol: 'KEEP' }));
+  memory.ensureMemoryFiles();
+  assert.deepEqual(memory.loadLedger().map((r) => r.symbol), ['KEEP']);
+});
