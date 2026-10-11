@@ -15,7 +15,6 @@ import {
   type EntryResult,
   cancelStaleBotOrders,
   closePaperPosition,
-  fetchOrdersSince,
   getAccount,
   getBrokerPositions,
   getLatestQuote,
@@ -29,8 +28,9 @@ import {
 import { buildRiskContext, evaluateEntry, recordEntry, stopCooldownActive, type RiskContext } from './portfolioRisk';
 import { acquireRunLock, runLockHolder } from './locks';
 import { fmtPrice, repairFromBroker } from './reconcileRun';
-import { boundaryOfClientId, ordersToFills } from './broker/fills';
+import { boundaryOfClientId } from './broker/fills';
 import { priceEntry } from './entryPricing';
+import { tripCashSince, tripReturnPct } from './exitPricing';
 import type { Candle, Signal } from './types';
 
 function log(msg: string): void {
@@ -86,6 +86,18 @@ export interface ScanStats {
   attempts: Record<string, string>;
   /** Consecutive missed entries per symbol, carried across scans; neutral scans neither add nor reset. */
   entryMisses: Record<string, { n: number; kind: string }>;
+  /**
+   * When a book scan last ran inside the crypto entry window, carried across
+   * scans. A Mac asleep through 00:00 to 02:00 UTC every night would never
+   * try a crypto entry, and no single scan would look wrong.
+   */
+  lastCryptoWindowScan: string | null;
+  /** The scan could not reach the broker or market data at all (a Power Nap dark wake, the network down) and did nothing. */
+  offline: boolean;
+  /** Consecutive offline scans, carried across scans. */
+  offlineStreak: number;
+  /** The symbols this run manages; health pages on a broker position outside them. */
+  universe: string[];
 }
 
 export function runLabel(): string {
@@ -122,7 +134,29 @@ function newStats(): ScanStats {
     entriesBlocked: null,
     attempts: {},
     entryMisses: {},
+    lastCryptoWindowScan: null,
+    offline: false,
+    offlineStreak: 0,
+    universe: [...CONFIG.symbolsList],
   };
+}
+
+/**
+ * Can this machine reach the broker right now? Retries for about a minute:
+ * launchd runs a scheduled scan inside a Power Nap dark wake, where the
+ * network may be down or still coming up. A scan that can't reach it does
+ * nothing instead of failing every step.
+ */
+async function brokerReachable(attempts = 6, gapMs = 10_000): Promise<boolean> {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      await fetchMarketClock();
+      return true;
+    } catch {
+      if (i < attempts - 1) await new Promise((r) => setTimeout(r, gapMs));
+    }
+  }
+  return false;
 }
 
 function heartbeatFile(label: string): string {
@@ -158,6 +192,13 @@ export function nextEntryMisses(
     }
   }
   return next;
+}
+
+/** New crypto entries fire only this many minutes after the 00:00 UTC daily close (ENTRY_WINDOW_MIN; 0 = any time). */
+export function inCryptoEntryWindow(nowMs: number): boolean {
+  if (CONFIG.entryWindowMin <= 0) return true;
+  const lastClose = Math.floor(nowMs / 86_400_000) * 86_400_000; // last 00:00 UTC
+  return (nowMs - lastClose) / 60_000 <= CONFIG.entryWindowMin;
 }
 
 /** data/heartbeat/<label>.json, one file per agent, so a busy agent can't mask a dead one. */
@@ -206,37 +247,36 @@ async function manageBrokerExits(stats: ScanStats): Promise<void> {
       }
       const entryBoundary = Math.floor(Date.parse(entry.timestamp) / iMs) * iMs;
 
-      // Catastrophe stop-loss: force-exit a position down more than the limit,
-      // regardless of the strategy signal. Wide by default so it never fights the
-      // momentum exit — it only catches a disaster (gap, depeg, bad regime).
+      // Exit rules. In the state construction the momentum flip is checked
+      // first, so a crash close that both turns momentum and breaches the stop
+      // is a plain state exit (no re-entry cooldown). The catastrophe stop
+      // catches a position down past the limit while momentum still reads
+      // positive: a gap, a depeg, a regime break.
       const unrealizedPct = (Number(pos.unrealized_pl) / (Number(pos.market_value) - Number(pos.unrealized_pl))) * 100;
+      const stopHit = CONFIG.maxPositionLossPct > 0 && unrealizedPct <= -CONFIG.maxPositionLossPct;
+      const stopReason = `CATASTROPHE STOP: position down ${unrealizedPct.toFixed(1)}% (limit ${CONFIG.maxPositionLossPct}%)`;
       let exitReason: string | null = null;
-      if (CONFIG.maxPositionLossPct > 0 && unrealizedPct <= -CONFIG.maxPositionLossPct) {
-        exitReason = `CATASTROPHE STOP: position down ${unrealizedPct.toFixed(1)}% (limit ${CONFIG.maxPositionLossPct}%)`;
-      }
-
-      // Age in CLOSED TRADING CANDLES since entry (exact for stocks and crypto —
-      // matches the model's index-based horizon; calendar math would drift for
-      // stocks, where 28 trading candles span ~40 calendar days).
-      if (!exitReason) {
-        const series = closedCandles(await fetchSeries(sym, CONFIG.interval, Math.max(CONFIG.evalHorizon * 3, 90)));
-        if (CONFIG.tsmomState) {
-          // State construction: exit when trailing momentum flips non-positive.
-          const L = CONFIG.tsmomLookback;
-          const mom = series[series.length - 1].close / series[series.length - 1 - L].close - 1;
-          if (mom > 0) {
-            log(`Broker: ${sym} momentum ${(mom * 100).toFixed(2)}% still positive (unrealized ${Number(pos.unrealized_pl).toFixed(2)} USD) — holding.`);
-            continue;
-          }
-          exitReason = `momentum flipped non-positive (${(mom * 100).toFixed(2)}%) — state exit`;
-        } else {
-          const ageCandles = series.filter((c) => c.closeTime > entryBoundary).length;
-          if (ageCandles < CONFIG.evalHorizon) {
-            log(`Broker: ${sym} held ${ageCandles}/${CONFIG.evalHorizon} candles (unrealized ${Number(pos.unrealized_pl).toFixed(2)} USD) — holding.`);
-            continue;
-          }
-          exitReason = `horizon exit after ${ageCandles} candles`;
+      const series = closedCandles(await fetchSeries(sym, CONFIG.interval, Math.max(CONFIG.evalHorizon * 3, 90)));
+      if (CONFIG.tsmomState) {
+        const L = CONFIG.tsmomLookback;
+        const mom = series[series.length - 1].close / series[series.length - 1 - L].close - 1;
+        if (mom <= 0) exitReason = `momentum flipped non-positive (${(mom * 100).toFixed(2)}%) — state exit`;
+        else if (stopHit) exitReason = stopReason;
+        else {
+          log(`Broker: ${sym} momentum ${(mom * 100).toFixed(2)}% still positive (unrealized ${Number(pos.unrealized_pl).toFixed(2)} USD) — holding.`);
+          continue;
         }
+      } else if (stopHit) {
+        exitReason = stopReason;
+      } else {
+        // Age in CLOSED TRADING CANDLES since entry (exact for stocks and
+        // crypto; calendar math would drift for stocks).
+        const ageCandles = series.filter((c) => c.closeTime > entryBoundary).length;
+        if (ageCandles < CONFIG.evalHorizon) {
+          log(`Broker: ${sym} held ${ageCandles}/${CONFIG.evalHorizon} candles (unrealized ${Number(pos.unrealized_pl).toFixed(2)} USD) — holding.`);
+          continue;
+        }
+        exitReason = `horizon exit after ${ageCandles} candles`;
       }
       if (!isCryptoSymbol(sym)) {
         if (stockOpen === null) stockOpen = (await fetchMarketClock()).is_open;
@@ -246,23 +286,10 @@ async function manageBrokerExits(stats: ScanStats): Promise<void> {
         }
       }
       const order = await closePaperPosition(sym);
-      // Price the exit from every sell since the entry: a close that partly
-      // filled in an earlier scan is part of this exit too.
-      let exitFill = Number(order.filled_avg_price);
-      let exitQty = Number(order.filled_qty);
-      try {
-        const since = new Date(Date.parse(entry.timestamp) - 60_000).toISOString();
-        const sells = ordersToFills(await fetchOrdersSince(since)).filter((f) => f.side === 'sell' && f.botSymbol === sym);
-        const q = sells.reduce((a, f) => a + f.qty, 0);
-        if (q > 0) {
-          exitFill = sells.reduce((a, f) => a + f.qty * f.price, 0) / q;
-          exitQty = q;
-        }
-      } catch {
-        /* this close order's own fill stands */
-      }
+      const cash = await tripCashSince(sym, entry.timestamp, order);
+      const { exitPrice: exitFill, exitQty } = cash;
       const entryFill = entryFillOf(entry) ?? Number(entry.price);
-      const actualPct = ((exitFill - entryFill) / entryFill) * 100;
+      const actualPct = tripReturnPct(isCryptoSymbol(sym), entryFill, cash);
       const tag = entry.reason.match(/^\[([^\]]+)\]/)?.[1] ?? 'unknown';
       appendLedgerRow({
         timestamp: new Date().toISOString(),
@@ -310,6 +337,17 @@ export async function runScan(): Promise<void> {
     return;
   }
   const stats = newStats();
+  if (broker && !(await brokerReachable())) {
+    stats.offline = true;
+    stats.offlineStreak = (previousHeartbeat(stats.label)?.offlineStreak ?? 0) + 1;
+    const prev = previousHeartbeat(stats.label);
+    stats.entryMisses = prev?.entryMisses ?? {};
+    stats.lastCryptoWindowScan = prev?.lastCryptoWindowScan ?? null;
+    log(`No network: the broker did not answer for a minute (scan ${stats.offlineStreak} in a row). Nothing was done; the next scan retries.`);
+    writeHeartbeat(stats);
+    release?.();
+    return;
+  }
   try {
     log(
       `Scanner started for ${symbolsList.length} symbols on ${interval} [${stats.label}] ` +
@@ -330,12 +368,6 @@ export async function runScan(): Promise<void> {
         return false;
       }
     };
-
-    // Score earlier paper trades whose horizon has passed, so the forward
-    // record (and the memory system) runs on real outcomes.
-    await step('scoring', async () => {
-      await scoreMaturedScanTrades(log);
-    });
 
     let riskCtx: RiskContext | null = null;
     if (broker) {
@@ -373,18 +405,30 @@ export async function runScan(): Promise<void> {
       if (stats.entriesBlocked) log(`Broker: no new entries this scan: ${stats.entriesBlocked}.`);
     }
 
+    // Score earlier trades whose exit has printed, so the forward record (and
+    // the memory system) runs on real outcomes. It runs after the exit
+    // manager: a slow market-data source must not delay a catastrophe stop.
+    await step('scoring', async () => {
+      await scoreMaturedScanTrades(log);
+    });
+
     let stockMarketOpen: boolean | null = null;
     if (symbolsList.some((s) => !isCryptoSymbol(s))) {
-      const clock = await fetchMarketClock();
-      stockMarketOpen = clock.is_open;
-      if (!clock.is_open) {
-        log(
-          CONFIG.interval === '1d'
-            ? `US stock market is closed — daily signals are still evaluated; any orders defer to the next open (${clock.next_open}).`
-            : `US stock market is closed — stock symbols will be skipped this cycle (next open ${clock.next_open}).`
-        );
-      }
+      const ok = await step('clock', async () => {
+        const clock = await fetchMarketClock();
+        stockMarketOpen = clock.is_open;
+        if (!clock.is_open) {
+          log(
+            CONFIG.interval === '1d'
+              ? `US stock market is closed — daily signals are still evaluated; any orders defer to the next open (${clock.next_open}).`
+              : `US stock market is closed — stock symbols will be skipped this cycle (next open ${clock.next_open}).`
+          );
+        }
+      });
+      // Without the clock, treat the stock market as closed: stock orders wait, crypto carries on.
+      if (!ok) stockMarketOpen = false;
     }
+    if (broker && symbolsList.some(isCryptoSymbol) && inCryptoEntryWindow(Date.now())) stats.lastCryptoWindowScan = new Date().toISOString();
 
     for (const symbol of symbolsList) {
       try {
@@ -407,7 +451,11 @@ export async function runScan(): Promise<void> {
     stats.stepFailures.push(`scan: ${(err as Error).message.split('\n')[0]}`);
     throw err;
   } finally {
-    if (broker) stats.entryMisses = nextEntryMisses(previousHeartbeat(stats.label)?.entryMisses ?? {}, stats.attempts, symbolsList);
+    if (broker) {
+      const prev = previousHeartbeat(stats.label);
+      stats.entryMisses = nextEntryMisses(prev?.entryMisses ?? {}, stats.attempts, symbolsList);
+      stats.lastCryptoWindowScan ??= prev?.lastCryptoWindowScan ?? null;
+    }
     writeHeartbeat(stats);
     release?.();
     const bad = stats.failures.length + stats.rejects.length + stats.unknown.length + stats.exitFailures.length + stats.orphans.length + stats.stepFailures.length;
@@ -622,14 +670,11 @@ async function enterPosition(
   // Entry-timing window: cluster NEW crypto entries near the daily close (the
   // price the signal was computed on), TZ-independently. Exits are never
   // windowed. No row is written when deferring, so a later scan retries.
-  if (CONFIG.entryWindowMin > 0 && crypto) {
-    const lastClose = Math.floor(Date.now() / 86_400_000) * 86_400_000; // last 00:00 UTC
-    const minsSinceClose = (Date.now() - lastClose) / 60_000;
-    if (minsSinceClose > CONFIG.entryWindowMin) {
-      stats.attempts[symbol] = 'neutral';
-      log(`${symbol}: outside the ${CONFIG.entryWindowMin}-min post-close entry window (${minsSinceClose.toFixed(0)} min in) — deferring to near the next daily close for a fill nearer the signal price.`);
-      return;
-    }
+  if (crypto && !inCryptoEntryWindow(Date.now())) {
+    const minsSinceClose = (Date.now() - Math.floor(Date.now() / 86_400_000) * 86_400_000) / 60_000;
+    stats.attempts[symbol] = 'neutral';
+    log(`${symbol}: outside the ${CONFIG.entryWindowMin}-min post-close entry window (${minsSinceClose.toFixed(0)} min in) — deferring to near the next daily close for a fill nearer the signal price.`);
+    return;
   }
 
   const decision = evaluateEntry(symbol, orderKey, candles, riskCtx);
@@ -677,6 +722,12 @@ async function enterPosition(
     res = await submitPaperBuy(symbol, decision.notional, clientId);
   }
 
+  if (res.order.status === 'rejected') {
+    stats.attempts[symbol] = 'miss:refused';
+    stats.rejects.push(`${symbol}: accepted, then rejected by the broker (order ${clientId})`);
+    log(`${symbol}: order ${clientId} was accepted and then rejected by the broker — nothing filled.`);
+    return;
+  }
   if (res.state === 'unfilled') {
     stats.attempts[symbol] = 'miss:unfilled';
     stats.unfilled.push(symbol);

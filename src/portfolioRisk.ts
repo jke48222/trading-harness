@@ -163,14 +163,33 @@ export function recordEntry(ctx: RiskContext, botSymbol: string, orderSymbolNoSl
   ctx.openSymbols.add(orderSymbolNoSlash);
 }
 
+/** The reason text a dashboard close writes; isStopExit treats it as a stop. */
+export const MANUAL_CLOSE = 'Manual close via dashboard';
+
+/**
+ * True for an exit row that closed a catastrophe stop. The exit manager says
+ * so in the reason; an exit that the next scan rebuilt from broker fills (a
+ * crash between the close and its row) has no reason to read, so a loss
+ * beyond the stop limit counts too, unless the row says it was a state exit.
+ */
+export function isStopExit(row: LedgerRow, limitPct: number): boolean {
+  if (row.reason.includes('CATASTROPHE STOP')) return true;
+  // A manual close is an override of a signal that still says hold; without a
+  // cooldown the next hourly scan would buy the position straight back.
+  if (row.reason.includes(MANUAL_CLOSE)) return true;
+  if (row.reason.includes('state exit') || !(limitPct > 0)) return false;
+  const pnl = Number(row.pnl);
+  return Number.isFinite(pnl) && row.pnl !== '' && pnl <= -limitPct;
+}
+
 /**
  * After a catastrophe stop the state signal is usually still BUY: 28-day
  * momentum can stay positive while a position falls 30% from a higher entry.
  * Without a cooldown the next scan would buy straight back, pay another round
- * trip and reset the stop. A stopped symbol may re-enter only after its
- * momentum has been non-positive on at least one close since the stop.
+ * trip and reset the stop. A stopped (or manually closed) symbol may re-enter
+ * only after its momentum has been non-positive on at least one close since.
  */
-export function stopCooldownActive(rows: LedgerRow[], symbol: string, candles: Candle[], L: number): boolean {
+export function stopCooldownActive(rows: LedgerRow[], symbol: string, candles: Candle[], L: number, limitPct = CONFIG.maxPositionLossPct): boolean {
   let last: LedgerRow | null = null;
   let lastT = -Infinity;
   for (const r of rows) {
@@ -181,7 +200,7 @@ export function stopCooldownActive(rows: LedgerRow[], symbol: string, candles: C
       lastT = t;
     }
   }
-  if (!last || !last.reason.includes('CATASTROPHE STOP')) return false;
+  if (!last || !isStopExit(last, limitPct)) return false;
   const reentered = rows.some((r) => r.symbol === symbol && r.mode === 'alpaca-paper' && r.action === 'BUY' && Date.parse(r.timestamp) > lastT);
   if (reentered) return false;
   if (candles.length === 0 || candles[0].closeTime > lastT) return false; // the stop is older than the data held
@@ -191,4 +210,3 @@ export function stopCooldownActive(rows: LedgerRow[], symbol: string, candles: C
   }
   return true;
 }
-

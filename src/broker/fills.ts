@@ -118,7 +118,9 @@ export function buildRoundTrips(fills: Fill[], dustFrac = 0.01): { trips: RoundT
       exitVwap,
       openedAt: t.entries[0].filledAt,
       closedAt: closed ? t.exits[t.exits.length - 1].filledAt : null,
-      grossPct: closed && exitVwap != null ? (exitVwap / entryVwap - 1) * 100 : null,
+      // Stocks: cash out over cash in (no commission, and it survives a split).
+      // Crypto: per unit, because the buy fee taken in coin shrinks the sold quantity.
+      grossPct: !closed || exitVwap == null ? null : sym.endsWith('USDT') ? (exitVwap / entryVwap - 1) * 100 : (exitQty * exitVwap / (entryQty * entryVwap) - 1) * 100,
       cashPnlUsd: closed ? t.exits.reduce((a, f) => a + f.qty * f.price, 0) - t.entries.reduce((a, f) => a + f.qty * f.price, 0) : null,
       manual: [...t.entries, ...t.exits].some((f) => !f.bot && f.side === 'buy'),
     });

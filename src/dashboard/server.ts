@@ -18,13 +18,15 @@ import {
   positionMatches,
 } from '../broker/orders';
 import { reconcile } from '../broker/fills';
-import { EXPECTED_AGENTS, type HealthInput, evaluateHealth, readHeartbeats, readMonitor } from '../health';
+import { EXPECTED_AGENTS, evaluateHealth, expectedMonitorMonth, gatherHealthInput } from '../health';
 import { attributeTrips, summarizeFees } from '../report';
 import { BOOK_START_ISO, loadBrokerTruth } from '../reconcileRun';
 import type { LedgerRow } from '../types';
 import { BOOK_ENV, COMMANDS, isCommand } from './commands';
 import { requestAllowed } from './guard';
 import { acquireRunLock } from '../locks';
+import { tripCashSince, tripReturnPct } from '../exitPricing';
+import { MANUAL_CLOSE } from '../portfolioRisk';
 import {
   OPS_CLOCK_START,
   type HealthPayload,
@@ -204,14 +206,11 @@ async function summary(): Promise<unknown> {
  * CLI it never rotates logs.
  */
 async function health(): Promise<HealthPayload> {
-  const nowMs = Date.now();
-  const input: HealthInput = { nowMs, heartbeats: readHeartbeats(), rows: loadLedger(), monitor: readMonitor() };
+  // The same input `npm run health` builds (awake-time run history, broker
+  // streak, book lock, ledger read after the broker), without recording a run.
+  const { input } = await gatherHealthInput(false);
+  const nowMs = input.nowMs;
   const brokerChecked = Boolean(process.env.ALPACA_PAPER_KEY_ID);
-  if (brokerChecked) {
-    const c = await brokerSnapshot.get();
-    if (c.value && !c.error) input.broker = c.value;
-    else input.brokerError = c.error ?? 'The broker did not answer.';
-  }
   return shapeHealth({
     nowMs,
     expected: EXPECTED_AGENTS,
@@ -378,12 +377,20 @@ async function gates(): Promise<unknown> {
   const rows = loadLedger();
   const ledgerExits = rows.filter((r) => r.mode === 'alpaca-paper-exit').length;
   const truth = await brokerReport.get();
-  const mon = monitorStatus().latest as { status?: string; trailing12?: number } | null;
+  const mon = monitorStatus().latest as { month?: string; status?: string; trailing12?: number } | null;
+  const want = expectedMonitorMonth(Date.now());
+  const monCurrent = !!mon?.month && mon.month >= want;
   return {
     gates: [
       opsGate(Date.now(), OPS_CLOCK_START),
       tripsGate(truth.value, truth.error, ledgerExits),
-      { id: 'alarm', label: 'Regime monitor: no ALARM', progress: mon ? `${mon.status} · trailing-12 ${mon.trailing12 ?? 'n/a'}%/mo` : 'no data yet', done: !!mon && mon.status !== 'ALARM' },
+      {
+        id: 'alarm',
+        label: 'Regime monitor: no ALARM',
+        progress: !mon ? 'no data yet' : `${mon.status} · trailing-12 ${mon.trailing12 ?? 'n/a'}%/mo · through ${mon.month}${monCurrent ? '' : ` (behind: ${want} expected)`}`,
+        // A stale "ok" proves nothing about the months it hasn't seen.
+        done: !!mon && monCurrent && mon.status !== 'ALARM',
+      },
       {
         id: 'evidence',
         label: 'Evidence review (all strategies currently WATCH)',
@@ -405,8 +412,9 @@ function runCommand(name: string): Promise<{ ok: boolean; output: string }> {
     execFile(
       'npm',
       cmd.args,
-      // A book scan settles every order it places; never kill one mid-order.
-      { cwd: ROOT, env: { ...process.env, ...cmd.env }, timeout: 15 * 60_000, maxBuffer: 4 * 1024 * 1024 },
+      // A book scan settles every order it places; killing one mid-order would
+      // leave an order the ledger never hears about, so it gets no time limit.
+      { cwd: ROOT, env: { ...process.env, ...cmd.env }, timeout: name === 'scan-book' ? 0 : 15 * 60_000, maxBuffer: 4 * 1024 * 1024 },
       (err, stdout, stderr) => {
         const output = (stdout + '\n' + stderr).trim().split('\n').slice(-30).join('\n');
         resolve({ ok: !err, output });
@@ -440,16 +448,18 @@ async function closeAndRecord(botSymbol: string): Promise<unknown> {
   // Attribute by timestamp to the symbol's open entry, the same rule the exit manager uses.
   const entry = openEntryFor(loadLedger(), botSymbol);
   const order = await closePaperPosition(botSymbol);
-  const exitFill = Number(order.filled_avg_price);
+  // Same pricing as the exit manager: every sell since the entry, cash-based for stocks.
+  const cash = entry ? await tripCashSince(botSymbol, entry.timestamp, order) : { exitPrice: Number(order.filled_avg_price), exitQty: Number(order.filled_qty), buyCost: 0 };
+  const exitFill = cash.exitPrice;
   const entryFill = entry ? (entryFillOf(entry) ?? Number(entry.price)) : exitFill;
-  const actualPct = ((exitFill - entryFill) / entryFill) * 100;
+  const actualPct = tripReturnPct(botSymbol.endsWith('USDT'), entryFill, cash);
   appendLedgerRow({
     timestamp: new Date().toISOString(),
     symbol: entry?.symbol ?? botSymbol,
     action: 'SELL',
     price: String(exitFill),
-    quantity: order.filled_qty,
-    reason: `[actual:${entry ? tagOf(entry) : 'manual'}] Manual close via dashboard; entry fill ${entryFill} (order ${entry ? (orderIdOf(entry) ?? 'unknown') : 'none: no open ledger entry'}); ACTUAL round-trip P&L from real paper fills, gross of Alpaca fees.`,
+    quantity: String(cash.exitQty),
+    reason: `[actual:${entry ? tagOf(entry) : 'manual'}] ${MANUAL_CLOSE}; entry fill ${entryFill} (order ${entry ? (orderIdOf(entry) ?? 'unknown') : 'none: no open ledger entry'}); ACTUAL round-trip P&L from real paper fills, gross of Alpaca fees.`,
     mode: 'alpaca-paper-exit',
     outcome: actualPct > 0 ? 'win' : actualPct < 0 ? 'loss' : 'flat',
     pnl: actualPct.toFixed(4),

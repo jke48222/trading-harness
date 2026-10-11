@@ -7,6 +7,7 @@ import { insertLedgerRows, ledgerPath, loadLedger, rowKey, updateLedger } from '
 import {
   type BrokerOrder,
   type BrokerPosition,
+  botSymbolOf,
   fetchOrdersSince,
   getBrokerPositions,
 } from './broker/orders';
@@ -94,8 +95,12 @@ export async function repairFromBroker(log: (m: string) => void, symbols: Set<st
   const today = new Date().toISOString().slice(0, 10);
   const add: LedgerRow[] = [];
   const result: RepairResult = { adopted: 0, exitsAdded: 0, needsReview: [] };
+  // A trip counts as closed once 99% is sold; if the broker still holds the
+  // rest, the exit manager owns it and will write the exit when it sells.
+  const held = new Set(truth.positions.map((p) => botSymbolOf(p.symbol)));
   for (const f of findings) {
     if (!symbols.has(f.botSymbol) || f.trip?.manual) continue;
+    if (f.kind === 'missing-exit-row' && held.has(f.botSymbol)) continue;
     if (f.kind === 'missing-entry-row' && f.fill) {
       const tag = tagRunningAt(rows, Date.parse(f.fill.submittedAt), bookTag());
       add.push(adoptionRow(f.fill, tag, await signalCloseFor(f.fill, tag), fmtPrice, today));

@@ -21,7 +21,7 @@ process.env.ALPACA_PAPER_SECRET = 'test-secret';
 const { evaluateHealth, expectedMonitorMonth } = await import('../src/health.ts');
 
 function hb(p: Partial<ScanStats>): ScanStats {
-  return { label: 'book', at: new Date().toISOString(), startedAt: '', interval: '1d', execution: 'alpaca-paper', symbols: 56, failures: [], entries: [], partials: [], unfilled: [], unknown: [], rejects: [], spreadSkips: [], exits: [], exitFailures: [], orphans: [], swept: 0, adopted: 0, exitsAdded: 0, needsReview: [], stepFailures: [], exitsRan: true, entriesBlocked: null, attempts: {}, entryMisses: {}, ...p };
+  return { label: 'book', at: new Date().toISOString(), startedAt: '', interval: '1d', execution: 'alpaca-paper', symbols: 56, failures: [], entries: [], partials: [], unfilled: [], unknown: [], rejects: [], spreadSkips: [], exits: [], exitFailures: [], orphans: [], swept: 0, adopted: 0, exitsAdded: 0, needsReview: [], stepFailures: [], exitsRan: true, entriesBlocked: null, attempts: {}, entryMisses: {}, lastCryptoWindowScan: new Date().toISOString(), offline: false, offlineStreak: 0, universe: [], ...p };
 }
 
 const okMonitor = { month: expectedMonitorMonth(Date.now()), status: 'ok', trailing12: '0.6' };
@@ -38,9 +38,11 @@ test('health: a quiet, healthy book has no problems', () => {
 
 test('health: broker refusals, a stale book, orphans and resting orders are all PROBLEMs', () => {
   const now = Date.now();
+  const runs = [1, 2, 3, 4, 5].map((i) => now - i * 30 * 60_000); // health ran five times since the book did
   const r = evaluateHealth({
     nowMs: now,
     heartbeats: [hb({ at: new Date(now - 3 * 3_600_000).toISOString(), rejects: ['XRPUSDT: HTTP 403 insufficient balance'] }), quiet[1], quiet[2]],
+    healthRunTimes: runs,
     rows: [],
     monitor: { ...okMonitor, month: '2026-01' },
     broker: {
@@ -50,7 +52,7 @@ test('health: broker refusals, a stale book, orphans and resting orders are all 
     },
   });
   const all = r.problems.join(' | ');
-  assert.match(all, /last ran 180 min ago/);
+  assert.match(all, /has not run while health ran 5 times \(its last scan was 180 min ago\)/);
   assert.match(all, /refused 1 order/);
   assert.match(all, /BONKUSD with no open ledger entry/);
   assert.match(all, /resting at the broker/);
@@ -88,13 +90,38 @@ test('health: an old heartbeat from an ad hoc run never pages', () => {
   assert.deepEqual(r.problems, []);
 });
 
-test('health: a stale book right after the Mac wakes is info, not a page', () => {
+test('health: staleness is counted in awake time (health runs), so sleep neither pages nor hides a dead agent', () => {
   const now = Date.now();
   const stale = [hb({ at: new Date(now - 8 * 3_600_000).toISOString() }), quiet[1], quiet[2]];
-  const woke = evaluateHealth({ nowMs: now, heartbeats: stale, rows: [], monitor: okMonitor, wokeAtMs: now - 10 * 60_000 });
-  assert.equal(woke.problems.length, 0);
-  const awake = evaluateHealth({ nowMs: now, heartbeats: stale, rows: [], monitor: okMonitor, wokeAtMs: now - 5 * 3_600_000 });
-  assert.match(awake.problems.join(' | '), /last ran 480 min ago/);
+  // The Mac slept 8 hours: health has only run twice since the book's last scan.
+  const justWoke = evaluateHealth({ nowMs: now, heartbeats: stale, rows: [], monitor: okMonitor, healthRunTimes: [now - 30 * 60_000, now] });
+  assert.equal(justWoke.problems.length, 0);
+  // Awake for 2.5 hours and still no book scan: the agent is dead, whenever the Mac last woke.
+  const dead = evaluateHealth({ nowMs: now, heartbeats: stale, rows: [], monitor: okMonitor, healthRunTimes: [4, 3, 2, 1, 0].map((i) => now - i * 30 * 60_000) });
+  assert.match(dead.problems.join(' | '), /has not run while health ran 5 times/);
+  // An unreadable stamp is stale, never fresh.
+  const garbled = evaluateHealth({ nowMs: now, heartbeats: [hb({ at: 'not a date' }), quiet[1], quiet[2]], rows: [], monitor: okMonitor, healthRunTimes: [4, 3, 2, 1, 0].map((i) => now - i * 30 * 60_000) });
+  assert.match(garbled.problems.join(' | '), /has not run while health ran 5 times/);
+});
+
+test('health: a regime ALARM is a warning plus a once-a-month notice, not a page every 30 minutes', () => {
+  const r = evaluateHealth({ nowMs: Date.now(), heartbeats: quiet, rows: [], monitor: { ...okMonitor, status: 'ALARM' } });
+  assert.deepEqual(r.problems, []);
+  assert.match(r.warnings.join(' | '), /ALARM/);
+  assert.deepEqual(r.notices.map((n) => n.key), [`alarm:${okMonitor.month}`]);
+});
+
+test('health: an offline scan warns once and pages when it repeats', () => {
+  const once = evaluateHealth({ nowMs: Date.now(), heartbeats: [hb({ offline: true, offlineStreak: 1, exitsRan: false }), quiet[1], quiet[2]], rows: [], monitor: okMonitor });
+  assert.deepEqual(once.problems, [], 'one dark-wake scan with no network is not an outage');
+  const twice = evaluateHealth({ nowMs: Date.now(), heartbeats: [hb({ offline: true, offlineStreak: 2, exitsRan: false }), quiet[1], quiet[2]], rows: [], monitor: okMonitor });
+  assert.match(twice.problems.join(' | '), /last 2 scan\(s\) could not reach/);
+});
+
+test('health: a position outside the book universe pages (nothing manages it)', () => {
+  const positions = [{ symbol: 'XLKX', qty: '3', avg_entry_price: '1', market_value: '1', unrealized_pl: '0', current_price: '1' }];
+  const r = evaluateHealth({ nowMs: Date.now(), heartbeats: [hb({ universe: ['BTCUSDT', 'SPY'] }), quiet[1], quiet[2]], rows: [], monitor: okMonitor, broker: { positions, openOrders: [], account: acct } });
+  assert.match(r.problems.join(' | '), /outside the book's universe/);
 });
 
 test('health: the broker unreachable once warns, twice in a row pages', () => {
@@ -110,3 +137,13 @@ test('health: while a book scan runs, a position without its row yet is not an o
   assert.deepEqual(r.problems, []);
 });
 
+
+test('health: no scan inside the crypto entry window for over a day warns and notifies once a day', () => {
+  const now = Date.now();
+  const r = evaluateHealth({ nowMs: now, heartbeats: [hb({ lastCryptoWindowScan: new Date(now - 30 * 3_600_000).toISOString() }), quiet[1], quiet[2]], rows: [], monitor: okMonitor });
+  assert.deepEqual(r.problems, [], 'a sleeping Mac is a habit to fix, not a 30-minute page');
+  assert.match(r.warnings.join(' | '), /crypto entry window/);
+  assert.deepEqual(r.notices.map((n) => n.key), [`crypto-window:${new Date(now).toISOString().slice(0, 10)}`]);
+  const fresh = evaluateHealth({ nowMs: now, heartbeats: [hb({ lastCryptoWindowScan: null }), quiet[1], quiet[2]], rows: [], monitor: okMonitor });
+  assert.deepEqual([fresh.problems, fresh.notices], [[], []], 'not yet recorded is info only');
+});

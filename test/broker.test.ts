@@ -265,3 +265,40 @@ test('repairFromBroker adopts a late fill and records an exit that has no row, o
   const adaExit = rows.find((r) => r.symbol === 'ADAUSDT' && r.mode === 'alpaca-paper-exit');
   assert.equal(adaExit?.pnl, '10.0000');
 });
+
+test('stock round trips are measured in cash, so a split does not read as a crash', async () => {
+  const { tripReturnPct } = await import('../src/exitPricing.ts');
+  const splitOrders = [
+    { ...fill('buy', 10, 200, t0, 'bot-NVDAX-1'), symbol: 'NVDAX' },
+    { ...fill('sell', 100, 21, t0 + 30 * DAY, 'uuid-s'), symbol: 'NVDAX' }, // after a 10-for-1 split
+  ];
+  const { trips } = fills.buildRoundTrips(fills.ordersToFills(splitOrders));
+  assert.equal(trips[0].grossPct?.toFixed(2), '5.00', '2,000 in, 2,100 out');
+  assert.equal(tripReturnPct(false, 200, { exitPrice: 21, exitQty: 100, buyCost: 2000 }).toFixed(2), '5.00');
+  assert.equal(tripReturnPct(false, 200, { exitPrice: 210, exitQty: 10, buyCost: 0 }).toFixed(2), '5.00', 'no buy history: per share');
+  assert.equal(tripReturnPct(true, 2, { exitPrice: 2.1, exitQty: 99.75, buyCost: 200 }).toFixed(2), '5.00', 'crypto stays per unit');
+});
+
+test('repairFromBroker leaves a still-held leftover to the exit manager (no exit row, no orphan)', async () => {
+  const { repairFromBroker } = await import('../src/reconcileRun.ts');
+  memory.resetMemory();
+  const T = Date.parse('2026-09-01T00:30:00Z');
+  const brokerOrders = [
+    { ...fill('buy', 1000, 1.0, T, 'bot-DOTUSDT-1788220800000'), symbol: 'DOT/USD' },
+    { ...fill('sell', 995, 1.1, T + 2 * DAY, 'uuid-p'), symbol: 'DOT/USD' }, // 99.5% filled, the rest canceled
+  ];
+  memory.appendLedgerRow(row({ timestamp: iso(T), symbol: 'DOTUSDT', price: '0.99', reason: '[tsmom28-1d-state-long] up || broker fill 1 qty 1000, order bot-DOTUSDT-1788220800000' }));
+  const positions = [{ symbol: 'DOTUSD', qty: '5', avg_entry_price: '1', market_value: '5.5', unrealized_pl: '0.5', current_price: '1.1' }];
+  const m = mockFetch((url) => {
+    if (url.includes('/v2/orders?')) return { body: brokerOrders };
+    if (url.endsWith('/v2/positions')) return { body: positions };
+    return { status: 404, body: {} };
+  });
+  try {
+    const r = await repairFromBroker(() => {}, new Set(['DOTUSDT']));
+    assert.equal(r.exitsAdded, 0);
+  } finally {
+    m.restore();
+  }
+  assert.equal(memory.openEntryFor(memory.loadLedger(), 'DOTUSDT')?.symbol, 'DOTUSDT', 'the entry stays open for the exit manager');
+});

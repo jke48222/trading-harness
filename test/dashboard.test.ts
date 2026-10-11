@@ -51,7 +51,7 @@ const NOW = Date.parse('2026-10-11T04:00:00Z');
 
 function hb(p: Partial<ScanStats>): ScanStats {
   const at = p.at ?? iso(NOW);
-  return { label: 'book', at, startedAt: at, interval: '1d', execution: 'alpaca-paper', symbols: 56, failures: [], entries: [], partials: [], unfilled: [], unknown: [], rejects: [], spreadSkips: [], exits: [], exitFailures: [], orphans: [], swept: 0, adopted: 0, exitsAdded: 0, needsReview: [], stepFailures: [], exitsRan: true, entriesBlocked: null, attempts: {}, entryMisses: {}, ...p };
+  return { label: 'book', at, startedAt: at, interval: '1d', execution: 'alpaca-paper', symbols: 56, failures: [], entries: [], partials: [], unfilled: [], unknown: [], rejects: [], spreadSkips: [], exits: [], exitFailures: [], orphans: [], swept: 0, adopted: 0, exitsAdded: 0, needsReview: [], stepFailures: [], exitsRan: true, entriesBlocked: null, attempts: {}, entryMisses: {}, lastCryptoWindowScan: new Date().toISOString(), offline: false, offlineStreak: 0, universe: [], ...p };
 }
 
 test('health payload: expected agents first, each fresh, stale, missing or unscheduled', () => {
@@ -64,7 +64,7 @@ test('health payload: expected agents first, each fresh, stale, missing or unsch
     nowMs: NOW,
     expected: EXPECTED,
     heartbeats: [manual, flip, book, legacy as unknown as ScanStats],
-    report: { problems: [], warnings: ['a warning'], info: ['a note'] },
+    report: { problems: [], warnings: ['a warning'], info: ['a note'], notices: [] },
     monitor: { month: '2026-09', status: 'ok', trailing12: '1.185' },
     broker: { positions: 28, openOrders: 0, equity: 105305.58 },
     brokerChecked: true,
@@ -92,10 +92,11 @@ test('health payload: expected agents first, each fresh, stale, missing or unsch
 test('health payload: status follows evaluateHealth (a stale book is a problem)', () => {
   const heartbeats = [hb({ at: iso(NOW - 3 * 3_600_000) }), hb({ label: 'watch-flip', execution: 'sim' }), hb({ label: 'watch-sol', execution: 'sim' })];
   const monitor = { month: '2026-09', status: 'ok', trailing12: '1.185' };
-  const report = evaluateHealth({ nowMs: NOW, heartbeats, rows: [], monitor });
+  const healthRunTimes = [5, 4, 3, 2, 1].map((i) => NOW - i * 30 * 60_000);
+  const report = evaluateHealth({ nowMs: NOW, heartbeats, rows: [], monitor, healthRunTimes });
   const h = P.shapeHealth({ nowMs: NOW, expected: EXPECTED, heartbeats, report, monitor, broker: null, brokerChecked: false, brokerError: null });
   assert.equal(h.status, 'problem');
-  assert.match(h.problems.join(' | '), /\[book\] last ran 180 min ago/);
+  assert.match(h.problems.join(' | '), /\[book\] has not run while health ran 5 times/);
   assert.equal(h.agents[0].state, 'stale');
   assert.equal(h.broker, null);
 });

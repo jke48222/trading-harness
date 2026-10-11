@@ -110,3 +110,93 @@ test('nextEntryMisses: misses add up, neutral scans keep the count, an entry res
   m = nextEntryMisses(m, { A: 'miss:refused', B: 'ok' }, syms);
   assert.deepEqual(m, { A: { n: 2, kind: 'refused' } });
 });
+
+const portfolioRisk = await import('../src/portfolioRisk.ts');
+const { isStopExit } = portfolioRisk;
+const { inCryptoEntryWindow } = await import('../src/bot.ts');
+
+test('isStopExit: a stop exit rebuilt from broker fills still counts, a state exit never does', () => {
+  const repaired = row({ mode: 'alpaca-paper-exit', action: 'SELL', reason: '[actual:t] Exit recorded 2026-10-12 from broker fills (no row was written at the time); entry fill 200', pnl: '-35.0000' });
+  assert.equal(isStopExit(repaired, 30), true);
+  assert.equal(isStopExit({ ...repaired, reason: '[actual:t] Exit: momentum flipped non-positive (-3.10%) — state exit', pnl: '-35.0000' }, 30), false);
+  assert.equal(isStopExit({ ...repaired, pnl: '-5.0000' }, 30), false);
+});
+
+test('a manual close from the dashboard starts the re-entry cooldown, at any P&L', () => {
+  const { MANUAL_CLOSE } = portfolioRisk;
+  const manual = row({ mode: 'alpaca-paper-exit', action: 'SELL', reason: `[actual:t] ${MANUAL_CLOSE}; entry fill 200 (order bot-X-1)`, pnl: '4.2000' });
+  assert.equal(isStopExit(manual, 30), true, 'closed by hand while the signal says hold: the next scan must not buy it straight back');
+});
+
+test('inCryptoEntryWindow follows ENTRY_WINDOW_MIN after the 00:00 UTC close', () => {
+  assert.equal(inCryptoEntryWindow(Date.parse('2026-10-12T01:30:00Z')), true);
+  assert.equal(inCryptoEntryWindow(Date.parse('2026-10-12T02:30:00Z')), false);
+});
+
+test('a crash close that both breaches the stop and turns momentum is a plain state exit (no cooldown)', async () => {
+  memory.resetMemory();
+  memory.appendLedgerRow(row({ timestamp: iso(now - 14 * DAY), symbol: 'AAPL', price: '199.00', reason: '[tsmom28-1d-state-long] up || broker fill 200 qty 10, order bot-AAPL-1790000000000-m1' }));
+  const bars = crashBars();
+  const last = bars.length - 1;
+  bars[last] = { ...bars[last], o: 110, h: 110, l: 110, c: 110 }; // below the close 28 sessions back (120): momentum turns
+  let closed = false;
+  const m = mockFetch((url, init) => {
+    const method = init?.method ?? 'GET';
+    if (url.includes('/v2/stocks/AAPL/bars')) return { body: { bars, next_page_token: null } };
+    if (url.endsWith('/v2/clock')) return { body: { is_open: true, next_open: iso(now + DAY), next_close: iso(now + 3_600_000) } };
+    if (url.includes('/v2/orders?status=')) return { body: [] };
+    if (url.endsWith('/v2/account')) return { body: { account_number: 'x', status: 'ACTIVE', cash: '90000', equity: '100000', portfolio_value: '100000', buying_power: '90000' } };
+    if (url.endsWith('/v2/positions') && method === 'GET') return { body: closed ? [] : [{ symbol: 'AAPL', qty: '10', avg_entry_price: '200', market_value: '1100', unrealized_pl: '-900', current_price: '110' }] };
+    if (method === 'DELETE' && url.endsWith('/v2/positions/AAPL')) {
+      closed = true;
+      return { body: order({ id: 'close2', symbol: 'AAPL', side: 'sell', status: 'filled', filled_qty: '10', filled_avg_price: '110' }) };
+    }
+    if (url.endsWith('/v2/orders/close2')) return { body: order({ id: 'close2', symbol: 'AAPL', side: 'sell', status: 'filled', filled_qty: '10', filled_avg_price: '110' }) };
+    return { status: 404, body: { message: `unmocked ${method} ${url}` } };
+  });
+  const realLog = console.log;
+  console.log = () => {};
+  try {
+    await runScan();
+  } finally {
+    console.log = realLog;
+    m.restore();
+  }
+  const exit = memory.loadLedger().find((r) => r.mode === 'alpaca-paper-exit');
+  assert.match(exit?.reason ?? '', /state exit/);
+  assert.doesNotMatch(exit?.reason ?? '', /CATASTROPHE/);
+});
+
+test('an order the broker accepts and then rejects counts as refused, not merely unfilled', async () => {
+  memory.resetMemory();
+  const n = 120;
+  const bars = Array.from({ length: n }, (_, i) => {
+    const c = 100 + i; // steady uptrend: momentum positive, the state signal says BUY
+    return { t: new Date(now - 2 * DAY - (n - 1 - i) * DAY).toISOString(), o: c, h: c, l: c, c, v: 1000 };
+  });
+  const m = mockFetch((url, init) => {
+    const method = init?.method ?? 'GET';
+    if (url.includes('/v2/stocks/AAPL/bars')) return { body: { bars, next_page_token: null } };
+    if (url.includes('/quotes/latest')) return { body: { quote: { bp: 218.9, ap: 219.1, t: new Date().toISOString() } } };
+    if (url.endsWith('/v2/clock')) return { body: { is_open: true, next_open: iso(now + DAY), next_close: iso(now + 3_600_000) } };
+    if (url.includes('/v2/orders?status=')) return { body: [] };
+    if (url.endsWith('/v2/account')) return { body: { account_number: 'x', status: 'ACTIVE', cash: '90000', equity: '100000', portfolio_value: '100000', buying_power: '90000' } };
+    if (url.endsWith('/v2/positions') && method === 'GET') return { body: [] };
+    if (method === 'POST' && url.endsWith('/v2/orders')) return { body: order({ id: 'b9', symbol: 'AAPL', status: 'new' }) };
+    if (url.endsWith('/v2/orders/b9')) return { body: order({ id: 'b9', symbol: 'AAPL', status: 'rejected', filled_qty: '0' }) };
+    return { status: 404, body: { message: `unmocked ${method} ${url}` } };
+  });
+  const realLog = console.log;
+  console.log = () => {};
+  try {
+    await runScan();
+  } finally {
+    console.log = realLog;
+    m.restore();
+  }
+  process.exitCode = 0; // runScan flags the reject for launchd; this test expects it
+  const hb = JSON.parse(fs.readFileSync(path.join(process.env.DATA_DIR as string, 'heartbeat', 'book.json'), 'utf8'));
+  assert.equal(hb.rejects.length, 1);
+  assert.equal(hb.attempts.AAPL, 'miss:refused');
+  assert.deepEqual(hb.unfilled, []);
+});
