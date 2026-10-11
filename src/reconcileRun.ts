@@ -2,7 +2,8 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { CONFIG } from './config';
 import { closedCandles, fetchSeriesSince, intervalToMs } from './market';
-import { insertLedgerRows, ledgerPath, loadLedger, orderIdOf, rowKey, updateLedger } from './memory';
+import { acquireRunLock } from './locks';
+import { insertLedgerRows, ledgerPath, loadLedger, rowKey, updateLedger } from './memory';
 import {
   type BrokerOrder,
   type BrokerPosition,
@@ -70,28 +71,46 @@ function bookTag(): string {
   return `tsmom${CONFIG.tsmomLookback}-${CONFIG.interval}-state-long`;
 }
 
+export interface RepairResult {
+  adopted: number;
+  exitsAdded: number;
+  /** Divergences only a person should resolve (misattributed exits, unexplained positions). */
+  needsReview: string[];
+}
+
 /**
- * Write the missing ledger row for every bot buy that filled after its scan
- * gave up on it (the order settled late). Runs at the start of every book scan,
- * so the exit manager can manage the position within the hour.
+ * Bring the ledger in line with what the broker proves, for this run's
+ * universe: adopt bot buys that filled after their scan gave up on them, and
+ * add exit rows for bot trips the broker closed with no row (a crash between
+ * the fill and the write). Runs at the start of every book scan, so the exit
+ * manager can manage an adopted position within the hour. Manual trips and
+ * misattributed exits are left for `npm run reconcile`.
  */
-export async function adoptLateFills(log: (m: string) => void, lookbackDays = 14, symbols?: Set<string>): Promise<number> {
-  const since = new Date(Date.now() - lookbackDays * 86_400_000).toISOString();
-  const fills = ordersToFills(await fetchOrdersSince(since)).filter(
-    (f) => f.side === 'buy' && f.bot && (!symbols || symbols.has(f.botSymbol))
-  );
+export async function repairFromBroker(log: (m: string) => void, symbols: Set<string>): Promise<RepairResult> {
+  const truth = await loadBrokerTruth();
   const rows = loadLedger();
-  const known = new Set(rows.map(orderIdOf).filter(Boolean) as string[]);
+  const filledBotClientIds = new Set(truth.fills.filter((f) => f.bot).map((f) => f.clientOrderId));
+  const findings = reconcile({ rows, trips: truth.trips, positions: truth.positions, filledBotClientIds, sinceMs: Date.parse(BOOK_START_ISO) });
   const today = new Date().toISOString().slice(0, 10);
-  const adopt: LedgerRow[] = [];
-  for (const f of fills) {
-    if (known.has(f.clientOrderId)) continue;
-    const tag = tagRunningAt(rows, Date.parse(f.submittedAt), bookTag());
-    adopt.push(adoptionRow(f, tag, await signalCloseFor(f, tag), fmtPrice, today));
-    log(`Broker: adopting late fill ${f.clientOrderId} (${f.qty} ${f.brokerSymbol} @ ${f.price}, filled ${f.filledAt}) — it had no ledger row.`);
+  const add: LedgerRow[] = [];
+  const result: RepairResult = { adopted: 0, exitsAdded: 0, needsReview: [] };
+  for (const f of findings) {
+    if (!symbols.has(f.botSymbol) || f.trip?.manual) continue;
+    if (f.kind === 'missing-entry-row' && f.fill) {
+      const tag = tagRunningAt(rows, Date.parse(f.fill.submittedAt), bookTag());
+      add.push(adoptionRow(f.fill, tag, await signalCloseFor(f.fill, tag), fmtPrice, today));
+      log(`Broker: adopting late fill ${f.fill.clientOrderId} (${f.fill.qty} ${f.fill.brokerSymbol} @ ${f.fill.price}, filled ${f.fill.filledAt}): it had no ledger row.`);
+      result.adopted++;
+    } else if (f.kind === 'missing-exit-row' && f.trip) {
+      add.push(missingExitRow(f.trip, tagRunningAt(rows, Date.parse(f.trip.openedAt), bookTag()), fmtPrice, today));
+      log(`Broker: recording the exit of ${f.botSymbol} that filled ${f.trip.closedAt} with no ledger row.`);
+      result.exitsAdded++;
+    } else if (f.kind === 'misattributed-exit' || f.kind === 'unbacked-entry-row') {
+      result.needsReview.push(`${f.botSymbol}: ${f.kind}`);
+    }
   }
-  insertLedgerRows(adopt);
-  return adopt.length;
+  insertLedgerRows(add);
+  return result;
 }
 
 function backupLedger(): string {
@@ -154,6 +173,12 @@ export async function runReconcile(apply: boolean): Promise<Finding[]> {
     console.log('Nothing the broker can prove automatically; the findings above need a person.');
     return findings;
   }
+  // A book scan repairs the same rows; never apply alongside one.
+  const release = acquireRunLock('book');
+  if (!release) {
+    console.log('A book scan is running; nothing was applied. Run this again in a minute.');
+    return findings;
+  }
   const backup = backupLedger();
   updateLedger((all) => {
     for (let i = 0; i < all.length; i++) {
@@ -162,6 +187,7 @@ export async function runReconcile(apply: boolean): Promise<Finding[]> {
     }
   });
   insertLedgerRows([...adoptions, ...newExits]);
+  release();
   console.log(
     `Applied: ${adoptions.length} adopted entr${adoptions.length === 1 ? 'y' : 'ies'}, ${corrections.size} corrected exit(s), ` +
       `${newExits.length} added exit(s). Backup: ${backup}`

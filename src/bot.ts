@@ -15,6 +15,7 @@ import {
   type EntryResult,
   cancelStaleBotOrders,
   closePaperPosition,
+  fetchOrdersSince,
   getAccount,
   getBrokerPositions,
   getLatestQuote,
@@ -25,9 +26,10 @@ import {
   submitPaperBuyMaker,
   toOrderSymbol,
 } from './broker/orders';
-import { buildRiskContext, evaluateEntry, recordEntry, type RiskContext } from './portfolioRisk';
+import { buildRiskContext, evaluateEntry, recordEntry, stopCooldownActive, type RiskContext } from './portfolioRisk';
 import { acquireRunLock, runLockHolder } from './locks';
-import { adoptLateFills, fmtPrice } from './reconcileRun';
+import { fmtPrice, repairFromBroker } from './reconcileRun';
+import { boundaryOfClientId, ordersToFills } from './broker/fills';
 import { priceEntry } from './entryPricing';
 import type { Candle, Signal } from './types';
 
@@ -70,6 +72,20 @@ export interface ScanStats {
   orphans: string[];
   swept: number;
   adopted: number;
+  /** Exit rows added from broker fills (an exit that filled with no row). */
+  exitsAdded: number;
+  /** Divergences from broker fills that need `npm run reconcile` and a person. */
+  needsReview: string[];
+  /** Steps that failed outright (scoring, sweep, repair, exits, risk). */
+  stepFailures: string[];
+  /** True once the exit manager checked every position (risk management ran). */
+  exitsRan: boolean;
+  /** Why this scan placed no entries at all, when it didn't. */
+  entriesBlocked: string | null;
+  /** Per symbol this scan: 'ok', 'neutral', or 'miss:<kind>' when an entry the strategy wanted did not happen. */
+  attempts: Record<string, string>;
+  /** Consecutive missed entries per symbol, carried across scans; neutral scans neither add nor reset. */
+  entryMisses: Record<string, { n: number; kind: string }>;
 }
 
 export function runLabel(): string {
@@ -99,7 +115,49 @@ function newStats(): ScanStats {
     orphans: [],
     swept: 0,
     adopted: 0,
+    exitsAdded: 0,
+    needsReview: [],
+    stepFailures: [],
+    exitsRan: false,
+    entriesBlocked: null,
+    attempts: {},
+    entryMisses: {},
   };
+}
+
+function heartbeatFile(label: string): string {
+  return path.join(heartbeatDir(), `${label.replace(/[^A-Za-z0-9._-]/g, '_')}.json`);
+}
+
+function previousHeartbeat(label: string): Partial<ScanStats> | null {
+  try {
+    return JSON.parse(fs.readFileSync(heartbeatFile(label), 'utf8')) as Partial<ScanStats>;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Carry the missed-entry streaks forward. A miss adds one, an entry or a
+ * signal that wants none resets, and a neutral scan (outside the entry
+ * window, market closed, budget full) leaves the count alone, so a coin that
+ * misses its window two days running reads 2, not 0.
+ */
+export function nextEntryMisses(
+  prev: Record<string, { n: number; kind: string }>,
+  attempts: Record<string, string>,
+  symbols: string[]
+): Record<string, { n: number; kind: string }> {
+  const next: Record<string, { n: number; kind: string }> = {};
+  for (const sym of symbols) {
+    const a = attempts[sym];
+    if (a === undefined || a === 'neutral') {
+      if (prev[sym]) next[sym] = prev[sym];
+    } else if (a.startsWith('miss:')) {
+      next[sym] = { n: (prev[sym]?.n ?? 0) + 1, kind: a.slice(5) };
+    }
+  }
+  return next;
 }
 
 /** data/heartbeat/<label>.json, one file per agent, so a busy agent can't mask a dead one. */
@@ -111,7 +169,7 @@ function writeHeartbeat(stats: ScanStats): void {
   try {
     stats.at = new Date().toISOString();
     fs.mkdirSync(heartbeatDir(), { recursive: true });
-    const file = path.join(heartbeatDir(), `${stats.label.replace(/[^A-Za-z0-9._-]/g, '_')}.json`);
+    const file = heartbeatFile(stats.label);
     fs.writeFileSync(file + '.tmp', JSON.stringify(stats, null, 1));
     fs.renameSync(file + '.tmp', file);
   } catch {
@@ -130,6 +188,7 @@ async function manageBrokerExits(stats: ScanStats): Promise<void> {
   const positions = await getBrokerPositions();
   if (positions.length === 0) {
     log('Broker: no open paper positions.');
+    stats.exitsRan = true;
     return;
   }
   const iMs = intervalToMs(CONFIG.interval);
@@ -187,7 +246,21 @@ async function manageBrokerExits(stats: ScanStats): Promise<void> {
         }
       }
       const order = await closePaperPosition(sym);
-      const exitFill = Number(order.filled_avg_price);
+      // Price the exit from every sell since the entry: a close that partly
+      // filled in an earlier scan is part of this exit too.
+      let exitFill = Number(order.filled_avg_price);
+      let exitQty = Number(order.filled_qty);
+      try {
+        const since = new Date(Date.parse(entry.timestamp) - 60_000).toISOString();
+        const sells = ordersToFills(await fetchOrdersSince(since)).filter((f) => f.side === 'sell' && f.botSymbol === sym);
+        const q = sells.reduce((a, f) => a + f.qty, 0);
+        if (q > 0) {
+          exitFill = sells.reduce((a, f) => a + f.qty * f.price, 0) / q;
+          exitQty = q;
+        }
+      } catch {
+        /* this close order's own fill stands */
+      }
       const entryFill = entryFillOf(entry) ?? Number(entry.price);
       const actualPct = ((exitFill - entryFill) / entryFill) * 100;
       const tag = entry.reason.match(/^\[([^\]]+)\]/)?.[1] ?? 'unknown';
@@ -196,7 +269,7 @@ async function manageBrokerExits(stats: ScanStats): Promise<void> {
         symbol: sym,
         action: 'SELL',
         price: fmtPrice(exitFill),
-        quantity: order.filled_qty,
+        quantity: String(exitQty),
         reason:
           `[actual:${tag}] Exit: ${exitReason}; entry fill ${entryFill} (order ${orderIdOf(entry) ?? 'unknown'}); ` +
           'ACTUAL round-trip P&L from real paper fills, gross of Alpaca fees.',
@@ -205,12 +278,13 @@ async function manageBrokerExits(stats: ScanStats): Promise<void> {
         pnl: actualPct.toFixed(4),
       });
       stats.exits.push(`${sym} ${actualPct >= 0 ? '+' : ''}${actualPct.toFixed(2)}%`);
-      log(`Broker: ${sym} ${exitReason} — sold ${order.filled_qty} @ ${exitFill} (entry fill ${entryFill}) = ${actualPct >= 0 ? '+' : ''}${actualPct.toFixed(3)}% actual, recorded.`);
+      log(`Broker: ${sym} ${exitReason} — sold ${exitQty} @ ${exitFill} (entry fill ${entryFill}) = ${actualPct >= 0 ? '+' : ''}${actualPct.toFixed(3)}% actual, recorded.`);
     } catch (err) {
       stats.exitFailures.push(`${sym}: ${(err as Error).message.split('\n')[0]}`);
       log(`Broker: ${sym} exit check failed — ${(err as Error).message.split('\n')[0]} (retried next scan).`);
     }
   }
+  stats.exitsRan = true;
 }
 
 /**
@@ -242,31 +316,61 @@ export async function runScan(): Promise<void> {
         `(paper only — orders can reach only the Alpaca paper host${CONFIG.tsmomState ? '; STATE construction (Trial 07)' : ''}${CONFIG.regimeFilter ? `; regime filter ON: ${CONFIG.htfInterval} SMA${CONFIG.htfMa}` : ''})`
     );
 
+    // Each step is guarded on its own: bookkeeping that fails (scoring, a
+    // sweep, a repair) must never stop the exit manager, which carries the
+    // catastrophe stop.
+    const step = async (name: string, fn: () => Promise<void>): Promise<boolean> => {
+      try {
+        await fn();
+        return true;
+      } catch (err) {
+        const msg = (err as Error).message.split('\n')[0];
+        stats.stepFailures.push(`${name}: ${msg}`);
+        log(`Step '${name}' failed: ${msg}`);
+        return false;
+      }
+    };
+
     // Score earlier paper trades whose horizon has passed, so the forward
     // record (and the memory system) runs on real outcomes.
-    await scoreMaturedScanTrades(log);
+    await step('scoring', async () => {
+      await scoreMaturedScanTrades(log);
+    });
 
     let riskCtx: RiskContext | null = null;
     if (broker) {
-      // Nothing should be resting at the broker between scans; anything that is
-      // was left by a crash or an unconfirmed cancel.
-      const swept = await cancelStaleBotOrders();
-      stats.swept = swept.length;
-      if (swept.length > 0) log(`Broker: canceled ${swept.length} stale bot order(s): ${swept.map((o) => o.client_order_id).join(', ')}.`);
-      try {
-        stats.adopted = await adoptLateFills(log, 14, new Set(symbolsList));
-      } catch (err) {
-        stats.failures.push(`adoption: ${(err as Error).message.split('\n')[0]}`);
-        log(`Broker: late-fill adoption failed — ${(err as Error).message.split('\n')[0]}`);
-      }
-      await manageBrokerExits(stats);
+      // Nothing should be resting at the broker between scans; anything that
+      // is was left by a crash or an unconfirmed cancel. If the sweep can't
+      // run, entries wait: a resting order could double one.
+      const swept = await step('sweep', async () => {
+        const orders = await cancelStaleBotOrders();
+        stats.swept = orders.length;
+        if (orders.length > 0) log(`Broker: canceled ${orders.length} stale bot order(s): ${orders.map((o) => `${o.client_order_id} (${o.status})`).join(', ')}.`);
+        const unsettled = orders.filter((o) => !['canceled', 'filled', 'expired', 'rejected'].includes(o.status));
+        if (unsettled.length > 0) stats.entriesBlocked = `stale order(s) not confirmed canceled: ${unsettled.map((o) => o.symbol).join(', ')}`;
+      });
+      if (!swept) stats.entriesBlocked = 'the stale-order sweep failed';
+      await step('repair', async () => {
+        const r = await repairFromBroker(log, new Set(symbolsList));
+        stats.adopted = r.adopted;
+        stats.exitsAdded = r.exitsAdded;
+        stats.needsReview = r.needsReview;
+      });
+      await step('exits', () => manageBrokerExits(stats));
       // Build the risk context ONCE per scan from a fresh post-exit snapshot;
-      // symbols share it and increment its tallies as entries fill (one set of
-      // account/positions calls instead of one per symbol).
-      const [account, positions] = await Promise.all([getAccount(), getBrokerPositions()]);
-      riskCtx = buildRiskContext(account, positions);
-      log(`Risk: ${riskCtx.haltReason} · ${riskCtx.openCount} open · $${riskCtx.deployed.toFixed(0)} deployed ($${riskCtx.cryptoDeployed.toFixed(0)} crypto).`);
-      if (riskCtx.entriesHalted) log('Risk: NEW ENTRIES HALTED this scan (exits and stops still ran).');
+      // symbols share it and increment its tallies as entries fill.
+      const risk = await step('risk', async () => {
+        const [account, positions] = await Promise.all([getAccount(), getBrokerPositions()]);
+        riskCtx = buildRiskContext(account, positions);
+      });
+      if (!risk || !riskCtx) {
+        stats.entriesBlocked ??= 'no account or positions snapshot for the risk checks';
+      } else {
+        const ctx = riskCtx as RiskContext;
+        log(`Risk: ${ctx.haltReason} · ${ctx.openCount} open · $${ctx.deployed.toFixed(0)} deployed ($${ctx.cryptoDeployed.toFixed(0)} crypto).`);
+        if (ctx.entriesHalted) log('Risk: NEW ENTRIES HALTED this scan (exits and stops still ran).');
+      }
+      if (stats.entriesBlocked) log(`Broker: no new entries this scan: ${stats.entriesBlocked}.`);
     }
 
     let stockMarketOpen: boolean | null = null;
@@ -284,26 +388,29 @@ export async function runScan(): Promise<void> {
 
     for (const symbol of symbolsList) {
       try {
-        await scanSymbol(symbol, stockMarketOpen, riskCtx, stats);
+        await scanSymbol(symbol, stockMarketOpen, broker && stats.entriesBlocked ? null : riskCtx, stats);
       } catch (err) {
         const msg = (err as Error).message.split('\n')[0];
         if (err instanceof BrokerHttpError && err.path === '/v2/orders') {
           stats.rejects.push(`${symbol}: HTTP ${err.status} ${err.body.slice(0, 160)}`);
+          stats.attempts[symbol] = 'miss:refused';
           log(`${symbol}: ORDER REJECTED by the broker — HTTP ${err.status} ${err.body.slice(0, 200)}`);
         } else {
           stats.failures.push(`${symbol}: ${msg}`);
+          stats.attempts[symbol] ??= 'miss:error';
           log(`${symbol}: BLOCKED — ${msg}`);
           log(`${symbol}: the bot never fakes a result for a symbol it cannot read; continuing with the rest of the universe.`);
         }
       }
     }
   } catch (err) {
-    stats.failures.push(`scan: ${(err as Error).message.split('\n')[0]}`);
+    stats.stepFailures.push(`scan: ${(err as Error).message.split('\n')[0]}`);
     throw err;
   } finally {
+    if (broker) stats.entryMisses = nextEntryMisses(previousHeartbeat(stats.label)?.entryMisses ?? {}, stats.attempts, symbolsList);
     writeHeartbeat(stats);
     release?.();
-    const bad = stats.failures.length + stats.rejects.length + stats.unknown.length + stats.exitFailures.length + stats.orphans.length;
+    const bad = stats.failures.length + stats.rejects.length + stats.unknown.length + stats.exitFailures.length + stats.orphans.length + stats.stepFailures.length;
     if (bad > 0) process.exitCode = 1;
   }
 }
@@ -328,28 +435,42 @@ async function scanSymbol(symbol: string, stockMarketOpen: boolean | null, riskC
   const sig = latestSignal(candles);
   log(`${symbol}: signal ${sig.action} — ${sig.reason}`);
   if (sig.action === 'HOLD') {
+    stats.attempts[symbol] = 'ok';
     log(`${symbol}: final decision HOLD — no paper order was sent.`);
     return;
   }
   if (CONFIG.entrySkip.has(symbol)) {
+    stats.attempts[symbol] = 'neutral';
     log(`${symbol}: ${sig.action} signal not taken — new entries are off for this symbol (ENTRY_SKIP); open positions still exit on the strategy's rule.`);
     return;
   }
 
   // One decision per signal candle: scans run far more often than candles
   // close (e.g. hourly scans of daily candles), and the same fresh signal must
-  // not be traded again on every re-scan.
+  // not be traded again on every re-scan. Broker rows carry the signal candle
+  // in their order id; timestamps can't be used for them, since a Monday
+  // stock entry acts on Friday's candle.
   const iMs = intervalToMs(interval);
   const signalBoundary = Math.floor((sig.time + 1) / iMs) * iMs;
-  const alreadyActed = loadLedger().some((r) => {
+  const rowsNow = loadLedger();
+  const alreadyActed = rowsNow.some((r) => {
     if (r.symbol !== symbol) return false;
     if (r.mode !== 'scan' && r.mode !== 'scan-filtered' && r.mode !== 'alpaca-paper') return false;
     if (!r.reason.includes(`[${sig.setupTag}]`)) return false;
+    const id = orderIdOf(r);
+    const b = id ? boundaryOfClientId(id) : null;
+    if (b != null) return b === signalBoundary;
     const t = Date.parse(r.timestamp);
     return Number.isFinite(t) && Math.floor(t / iMs) * iMs === signalBoundary;
   });
   if (alreadyActed) {
+    stats.attempts[symbol] = 'ok';
     log(`${symbol}: this ${sig.setupTag} signal candle was already acted on in an earlier scan — no duplicate order.`);
+    return;
+  }
+  if (CONFIG.executionMode === 'alpaca-paper' && sig.action === 'BUY' && stopCooldownActive(rowsNow, symbol, candles, CONFIG.tsmomLookback)) {
+    stats.attempts[symbol] = 'neutral';
+    log(`${symbol}: no re-entry yet — a catastrophe stop closed this symbol, and its momentum has not turned non-positive since.`);
     return;
   }
 
@@ -372,6 +493,7 @@ async function scanSymbol(symbol: string, stockMarketOpen: boolean | null, riskC
         outcome: 'open',
         pnl: '',
       });
+      stats.attempts[symbol] = 'ok';
       log(`${symbol}: regime filter declined ${sig.action} — ${verdict.reason}`);
       log(`${symbol}: final decision HOLD (filtered) — counterfactual logged to ${ledgerPath()} for honest scoring.`);
       return;
@@ -428,6 +550,7 @@ async function scanSymbol(symbol: string, stockMarketOpen: boolean | null, riskC
         outcome: 'open',
         pnl: '',
       });
+      stats.attempts[symbol] = 'ok';
       log(`${symbol}: final decision SKIP — memory blocked a known bad setup; counterfactual logged to ${ledgerPath()} for honest scoring.`);
       return;
     }
@@ -441,10 +564,15 @@ async function scanSymbol(symbol: string, stockMarketOpen: boolean | null, riskC
       // No ledger row is written, so the signal stays actionable: the next
       // scan with the market open places the order (slippage vs the signal
       // close will show the overnight gap — honest and measured).
+      stats.attempts[symbol] = 'neutral';
       log(`${symbol}: BUY signal noted but the stock market is closed — the order will be placed at the next open.`);
       return;
     } else {
-      if (!riskCtx) throw new Error('risk context missing for a broker entry (internal).');
+      if (!riskCtx) {
+        stats.attempts[symbol] = 'neutral';
+        log(`${symbol}: BUY signal not acted on — entries are blocked this scan (${stats.entriesBlocked ?? 'no risk snapshot'}).`);
+        return;
+      }
       await enterPosition(symbol, crypto, sig, candles, signalBoundary, riskCtx, stats);
       return;
     }
@@ -469,6 +597,7 @@ async function scanSymbol(symbol: string, stockMarketOpen: boolean | null, riskC
     outcome: 'open',
     pnl: '',
   });
+  stats.attempts[symbol] = 'ok';
   log(`${symbol}: execution — PAPER ${sig.action} ${quantity} @ ${sig.price.toFixed(2)} simulated; no real order was sent.`);
   log(`${symbol}: final decision ${sig.action} (paper) — logged to ${ledgerPath()}.`);
 }
@@ -497,6 +626,7 @@ async function enterPosition(
     const lastClose = Math.floor(Date.now() / 86_400_000) * 86_400_000; // last 00:00 UTC
     const minsSinceClose = (Date.now() - lastClose) / 60_000;
     if (minsSinceClose > CONFIG.entryWindowMin) {
+      stats.attempts[symbol] = 'neutral';
       log(`${symbol}: outside the ${CONFIG.entryWindowMin}-min post-close entry window (${minsSinceClose.toFixed(0)} min in) — deferring to near the next daily close for a fill nearer the signal price.`);
       return;
     }
@@ -504,6 +634,8 @@ async function enterPosition(
 
   const decision = evaluateEntry(symbol, orderKey, candles, riskCtx);
   if (!decision.allowed) {
+    // Already holding it is the strategy satisfied; a full budget or a halt is by design.
+    stats.attempts[symbol] = decision.reason.startsWith('position already open') ? 'ok' : 'neutral';
     log(`${symbol}: entry skipped — ${decision.reason}`);
     return;
   }
@@ -515,12 +647,14 @@ async function enterPosition(
     pricing = priceEntry({ crypto, quote, mark: await currentMark(symbol), nowMs: Date.now(), maxSpreadBps: CONFIG.maxSpreadBps });
   }
   if (pricing.kind === 'skip') {
+    stats.attempts[symbol] = 'miss:spread';
     stats.spreadSkips.push(`${symbol} ${quote ? quote.spreadBps.toFixed(0) + 'bps' : ''}`.trim());
     log(`${symbol}: entry skipped — ${pricing.reason}; crossing it costs more than a normal day's edge. Retried next scan.`);
     return;
   }
   const { arrival, touch } = pricing; // arrival: slippage reference; touch: what a marketable buy pays
   if (CONFIG.limitSlippageBps > 0 && touch == null) {
+    stats.attempts[symbol] = 'miss:noprice';
     stats.failures.push(`${symbol}: no price to bound the limit order`);
     log(`${symbol}: entry skipped — no quote and no 1-minute close to bound the limit order; retried next scan.`);
     return;
@@ -544,11 +678,13 @@ async function enterPosition(
   }
 
   if (res.state === 'unfilled') {
+    stats.attempts[symbol] = 'miss:unfilled';
     stats.unfilled.push(symbol);
     log(`${symbol}: order ${clientId} did not fill within ${CONFIG.orderTimeoutSec}s and was canceled — nothing rests at the broker; the next scan retries.`);
     return;
   }
   if (res.state === 'unknown') {
+    stats.attempts[symbol] = 'miss:unknown';
     stats.unknown.push(`${symbol} (${res.order.status})`);
     log(`${symbol}: order ${clientId} is still '${res.order.status}' after a cancel request — not recorded; the next scan sweeps it and adopts any fill.`);
     return;
@@ -577,6 +713,7 @@ async function enterPosition(
     pnl: '',
   });
   (res.state === 'partial' ? stats.partials : stats.entries).push(symbol);
+  stats.attempts[symbol] = 'ok';
   log(
     `${symbol}: REAL PAPER ORDER ${res.state} — $${notional.toFixed(2)} @ ${fillPrice}${partialNote}, ` +
       `exec slippage ${slipExec != null ? bps(slipExec) : 'n/a'} bps vs ${pricing.source}, signal-drift ${bps(slipSignal)} bps.`

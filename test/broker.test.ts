@@ -228,3 +228,40 @@ test('attributeTrips adds the fee back so model and actual are both gross', () =
   assert.equal(a.entrySlipBps?.toFixed(0), (((0.82663 / 0.828) - 1) * 10_000).toFixed(0));
   assert.equal(a.exitSlipBps?.toFixed(0), (((0.754711 / 0.76) - 1) * 10_000).toFixed(0));
 });
+
+test('repairFromBroker adopts a late fill and records an exit that has no row, once', async () => {
+  const { repairFromBroker } = await import('../src/reconcileRun.ts');
+  memory.resetMemory();
+  const T = Date.parse('2026-09-01T00:30:00Z');
+  const brokerOrders = [
+    fill('buy', 100, 1.0, T, 'bot-DOTUSDT-1788220800000'), // its scan timed out; no row
+    fill('buy', 50, 2.0, T + DAY, 'bot-ADAUSDT-1788307200000'),
+    fill('sell', 49.9, 2.2, T + 3 * DAY, 'uuid-x'), // closed, but the exit row was lost
+  ].map((o, i) => (i === 0 ? o : { ...o, symbol: 'ADA/USD' }));
+  memory.appendLedgerRow(row({ timestamp: iso(T + DAY), symbol: 'ADAUSDT', price: '1.98', reason: '[tsmom28-1d-state-long] up || broker fill 2 qty 50, order bot-ADAUSDT-1788307200000' }));
+  const positions = [{ symbol: 'DOTUSD', qty: '100', avg_entry_price: '1', market_value: '110', unrealized_pl: '10', current_price: '1.1' }];
+  const klines = Array.from({ length: 12 }, (_, i) => {
+    const open = Date.parse('2026-08-25T00:00:00Z') + i * DAY;
+    return [open, '0.97', '0.97', '0.97', '0.97', '1', open + DAY - 1];
+  });
+  const m = mockFetch((url) => {
+    if (url.includes('/v2/orders?')) return { body: brokerOrders };
+    if (url.endsWith('/v2/positions')) return { body: positions };
+    if (url.includes('klines')) return { body: klines };
+    return { status: 404, body: {} };
+  });
+  try {
+    const first = await repairFromBroker(() => {}, new Set(['DOTUSDT', 'ADAUSDT']));
+    assert.equal(first.adopted, 1);
+    assert.equal(first.exitsAdded, 1);
+    const second = await repairFromBroker(() => {}, new Set(['DOTUSDT', 'ADAUSDT']));
+    assert.deepEqual([second.adopted, second.exitsAdded], [0, 0], 'nothing twice');
+  } finally {
+    m.restore();
+  }
+  const rows = memory.loadLedger();
+  const dot = rows.find((r) => r.symbol === 'DOTUSDT');
+  assert.equal(dot?.price, '0.970000', 'adopted at the signal close');
+  const adaExit = rows.find((r) => r.symbol === 'ADAUSDT' && r.mode === 'alpaca-paper-exit');
+  assert.equal(adaExit?.pnl, '10.0000');
+});

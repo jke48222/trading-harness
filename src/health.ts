@@ -1,6 +1,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as zlib from 'node:zlib';
+import { execFileSync } from 'node:child_process';
 import { CONFIG } from './config';
 import {
   type BrokerAccount,
@@ -12,6 +13,7 @@ import {
   getOpenOrders,
 } from './broker/orders';
 import { loadLedger, openEntryFor } from './memory';
+import { runLockHolder } from './locks';
 import type { ScanStats } from './bot';
 import type { LedgerRow } from './types';
 
@@ -21,8 +23,12 @@ import type { LedgerRow } from './types';
  *
  * Until October 2026 this only warned about orphan positions and never looked
  * at open orders or broker refusals, so 35 stuck orders blocked crypto entries
- * for 11 weeks without an alert. Anything that means the book is not doing
- * what the strategy says is now a PROBLEM.
+ * for 11 weeks without an alert. It now pages on: a silent book agent; a book
+ * scan whose steps failed or whose exit manager did not run; broker refusals
+ * and unconfirmed orders; failed exits; positions with no open ledger entry;
+ * bot orders resting at the broker; a symbol whose wanted entry was missed
+ * four scans running; a broker that can't be reached twice in a row; and the
+ * regime ALARM. Everything else is a warning, which does not notify.
  */
 
 /** Agents health expects, by heartbeat label (RUN_LABEL in the launchd plist). */
@@ -41,6 +47,12 @@ export interface MonitorReading {
 export interface HealthInput {
   nowMs: number;
   heartbeats: ScanStats[];
+  /** When the Mac last woke from sleep (ms), if known: launchd skips runs while it sleeps. */
+  wokeAtMs?: number | null;
+  /** Consecutive health runs, including this one, that could not reach the broker. */
+  brokerFailStreak?: number;
+  /** A book scan holds its run lock right now (positions and ledger may be mid-update). */
+  bookScanRunning?: boolean;
   rows: LedgerRow[];
   monitor: MonitorReading | null;
   /** Present only when broker keys are configured and the broker answered. */
@@ -73,6 +85,7 @@ export function evaluateHealth(input: HealthInput): HealthReport {
 
   // 1. Agent freshness and what each agent's last scan reported.
   const byLabel = new Map(input.heartbeats.map((h) => [h.label, h]));
+  const sinceWakeMin = input.wokeAtMs != null ? (input.nowMs - input.wokeAtMs) / 60_000 : Infinity;
   for (const [label, exp] of Object.entries(EXPECTED_AGENTS)) {
     const hb = byLabel.get(label);
     if (!hb) {
@@ -82,20 +95,41 @@ export function evaluateHealth(input: HealthInput): HealthReport {
     const ageMin = (input.nowMs - Date.parse(hb.at)) / 60_000;
     info.push(`[${label}] last scan ${ageMin.toFixed(0)} min ago: ${hb.symbols} symbols, ${hb.entries.length} entries, ${hb.exits.length} exits.`);
     if (ageMin > exp.maxAgeMin) {
-      (exp.critical ? problems : warnings).push(`The ${exp.what} [${label}] last ran ${ageMin.toFixed(0)} min ago (limit ${exp.maxAgeMin}) — Mac asleep, or the agent is unloaded or crashing.`);
+      if (sinceWakeMin < 75) {
+        info.push(`[${label}] is ${ageMin.toFixed(0)} min old, but the Mac woke ${sinceWakeMin.toFixed(0)} min ago; launchd skips runs during sleep, so its first scan after wake may be pending.`);
+      } else {
+        (exp.critical ? problems : warnings).push(`The ${exp.what} [${label}] last ran ${ageMin.toFixed(0)} min ago (limit ${exp.maxAgeMin}) — Mac asleep, or the agent is unloaded or crashing.`);
+      }
     }
   }
   for (const hb of input.heartbeats) {
-    const critical = EXPECTED_AGENTS[hb.label]?.critical ?? hb.execution === 'alpaca-paper';
+    const expected = EXPECTED_AGENTS[hb.label];
+    const ageMin = (input.nowMs - Date.parse(hb.at)) / 60_000;
+    // A heartbeat from an ad hoc label (a manual run) is history once it is old; only fresh ones count.
+    if (!expected && !(ageMin <= 130)) {
+      info.push(`[${hb.label}] old heartbeat from an ad hoc run (${ageMin.toFixed(0)} min); not evaluated.`);
+      continue;
+    }
+    const critical = expected?.critical ?? hb.execution === 'alpaca-paper';
     const sink = critical ? problems : warnings;
+    if (hb.stepFailures.length) sink.push(`[${hb.label}] scan steps failed: ${list(hb.stepFailures)}`);
+    if (hb.execution === 'alpaca-paper' && !hb.exitsRan) sink.push(`[${hb.label}] the exit manager did not run on the last scan, so exits and the catastrophe stop were not checked.`);
     if (hb.rejects.length) sink.push(`[${hb.label}] the broker refused ${hb.rejects.length} order(s): ${list(hb.rejects)}`);
     if (hb.unknown.length) sink.push(`[${hb.label}] ${hb.unknown.length} order(s) never confirmed a final state: ${list(hb.unknown)}`);
     if (hb.exitFailures.length) sink.push(`[${hb.label}] ${hb.exitFailures.length} exit(s) failed: ${list(hb.exitFailures)}`);
     if (hb.orphans.length) sink.push(`[${hb.label}] ${hb.orphans.length} position(s) with no ledger entry: ${hb.orphans.join(', ')} — run \`npm run reconcile\`.`);
+    const streaks = Object.entries(hb.entryMisses).filter(([, m]) => m.n >= 4);
+    const hard = streaks.filter(([, m]) => m.kind !== 'spread');
+    const soft = streaks.filter(([, m]) => m.kind === 'spread');
+    if (hard.length) sink.push(`[${hb.label}] entries the strategy wanted keep failing: ${hard.map(([sym, m]) => `${sym} ${m.n}x ${m.kind}`).join(', ')}.`);
+    if (soft.length) warnings.push(`[${hb.label}] spread guard has skipped these entries ${soft.map(([sym, m]) => `${sym} ${m.n}x`).join(', ')} in a row.`);
+    if (hb.entriesBlocked) warnings.push(`[${hb.label}] no entries on the last scan: ${hb.entriesBlocked}.`);
+    if (hb.needsReview.length) warnings.push(`[${hb.label}] broker fills disagree with the ledger: ${list(hb.needsReview)} — run \`npm run reconcile\`.`);
     if (hb.failures.length) warnings.push(`[${hb.label}] ${hb.failures.length} symbol(s) failed on data or logic: ${list(hb.failures)}`);
     if (hb.unfilled.length) warnings.push(`[${hb.label}] ${hb.unfilled.length} entr${hb.unfilled.length === 1 ? 'y' : 'ies'} did not fill and were canceled: ${hb.unfilled.join(', ')} (retried next scan).`);
     if (hb.spreadSkips.length) info.push(`[${hb.label}] spread guard skipped ${hb.spreadSkips.join(', ')}.`);
     if (hb.adopted) warnings.push(`[${hb.label}] adopted ${hb.adopted} late fill(s) last scan — orders are settling slower than ORDER_TIMEOUT_SEC.`);
+    if (hb.exitsAdded) warnings.push(`[${hb.label}] recorded ${hb.exitsAdded} exit(s) from broker fills that had no ledger row.`);
     if (hb.swept) warnings.push(`[${hb.label}] swept ${hb.swept} stale order(s) at the start of the last scan.`);
   }
 
@@ -110,15 +144,20 @@ export function evaluateHealth(input: HealthInput): HealthReport {
   }
 
   // 3. Broker state against the ledger.
-  if (input.brokerError) warnings.push(`Could not reach the broker: ${input.brokerError}`);
+  if (input.brokerError) {
+    // One failed check is a blip; two in a row (an hour apart) is an outage the book can't trade through.
+    ((input.brokerFailStreak ?? 1) >= 2 ? problems : warnings).push(`Could not reach the broker (${input.brokerFailStreak ?? 1} check(s) in a row): ${input.brokerError}`);
+  }
   if (input.broker) {
     const { positions, openOrders, account } = input.broker;
     for (const p of positions) {
       const sym = botSymbolOf(p.symbol);
+      if (input.bookScanRunning) continue; // an entry may be between its fill and its row
       if (!openEntryFor(input.rows, sym)) {
         problems.push(`Broker holds ${p.qty} ${p.symbol} with no open ledger entry — the exit manager won't touch it. Run \`npm run reconcile\`.`);
       }
     }
+    if (input.bookScanRunning) info.push('A book scan is running; the position-to-ledger check waits for the next health run.');
     const held = new Set(positions.map((p) => botSymbolOf(p.symbol)));
     const ledgerOpen = [...new Set(input.rows.filter((r) => r.mode === 'alpaca-paper').map((r) => r.symbol))].filter(
       (s) => openEntryFor(input.rows, s) && !held.has(s)
@@ -140,6 +179,36 @@ export function evaluateHealth(input: HealthInput): HealthReport {
   return { problems, warnings, info };
 }
 
+/** Fill fields that heartbeats written by older code lack. */
+export function normalizeHeartbeat(h: Partial<ScanStats> & { label: string; at: string }): ScanStats {
+  return {
+    startedAt: h.at,
+    interval: '',
+    execution: '',
+    symbols: 0,
+    failures: [],
+    entries: [],
+    partials: [],
+    unfilled: [],
+    unknown: [],
+    rejects: [],
+    spreadSkips: [],
+    exits: [],
+    exitFailures: [],
+    orphans: [],
+    swept: 0,
+    adopted: 0,
+    exitsAdded: 0,
+    needsReview: [],
+    stepFailures: [],
+    exitsRan: true, // older code never recorded it; assume it ran rather than page on history
+    entriesBlocked: null,
+    attempts: {},
+    entryMisses: {},
+    ...h,
+  } as ScanStats;
+}
+
 /** Every heartbeat in data/heartbeat/. */
 export function readHeartbeats(): ScanStats[] {
   const dir = path.join(CONFIG.dataDir, 'heartbeat');
@@ -152,7 +221,7 @@ export function readHeartbeats(): ScanStats[] {
   }
   for (const f of files) {
     try {
-      out.push(JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8')) as ScanStats);
+      out.push(normalizeHeartbeat(JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8'))));
     } catch {
       /* half-written; next run */
     }
@@ -160,9 +229,11 @@ export function readHeartbeats(): ScanStats[] {
   return out;
 }
 
+/** The monitor's latest row, or null when the file is missing or has no data rows. */
 export function readMonitor(): MonitorReading | null {
   try {
     const lines = fs.readFileSync(path.join(CONFIG.dataDir, 'monitor_tsmom.csv'), 'utf8').split('\n').filter((l) => l.trim());
+    if (lines.length < 2) return null;
     const last = lines[lines.length - 1].split(',');
     return { month: last[0], status: last[4], trailing12: last[3] };
   } catch {
@@ -170,10 +241,23 @@ export function readMonitor(): MonitorReading | null {
   }
 }
 
+/** When this Mac last woke from sleep, from `sysctl kern.waketime` (macOS only). */
+export function readWakeTime(): number | null {
+  if (process.platform !== 'darwin') return null;
+  try {
+    const out = execFileSync('/usr/sbin/sysctl', ['-n', 'kern.waketime'], { encoding: 'utf8', timeout: 2000 });
+    const sec = Number(out.match(/sec = (\d+)/)?.[1]);
+    return sec > 0 ? sec * 1000 : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
- * Gzip any data/*.log over `maxBytes` into data/logs-archive/ and truncate it,
- * keeping the newest `keep` archives per log. Agents append with >>, which
- * reopens the file every run, so truncating between runs is safe.
+ * Rotate any data/*.log over `maxBytes` by renaming it into data/logs-archive/.
+ * A rename loses nothing: a scan still appending keeps writing to the renamed
+ * file, and the next run's >> creates a fresh log. Archives older than an hour
+ * are gzipped on a later run, and the newest `keep` per log are kept.
  */
 export function rotateLogs(maxBytes = 25 * 1024 * 1024, keep = 6): string[] {
   const rotated: string[] = [];
@@ -190,33 +274,69 @@ export function rotateLogs(maxBytes = 25 * 1024 * 1024, keep = 6): string[] {
     if (size <= maxBytes) continue;
     fs.mkdirSync(archive, { recursive: true });
     const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
-    fs.writeFileSync(path.join(archive, `${name}.${stamp}.gz`), zlib.gzipSync(fs.readFileSync(file)));
-    fs.truncateSync(file, 0);
+    fs.renameSync(file, path.join(archive, `${name}.${stamp}`));
     rotated.push(`${name} (${(size / 1048576).toFixed(0)} MB)`);
-    const olds = fs
-      .readdirSync(archive)
-      .filter((n) => n.startsWith(`${name}.`) && n.endsWith('.gz'))
-      .sort();
-    for (const old of olds.slice(0, Math.max(0, olds.length - keep))) fs.rmSync(path.join(archive, old));
+  }
+  try {
+    const all = fs.readdirSync(archive);
+    for (const n of all.filter((x) => !x.endsWith('.gz'))) {
+      const f = path.join(archive, n);
+      if (Date.now() - fs.statSync(f).mtimeMs < 3_600_000) continue;
+      fs.writeFileSync(`${f}.gz`, zlib.gzipSync(fs.readFileSync(f)));
+      fs.rmSync(f);
+    }
+    for (const name of names) {
+      const olds = fs
+        .readdirSync(archive)
+        .filter((n) => n.startsWith(`${name}.`))
+        .sort();
+      for (const old of olds.slice(0, Math.max(0, olds.length - keep))) fs.rmSync(path.join(archive, old));
+    }
+  } catch {
+    /* no archive yet */
   }
   return rotated;
+}
+
+/** Consecutive health runs that could not reach the broker, kept in data/health_state.json. */
+function updateBrokerFailStreak(failed: boolean): number {
+  const file = path.join(CONFIG.dataDir, 'health_state.json');
+  let n = 0;
+  try {
+    n = Number(JSON.parse(fs.readFileSync(file, 'utf8')).brokerFails) || 0;
+  } catch {
+    /* first run */
+  }
+  n = failed ? n + 1 : 0;
+  try {
+    fs.writeFileSync(file, JSON.stringify({ brokerFails: n }));
+  } catch {
+    /* non-fatal */
+  }
+  return n;
 }
 
 export async function runHealth(): Promise<void> {
   const input: HealthInput = {
     nowMs: Date.now(),
     heartbeats: readHeartbeats(),
-    rows: loadLedger(),
+    rows: [],
     monitor: readMonitor(),
+    wokeAtMs: readWakeTime(),
+    bookScanRunning: runLockHolder('book') != null,
   };
   if (process.env.ALPACA_PAPER_KEY_ID) {
     try {
       const [positions, openOrders, account] = await Promise.all([getBrokerPositions(), getOpenOrders(), getAccount()]);
       input.broker = { positions, openOrders, account };
+      input.brokerFailStreak = updateBrokerFailStreak(false);
     } catch (err) {
       input.brokerError = (err as Error).message;
+      input.brokerFailStreak = updateBrokerFailStreak(true);
     }
   }
+  // Read the ledger after the broker snapshot, so a fill that lands in between shows as a position whose row is already there.
+  input.rows = loadLedger();
   const report = evaluateHealth(input);
   for (const r of rotateLogs()) report.info.push(`Rotated ${r} into data/logs-archive/.`);
   for (const i of report.info) console.log(i);

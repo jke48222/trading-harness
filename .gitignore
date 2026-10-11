@@ -21,6 +21,7 @@ data/*.log
 # the perf report, rotated logs and the ledger backups reconcile makes first.
 data/heartbeat/
 data/perf.json
+data/health_state.json
 data/logs-archive/
 data/backups/
 data/.*.lock

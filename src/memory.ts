@@ -140,21 +140,38 @@ export function rowKey(row: LedgerRow): string {
   return [row.timestamp, row.symbol, row.action, row.mode, row.price].join('|');
 }
 
+/** True when `nr` is already in the ledger: the same order id on a row of the same mode, or an exit for the same symbol within 5 minutes. */
+function isDuplicate(rows: LedgerRow[], nr: LedgerRow): boolean {
+  const id = orderIdOf(nr);
+  if (id && rows.some((r) => r.mode === nr.mode && orderIdOf(r) === id)) return true;
+  if (nr.mode === 'alpaca-paper-exit') {
+    const t = Date.parse(nr.timestamp);
+    return rows.some((r) => r.mode === 'alpaca-paper-exit' && r.symbol === nr.symbol && Math.abs(Date.parse(r.timestamp) - t) <= 5 * 60_000);
+  }
+  return false;
+}
+
 /**
  * Insert rows at their chronological position (after the last row with an
  * earlier or equal timestamp), so a back-dated row (an adopted late fill) sits
- * where a reader expects it instead of at the end of the file.
+ * where a reader expects it instead of at the end of the file. A row already
+ * present (two repairs racing) is skipped. Returns how many were inserted.
  */
-export function insertLedgerRows(newRows: LedgerRow[]): void {
-  if (newRows.length === 0) return;
+export function insertLedgerRows(newRows: LedgerRow[]): number {
+  if (newRows.length === 0) return 0;
+  let inserted = 0;
   updateLedger((rows) => {
     for (const nr of [...newRows].sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp))) {
+      if (isDuplicate(rows, nr)) continue;
       const t = Date.parse(nr.timestamp);
       let at = rows.length;
       while (at > 0 && Date.parse(rows[at - 1].timestamp) > t) at--;
       rows.splice(at, 0, nr);
+      inserted++;
     }
+    return inserted > 0;
   });
+  return inserted;
 }
 
 /** The client order id a broker row recorded ("order bot-ETHUSDT-1784160000000"), if any. */

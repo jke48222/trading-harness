@@ -2,7 +2,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { CONFIG } from './config';
 import type { BrokerAccount, BrokerPosition } from './broker/orders';
-import type { Candle } from './types';
+import type { Candle, LedgerRow } from './types';
 
 /**
  * Portfolio-level risk controls — the brakes the project was missing.
@@ -162,3 +162,33 @@ export function recordEntry(ctx: RiskContext, botSymbol: string, orderSymbolNoSl
   ctx.openCount += 1;
   ctx.openSymbols.add(orderSymbolNoSlash);
 }
+
+/**
+ * After a catastrophe stop the state signal is usually still BUY: 28-day
+ * momentum can stay positive while a position falls 30% from a higher entry.
+ * Without a cooldown the next scan would buy straight back, pay another round
+ * trip and reset the stop. A stopped symbol may re-enter only after its
+ * momentum has been non-positive on at least one close since the stop.
+ */
+export function stopCooldownActive(rows: LedgerRow[], symbol: string, candles: Candle[], L: number): boolean {
+  let last: LedgerRow | null = null;
+  let lastT = -Infinity;
+  for (const r of rows) {
+    if (r.symbol !== symbol || r.mode !== 'alpaca-paper-exit') continue;
+    const t = Date.parse(r.timestamp);
+    if (t > lastT) {
+      last = r;
+      lastT = t;
+    }
+  }
+  if (!last || !last.reason.includes('CATASTROPHE STOP')) return false;
+  const reentered = rows.some((r) => r.symbol === symbol && r.mode === 'alpaca-paper' && r.action === 'BUY' && Date.parse(r.timestamp) > lastT);
+  if (reentered) return false;
+  if (candles.length === 0 || candles[0].closeTime > lastT) return false; // the stop is older than the data held
+  for (let i = L; i < candles.length; i++) {
+    if (candles[i].closeTime <= lastT) continue;
+    if (candles[i].close / candles[i - L].close - 1 <= 0) return false;
+  }
+  return true;
+}
+

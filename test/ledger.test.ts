@@ -110,3 +110,13 @@ test('run locks are shared per broker account, outside the data directory', () =
   assert.match(path.basename(p), /^book-[0-9a-f]{12}\.lock$/);
 });
 
+
+test('insertLedgerRows skips a row already present (two repairs racing)', () => {
+  memory.resetMemory();
+  const adopted = row({ timestamp: '2026-08-24T00:48:55.000Z', symbol: 'GRTUSDT', reason: '[t] Adopted late fill || broker fill 0.017181 qty 1, order bot-GRTUSDT-1787529600000' });
+  const exit = row({ timestamp: '2026-10-07T00:56:37.000Z', symbol: 'DOTUSDT', action: 'SELL', mode: 'alpaca-paper-exit', reason: '[actual:t] Exit' });
+  assert.equal(memory.insertLedgerRows([adopted, exit]), 2);
+  const exitAgain = { ...exit, timestamp: '2026-10-07T00:58:00.000Z' }; // the same exit, stamped two minutes later
+  assert.equal(memory.insertLedgerRows([adopted, exitAgain]), 0);
+  assert.equal(memory.loadLedger().length, 2);
+});
