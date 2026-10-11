@@ -177,7 +177,8 @@ async function summary(): Promise<unknown> {
   return {
     asOf: new Date().toISOString(),
     account: {
-      number: account.account_number,
+      // Only the last four characters: the page gets screenshotted, and the full id has no use there.
+      number: `···${String(account.account_number ?? '').slice(-4)}`,
       status: account.status,
       equity: Number(account.equity),
       cash: Number(account.cash),
