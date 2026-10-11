@@ -34,7 +34,7 @@ Details and raw numbers are in `docs/`. Nothing in this project is cleared for r
 ## 4. Strategy and risk (the book)
 
 - **Construction (Trial 07):** at each daily close, a symbol with a positive 28-day return is held; when the return turns zero or negative, it is sold at the next scan (stocks at the next open). Long only. Closed candles only, so signals never repaint. No memory filter: Trial 07 tested the construction without one.
-- **Universe:** `SYMBOLS=@book`, 32 cryptos and 24 US stocks and ETFs (`src/universe.ts`).
+- **Universe:** `SYMBOLS=@book`, 32 cryptos and 24 US stocks and ETFs (`src/universe.ts`). Since 2026-10-11 the stocks take no new entries (`ENTRY_SKIP=@book-stocks`, Trial 08's locked consequence); the ones held then still exit on the momentum rule.
 - **Size:** $2,000 per position, scaled down for volatile symbols (`VOL_TARGET_PCT` 4%/day, floor 25%), at most 50 positions and a $100,000 budget.
 - **Risk controls** (`src/portfolioRisk.ts`) are all on by default. New entries halt when the account is down 8% on the UTC day; exits still run. Crypto is capped at 70% of the budget because it moves as one bet. A position down 30% is closed whatever the signal says. No pyramiding.
 - **Costs:** the book's rows are scored at a round-trip cost per sleeve. Crypto uses 60 bps (`FEE_BPS_CRYPTO`); its 42 round trips so far measure about 52: a 0.25% taker fee per side at the entry tier plus about 1 bp of mean slippage per side (`npm run report`). Stocks use 10 bps (`FEE_BPS_STOCKS`), an allowance rather than a measurement: there is no commission, and stock entries have filled a mean 1.8 bps above the price at order time across 80 entries. Replays and simulations use `FEE_BPS` (30).

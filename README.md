@@ -28,7 +28,7 @@ Each trial writes down its rules, data window and pass bar ahead of its results,
 | [07](docs/trial_07_portfolio_reanalysis.md) | TSMOM as an equal-weight portfolio of 8 unselected cryptos | **Pass:** +4.30% a month over its own average exposure, p = 0.0004; the 2023 to 2026 subsample alone is not significant |
 | [08](docs/trial_08_cost_and_sleeves.md) | Trial 07 at this account's real costs, on the book's 32 coins, and on US equity ETFs | Crypto holds: +3.74% a month on Trial 07's coins and +2.99% on the book's 32, p = 0.0011 each. Stocks fail: -0.23% a month, negative before costs |
 
-Trial 08 is why this README recommends winding down the book's stock sleeve. Over ten years, 28-day momentum timing on 15 unselected US equity ETFs, held in equal weights, lost to its own average exposure even before costs; at 5 bps every one of them lost. The paper book's stocks lost $1,869 over 66 round trips. The crypto result survived this account's real costs with room to spare: it breaks even at 162 to 193 bps per position change, and this account pays roughly 26 to 37 by the mean and median fills. Two cautions stand: the 2023 to 2026 era alone is not significant, and the correction for all 57 configurations gives 0.063.
+Trial 08 is why the book stopped opening stock positions on 2026-10-11 (`ENTRY_SKIP=@book-stocks`); the stocks it held then exit on the momentum rule. Over ten years, 28-day momentum timing on 15 unselected US equity ETFs, held in equal weights, lost to its own average exposure even before costs; at 5 bps every one of them lost. The paper book's stocks lost $1,869 over 66 round trips. The crypto result survived this account's real costs with room to spare: it breaks even at 162 to 193 bps per position change, and this account pays roughly 26 to 37 by the mean and median fills. Two cautions stand: the 2023 to 2026 era alone is not significant, and the correction for all 57 configurations gives 0.063.
 
 ### The paper book
 
@@ -84,7 +84,7 @@ The operating rules and the gates before any real money are in [`docs/paper_phas
 - **The book's sizing differs from the test.** Trial 07 tested equal weights; the book scales size down for volatile coins. That is a risk control, and its effect on returns is untested.
 - **Crypto was under-deployed from July 27 to October 11.** Resting orders held back cash and blocked crypto entries on 48 days ([incident write-up](docs/incidents.md)). Results from that period understate the crypto positions the strategy called for.
 - **launchd pauses while the Mac sleeps**, so the book misses scans until it wakes. Crypto entries only open in the two hours after the 00:00 UTC close, and health posts one notice a day when no scan ran in that window.
-- **Stock orders go in at the first scan after the open**, up to an hour after 9:30 ET.
+- **Stock exits wait for the open**, and go in at the first scan after 9:30 ET, up to an hour later.
 - **Trial 07's recent era is not significant on its own** (2023-12 onward, p = 0.23). The monthly monitor watches for the registered alarm: a negative trailing-12-month excess.
 
 ## Project layout

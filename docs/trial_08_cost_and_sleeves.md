@@ -118,6 +118,8 @@ Those figures pool all 108 trips, and 66 of them are stocks, whose fills against
 
 The Bonferroni context above gives Trial 07's 0.021, which is its p times the 53 configurations disclosed when it ran. Against today's 57 it is 0.023, still under 0.05.
 
+The recommendation was applied on 2026-10-11: the book runs with `ENTRY_SKIP=@book-stocks`, so it opens no new stock positions, and the stocks it held exit on the momentum rule.
+
 ### Implementation notes
 
 - Evaluated at a fixed date (2026-10-01 00:00 UTC) so a re-run reproduces these numbers.

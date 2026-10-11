@@ -2,6 +2,7 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!-- Hourly: the paper book (real orders on the Alpaca paper account), then the two simulation watch tests,
      pinned to EXECUTION=sim so nothing in .env can make them trade. The job exits with the book's status.
+     ENTRY_SKIP=@book-stocks (Trial 08): the book opens no new stock positions; open ones exit on the momentum rule.
      caffeinate -i keeps the Mac from idle-sleeping between an order and its ledger row.
      Installed by scripts/agents.sh, which fills in __ROOT__, __NPM__ and __LOGS__. -->
 <plist version="1.0">
@@ -14,7 +15,7 @@
     <string>-i</string>
     <string>/bin/zsh</string>
     <string>-lc</string>
-    <string>cd __ROOT__ || { /usr/bin/osascript -e 'display notification "The book agent cannot reach its folder" with title "Trading bot alert"'; exit 1; }; RUN_LABEL=book SYMBOLS=@book EXECUTION=alpaca-paper TSMOM_STATE=on LONG_ONLY=on STRATEGY=tsmom INTERVAL=1d TSMOM_LOOKBACK=28 EVAL_HORIZON=28 FEE_BPS=30 BUDGET=100000 PER_TRADE_USD=2000 MAX_OPEN_POSITIONS=50 ENTRY_WINDOW_MIN=120 LIMIT_SLIPPAGE_BPS=30 __NPM__ run scan &gt;&gt; data/tsmom-scan.log 2&gt;&amp;1; rc=$?; RUN_LABEL=watch-flip EXECUTION=sim TSMOM_STATE=off SYMBOLS=ETHUSDT,BNBUSDT,ADAUSDT,LINKUSDT LONG_ONLY=on STRATEGY=tsmom INTERVAL=1d TSMOM_LOOKBACK=28 EVAL_HORIZON=28 FEE_BPS=30 __NPM__ run scan &gt;&gt; data/tsmom-scan.log 2&gt;&amp;1; RUN_LABEL=watch-sol EXECUTION=sim TSMOM_STATE=off SYMBOLS=SOLUSDT LONG_ONLY=off STRATEGY=tsmom INTERVAL=1d TSMOM_LOOKBACK=28 EVAL_HORIZON=28 FEE_BPS=30 __NPM__ run scan &gt;&gt; data/tsmom-scan.log 2&gt;&amp;1; exit $rc</string>
+    <string>cd __ROOT__ || { /usr/bin/osascript -e 'display notification "The book agent cannot reach its folder" with title "Trading bot alert"'; exit 1; }; RUN_LABEL=book SYMBOLS=@book EXECUTION=alpaca-paper TSMOM_STATE=on LONG_ONLY=on STRATEGY=tsmom INTERVAL=1d TSMOM_LOOKBACK=28 EVAL_HORIZON=28 FEE_BPS=30 BUDGET=100000 PER_TRADE_USD=2000 MAX_OPEN_POSITIONS=50 ENTRY_WINDOW_MIN=120 LIMIT_SLIPPAGE_BPS=30 ENTRY_SKIP=@book-stocks __NPM__ run scan &gt;&gt; data/tsmom-scan.log 2&gt;&amp;1; rc=$?; RUN_LABEL=watch-flip EXECUTION=sim TSMOM_STATE=off SYMBOLS=ETHUSDT,BNBUSDT,ADAUSDT,LINKUSDT LONG_ONLY=on STRATEGY=tsmom INTERVAL=1d TSMOM_LOOKBACK=28 EVAL_HORIZON=28 FEE_BPS=30 __NPM__ run scan &gt;&gt; data/tsmom-scan.log 2&gt;&amp;1; RUN_LABEL=watch-sol EXECUTION=sim TSMOM_STATE=off SYMBOLS=SOLUSDT LONG_ONLY=off STRATEGY=tsmom INTERVAL=1d TSMOM_LOOKBACK=28 EVAL_HORIZON=28 FEE_BPS=30 __NPM__ run scan &gt;&gt; data/tsmom-scan.log 2&gt;&amp;1; exit $rc</string>
   </array>
   <key>StartInterval</key>
   <integer>3600</integer>

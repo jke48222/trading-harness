@@ -27,6 +27,8 @@ export const BOOK_ENV: Readonly<Record<string, string>> = Object.freeze({
   MAX_OPEN_POSITIONS: '50',
   ENTRY_WINDOW_MIN: '120',
   LIMIT_SLIPPAGE_BPS: '30',
+  // Trial 08: no new stock entries; open stock positions still exit on the momentum rule.
+  ENTRY_SKIP: '@book-stocks',
 });
 
 export interface Command {
