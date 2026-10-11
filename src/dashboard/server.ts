@@ -27,6 +27,7 @@ import { requestAllowed } from './guard';
 import { acquireRunLock } from '../locks';
 import { tripCashSince, tripReturnPct } from '../exitPricing';
 import { MANUAL_CLOSE } from '../portfolioRisk';
+import { trialsPath } from '../trials';
 import {
   OPS_CLOCK_START,
   type HealthPayload,
@@ -339,7 +340,7 @@ function activity(limit: number): unknown {
 
 function trials(limit: number): unknown {
   try {
-    const lines = fs.readFileSync(dataFile('trials.csv'), 'utf8').split('\n').filter((l) => l.trim());
+    const lines = fs.readFileSync(trialsPath(), 'utf8').split('\n').filter((l) => l.trim());
     const parse = (line: string): string[] => {
       const out: string[] = [];
       let f = '';

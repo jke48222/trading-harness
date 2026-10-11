@@ -41,10 +41,10 @@ The execution itself is faithful. Across 108 closed round trips, fills differed 
 You need Node 20.6 or later. Market data for crypto is public; stock data, paper trading and the reports need [Alpaca paper keys](https://app.alpaca.markets/paper/dashboard/overview).
 
 1. **Install:** `git clone https://github.com/jke48222/trading-harness && cd trading-harness && npm ci`
-2. **Test:** `npm test` runs 114 tests with the broker and market data mocked.
+2. **Test:** `npm test` runs 116 tests with the broker and market data mocked.
 3. **Replay a strategy on public data:** `npm run replay:raw`. Pick one with `STRATEGY`, `SYMBOL` and `INTERVAL`; every run is appended to `data/trials.csv`.
 4. **Connect a paper account:** `cp .env.example .env` and set `ALPACA_PAPER_KEY_ID` and `ALPACA_PAPER_SECRET`. Then `npm run broker:check` reads the account without placing anything.
-5. **Run the book:** `scripts/agents.sh install` loads the hourly book agent, the 30-minute health check and the monthly regime monitor on macOS. `scripts/agents.sh status` shows them; `uninstall` removes them.
+5. **Run the book:** `scripts/agents.sh install` loads the hourly book agent, the 30-minute health check and the monthly regime monitor on macOS. `scripts/agents.sh status` shows them; `uninstall` removes them. To keep the live ledger, heartbeats and logs out of the checkout, set `DATA_DIR` in `.env` (and `TRIALS_FILE=data/trials.csv` to keep the research record in it), then run `install` again.
 
 ## Commands
 
@@ -72,7 +72,7 @@ Alpaca fills ──────────────────────�
 - **Signals** use closed candles only, so they never repaint. The book runs Trial 07's state construction: hold a symbol while its 28-day return is positive, sell when it turns.
 - **Risk gates** ([`src/portfolioRisk.ts`](src/portfolioRisk.ts)): an 8% daily-loss halt on new entries, volatility-scaled size, a 70% cap on crypto (it moves as one bet), a 30% catastrophe stop, and no pyramiding. A stopped or manually closed symbol is not bought back until its momentum turns.
 - **Orders** ([`src/broker/orders.ts`](src/broker/orders.ts)) are priced off the venue's own quote and rounded up to Alpaca's increment. A crypto entry is skipped when the spread is over 100 bps. Every order settles, filled, partly filled or canceled after 30 seconds, and a scan sweeps anything a crash left behind.
-- **The ledger** (`data/ledger.csv`) records every decision with a plain-English reason. Writes take a file lock, so two agents can't drop each other's rows.
+- **The ledger** (`ledger.csv` in `DATA_DIR`, by default `data/`) records every decision with a plain-English reason. Writes take a file lock, so two agents can't drop each other's rows.
 - **Broker truth** ([`src/broker/fills.ts`](src/broker/fills.ts)): round trips are rebuilt from Alpaca's fills, which are the record of what traded. `reconcile` compares them with the ledger.
 - **Health** reads a heartbeat from each agent and posts a macOS notification on refused or stuck orders, unattributed positions, failed exits or a silent agent. It measures silence in its own runs, so a sleeping Mac never pages, and a book agent silent across five health runs (about 2.5 awake hours) does.
 
@@ -94,7 +94,8 @@ src/            bot, strategy, risk, scoring, reports, health, dashboard server
 src/broker/     Alpaca paper adapter (orders, fills, reconcile)
 scripts/        trial analyses, the regime monitor, scripts/agents.sh
 docs/           trial pre-registrations and results, protocol, incidents
-data/           ledger.csv, trials.csv, learnings.md, monitor output
+data/           trials.csv (the research record), and the ledger, lessons and monitor
+                output as of 2026-10-11 (the live copies are in DATA_DIR)
 ops/launchd/    the agents' plist templates
 test/           node:test suites
 ```

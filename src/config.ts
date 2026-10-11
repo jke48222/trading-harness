@@ -1,8 +1,13 @@
 import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { expandSymbols } from './universe';
 
 // Minimal .env loader (no dependency): real environment variables win over .env values.
+// Tests never read it: it holds the real paper keys and the live DATA_DIR, and
+// a test must touch neither.
 (function loadDotEnv(): void {
+  if (process.env.NODE_TEST_CONTEXT) return;
   try {
     const text = fs.readFileSync('.env', 'utf8');
     for (const line of text.split('\n')) {
@@ -17,6 +22,12 @@ import { expandSymbols } from './universe';
     // No .env file — defaults apply.
   }
 })();
+
+/** A leading ~ means the home folder, as in a shell (Node doesn't expand it). */
+export function expandHome(p: string): string {
+  if (p === '~') return os.homedir();
+  return p.startsWith('~/') ? path.join(os.homedir(), p.slice(2)) : p;
+}
 
 function num(name: string, fallback: number): number {
   const v = process.env[name];
@@ -160,7 +171,14 @@ export const CONFIG = {
    */
   replayWriteMemory: (process.env.REPLAY_WRITE_MEMORY ?? 'true').toLowerCase() !== 'false',
 
-  dataDir: process.env.DATA_DIR ?? 'data',
+  /** Live state: the ledger, heartbeats, risk and health state, reports, logs. */
+  dataDir: expandHome(process.env.DATA_DIR || 'data'),
+  /**
+   * The trials ledger, the research record. Empty means DATA_DIR/trials.csv;
+   * set it to keep the record in the checkout while DATA_DIR moves the live
+   * files out.
+   */
+  trialsFile: expandHome(process.env.TRIALS_FILE ?? ''),
 } as const;
 
 /**

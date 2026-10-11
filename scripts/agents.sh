@@ -18,6 +18,17 @@ DEST="$HOME/Library/LaunchAgents"
 # would recreate part of a moved or deleted one, and the job's own check for
 # a missing folder (and its notification) would never fire.
 LOGS="$HOME/Library/Logs/trading-harness"
+# Where the agents keep their data and logs: DATA_DIR from .env, the same line
+# the Node code reads (relative to the checkout, ~ for home), else data/.
+# Run install again after changing it.
+DATA="$(sed -n 's/^[[:space:]]*DATA_DIR[[:space:]]*=[[:space:]]*//p' "$ROOT/.env" 2>/dev/null | head -1 | sed -e 's/[[:space:]]*$//' -e "s/^[\"']//" -e "s/[\"']\$//")"
+case "$DATA" in
+  "") DATA="$ROOT/data" ;;
+  "~") DATA="$HOME" ;;
+  "~/"*) DATA="$HOME/${DATA#"~/"}" ;;
+  /*) ;;
+  *) DATA="$ROOT/$DATA" ;;
+esac
 DOMAIN="gui/$(id -u)"
 # Health loads first: it does not run at load, and it is what notices a
 # book agent that failed to load.
@@ -28,9 +39,9 @@ label() { echo "com.jalenedusei.trading.$1"; }
 
 # The paths go into a sed replacement, an XML plist and a shell command line.
 # Refuse anything outside a plain character set rather than escape all three.
-for p in "$ROOT" "$NPM" "$LOGS"; do
+for p in "$ROOT" "$NPM" "$LOGS" "$DATA"; do
   if [[ ! "$p" =~ ^[A-Za-z0-9._/-]+$ ]]; then
-    echo "refusing: '$p' has characters (spaces, quotes, &, \$ ...) the agents can't run safely; move the checkout to a plain path" >&2
+    echo "refusing: '$p' has characters (spaces, quotes, &, \$ ...) the agents can't run safely; use a plain path (letters, digits, . _ / -)" >&2
     exit 1
   fi
 done
@@ -59,12 +70,12 @@ wait_until_gone() {
 
 case "${1:-status}" in
   install)
-    mkdir -p "$DEST" "$LOGS"
+    mkdir -p "$DEST" "$LOGS" "$DATA"
     # Render and check every plist before touching a loaded agent, so a bad
     # template stops the install while the old agents are still running.
     for a in "${AGENTS[@]}"; do
       new="$DEST/$(label "$a").plist.new"
-      sed -e "s#__ROOT__#$ROOT#g" -e "s#__NPM__#$NPM#g" -e "s#__LOGS__#$LOGS#g" "$ROOT/ops/launchd/$(label "$a").plist" > "$new"
+      sed -e "s#__ROOT__#$ROOT#g" -e "s#__NPM__#$NPM#g" -e "s#__DATA__#$DATA#g" -e "s#__LOGS__#$LOGS#g" "$ROOT/ops/launchd/$(label "$a").plist" > "$new"
       if ! plutil -lint "$new" > /dev/null; then
         echo "refusing: $(label "$a") does not render to a valid plist; nothing was changed" >&2
         rm -f "$DEST"/com.jalenedusei.trading.*.plist.new

@@ -51,16 +51,17 @@ Details and raw numbers are in `docs/`. Nothing in this project is cleared for r
 
 ## 6. Records
 
-- `data/ledger.csv`: every decision, trade and skip, with a reason. Header `timestamp,symbol,action,price,quantity,reason,mode,outcome,pnl`. Writes take a file lock on `data/.ledger.lock`: a kernel lock on macOS, which a crashed holder releases at once, and a lock file elsewhere.
+- Live files live in `DATA_DIR` (default `data/`). The book's agents keep theirs outside the checkout, set in `.env`, so the agents never change tracked files; `data/` holds the trials ledger and a 2026-10-11 snapshot of the rest.
+- `ledger.csv`: every decision, trade and skip, with a reason. Header `timestamp,symbol,action,price,quantity,reason,mode,outcome,pnl`. Writes take a file lock on `.ledger.lock`: a kernel lock on macOS, which a crashed holder releases at once, and a lock file elsewhere.
 - Modes: `scan` (simulated trade), `scan-filtered` (a signal a filter declined, scored as a counterfactual), `alpaca-paper` (a real paper entry, scored by the model), `alpaca-paper-exit` (its exit, with actual P&L), `replay-*` (research replays).
-- `data/learnings.md`: one lesson per losing setup tag, from real outcomes only. The memory filter that reads it applies to simulated strategies, not to the book.
+- `learnings.md`: one lesson per losing setup tag, from real outcomes only. The memory filter that reads it applies to simulated strategies, not to the book.
 - Model scores on the book's rows carry a note (`|| model v2: state exit DATE at PRICE, net of COST bps`). Rows scored under the older models were re-scored once on 2026-10-11 and keep their old figure in the reason.
-- `data/trials.csv`: append-only; `memory:reset` never touches it.
-- `data/heartbeat/<label>.json`: what each agent's last scan did. `docs/incidents.md`: anything that went wrong and how it was fixed.
+- `trials.csv`: append-only; `memory:reset` never touches it. `TRIALS_FILE` sets its path (default `DATA_DIR/trials.csv`); with live data outside the checkout, `TRIALS_FILE=data/trials.csv` keeps the research record in git.
+- `heartbeat/<label>.json`: what each agent's last scan did. `docs/incidents.md`: anything that went wrong and how it was fixed.
 
 ## 7. Operations
 
-- Agents: `scripts/agents.sh install | status | uninstall` (plists in `ops/launchd/`). The hourly book, a 30-minute health check that posts a macOS notification on any problem, and the monthly regime monitor. `install` and `uninstall` wait for a running book scan to finish.
+- Agents: `scripts/agents.sh install | status | uninstall` (plists in `ops/launchd/`). The hourly book, a 30-minute health check that posts a macOS notification on any problem, and the monthly regime monitor. `install` and `uninstall` wait for a running book scan to finish. `install` writes `DATA_DIR` from `.env` into the agents' log paths, so run it again after changing `DATA_DIR`.
 - Health exits 0 when clear and 2 when it found a problem and posted the notification. Exit 1 means it crashed or could not post, and the launchd job then posts its own fallback notice. A regime ALARM and a night with no crypto-window scan are posted once each, not every half hour.
 - launchd pauses while the Mac sleeps, so health measures a silent book in its own runs: five health runs with no book scan (about 2.5 awake hours) is a problem, and sleep alone never is. The hourly job holds off idle sleep while it runs (`caffeinate -i`). A scan that wakes with no network (a Power Nap dark wake) writes an offline heartbeat and does nothing; two in a row is a problem.
 - Daily and weekly checks, the regime alarm and the promotion gates: `docs/paper_phase_protocol.md`.

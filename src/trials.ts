@@ -44,11 +44,11 @@ export interface TrialRow {
 }
 
 export function trialsPath(): string {
-  return path.join(CONFIG.dataDir, 'trials.csv');
+  return CONFIG.trialsFile || path.join(CONFIG.dataDir, 'trials.csv');
 }
 
 export function ensureTrialsFile(): void {
-  fs.mkdirSync(CONFIG.dataDir, { recursive: true });
+  fs.mkdirSync(path.dirname(trialsPath()), { recursive: true });
   if (!fs.existsSync(trialsPath())) fs.writeFileSync(trialsPath(), TRIALS_HEADER + '\n');
 }
 
