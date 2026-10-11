@@ -331,6 +331,10 @@ async function scanSymbol(symbol: string, stockMarketOpen: boolean | null, riskC
     log(`${symbol}: final decision HOLD — no paper order was sent.`);
     return;
   }
+  if (CONFIG.entrySkip.has(symbol)) {
+    log(`${symbol}: ${sig.action} signal not taken — new entries are off for this symbol (ENTRY_SKIP); open positions still exit on the strategy's rule.`);
+    return;
+  }
 
   // One decision per signal candle: scans run far more often than candles
   // close (e.g. hourly scans of daily candles), and the same fresh signal must

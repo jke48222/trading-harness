@@ -15,6 +15,7 @@ process.env.EVAL_HORIZON = '2';
 process.env.FEE_BPS = '30';
 process.env.ALPACA_PAPER_KEY_ID = 'test-key';
 process.env.ALPACA_PAPER_SECRET = 'test-secret';
+process.env.ENTRY_SKIP = '@book-stocks';
 
 const { expandSymbols, BOOK_CRYPTO, BOOK_STOCKS } = await import('../src/universe.ts');
 
@@ -25,4 +26,11 @@ test('universe presets expand to the 56-symbol book', () => {
   assert.equal(BOOK_STOCKS.length, 24);
   assert.deepEqual(expandSymbols('@book-crypto, spy ,BTCUSDT').slice(-1), ['SPY'], 'duplicates dropped, case normalized');
   assert.throws(() => expandSymbols('@nope'), /Unknown universe/);
+});
+
+test('ENTRY_SKIP winds a sleeve down: listed symbols take no entries but stay in the universe', async () => {
+  const { CONFIG } = await import('../src/config.ts');
+  assert.equal(CONFIG.entrySkip.size, 24);
+  assert.ok(CONFIG.entrySkip.has('AAPL'));
+  assert.ok(!CONFIG.entrySkip.has('BTCUSDT'));
 });

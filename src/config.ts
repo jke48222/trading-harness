@@ -41,6 +41,12 @@ export const CONFIG = {
   symbolsList: expandSymbols(process.env.SYMBOLS ?? primarySymbol),
   /** Names this run's heartbeat file (data/heartbeat/<label>.json); health watches it by name. */
   runLabel: process.env.RUN_LABEL ?? '',
+  /**
+   * Symbols that take no NEW entries but stay in the universe, so the exit
+   * manager still closes their open positions on the strategy's own rule.
+   * Winds a sleeve down without orphaning it (ENTRY_SKIP=@book-stocks).
+   */
+  entrySkip: new Set(expandSymbols(process.env.ENTRY_SKIP ?? '')),
   interval: process.env.INTERVAL ?? '5m',
   fastPeriod: num('FAST_MA', 9),
   slowPeriod: num('SLOW_MA', 21),
