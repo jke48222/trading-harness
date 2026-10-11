@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Hourly: the paper book (real orders on the Alpaca paper account), then the two simulation watch tests.
+     Installed by scripts/agents.sh, which fills in __ROOT__ and __NPM__. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.jalenedusei.trading.tsmom-daily</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>-lc</string>
+    <string>cd __ROOT__ || exit 1; RUN_LABEL=book SYMBOLS=@book EXECUTION=alpaca-paper TSMOM_STATE=on LONG_ONLY=on STRATEGY=tsmom INTERVAL=1d TSMOM_LOOKBACK=28 EVAL_HORIZON=28 FEE_BPS=30 BUDGET=100000 PER_TRADE_USD=2000 MAX_OPEN_POSITIONS=50 ENTRY_WINDOW_MIN=120 LIMIT_SLIPPAGE_BPS=30 __NPM__ run scan &gt;&gt; data/tsmom-scan.log 2&gt;&amp;1; RUN_LABEL=watch-flip SYMBOLS=ETHUSDT,BNBUSDT,ADAUSDT,LINKUSDT LONG_ONLY=on STRATEGY=tsmom INTERVAL=1d TSMOM_LOOKBACK=28 EVAL_HORIZON=28 FEE_BPS=30 __NPM__ run scan &gt;&gt; data/tsmom-scan.log 2&gt;&amp;1; RUN_LABEL=watch-sol SYMBOLS=SOLUSDT LONG_ONLY=off STRATEGY=tsmom INTERVAL=1d TSMOM_LOOKBACK=28 EVAL_HORIZON=28 FEE_BPS=30 __NPM__ run scan &gt;&gt; data/tsmom-scan.log 2&gt;&amp;1</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>3600</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardErrorPath</key>
+  <string>__ROOT__/data/tsmom-scan-launchd.err.log</string>
+</dict>
+</plist>

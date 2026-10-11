@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Monthly regime monitor (Trial 07's forward role). launchd calendar times are local, so 06:00 on the 1st
+     lands after the UTC month end in any US time zone. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.jalenedusei.trading.tsmom-monitor</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>-lc</string>
+    <string>cd __ROOT__ || exit 1; __NPM__ run tsmom:monitor &gt;&gt; data/monitor.log 2&gt;&amp;1</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Day</key>
+    <integer>1</integer>
+    <key>Hour</key>
+    <integer>6</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+  <key>StandardErrorPath</key>
+  <string>__ROOT__/data/monitor-launchd.err.log</string>
+</dict>
+</plist>

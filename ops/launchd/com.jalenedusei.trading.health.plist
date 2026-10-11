@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Every 30 min: npm run health. Any PROBLEM exits 1 and posts a macOS notification. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.jalenedusei.trading.health</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>-lc</string>
+    <string>cd __ROOT__ || exit 1; __NPM__ run health &gt;&gt; data/health.log 2&gt;&amp;1 || /usr/bin/osascript -e 'display notification "Health check failed: see data/health.log" with title "Trading bot alert"'</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>1800</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardErrorPath</key>
+  <string>__ROOT__/data/health-launchd.err.log</string>
+</dict>
+</plist>
