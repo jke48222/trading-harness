@@ -21,7 +21,8 @@
     "health": "tsx src/index.ts health",
     "tsmom:monitor": "tsx scripts/tsmom_monitor.ts",
     "broker:check": "tsx src/index.ts broker:check",
-    "broker:preview": "tsx src/index.ts broker:preview"
+    "broker:preview": "tsx src/index.ts broker:preview",
+    "typecheck": "tsc --noEmit -p ."
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
