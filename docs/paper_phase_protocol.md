@@ -51,7 +51,7 @@ Everything else, including spread-guard streaks and repairs from broker fills, i
 All of these, sustained, before a real-money conversation rests on evidence:
 
 1. **At least 4 consecutive weeks of clean operations** (the daily criteria), with every incident fixed and written up in `docs/incidents.md`. The clock restarted on 2026-10-11 after the resting-order incident.
-2. **At least 10 completed real-fill round trips with the model-to-fill gap measured.** Met on 2026-10-11: 108 closed round trips, mean gross gap -0.05% (median -0.17%), entry fills a mean 23 bps above the signal close, exit fills a mean 17 bps above the model's exit close (`npm run report`).
+2. **At least 10 completed real-fill round trips with the model-to-fill gap measured.** Met on 2026-10-11: 108 closed round trips, mean gross gap -0.09% (median -0.18%), entry fills a mean 23 bps above the signal close, exit fills a mean 12 bps above the model's exit close (`npm run report`, model v2).
 3. **No regime ALARM** at decision time.
 4. **An honest evidence review.** Every strategy is on watch (Trial 06); the only support is portfolio-level and historical (Trial 07, with a recent era that is not significant on its own). Trial 08 tests whether that support survives this account's costs. The base rates from three research reports stand: most retail algorithmic traders lose, and at this account size costs are the dominant force.
 5. **A final fidelity period:** the last two weeks or more of paper at the real planned scale ($300 total, $100 a position), so the habits being promoted are the ones that transfer.

@@ -110,6 +110,10 @@ Context, not the rule: against all 57 configurations disclosed in `data/trials.c
 
 **Recommendation (the locked consequence; changing the book is Jalen's call):** remove the stock sleeve. `ENTRY_SKIP=@book-stocks` stops new stock entries and lets the exit manager close the open stock positions on the momentum rule, so nothing is orphaned or force-sold.
 
+### Note added after the run
+
+Model v2 (2026-10-11, after this trial was registered) re-scored the book's rows with a full lookback for stocks. The registration's execution figures move a little: the gap between model and fills is now a mean of -0.09% (median -0.18%), and exit fills average 12 bps above the model's exit close instead of 17. The registered cost still fits: 25 bps of fee plus about 6 of slippage per side.
+
 ### Implementation notes
 
 - Evaluated at a fixed date (2026-10-01 00:00 UTC) so a re-run reproduces these numbers.
