@@ -449,17 +449,24 @@ async function closeAndRecord(botSymbol: string): Promise<unknown> {
   const entry = openEntryFor(loadLedger(), botSymbol);
   const order = await closePaperPosition(botSymbol);
   // Same pricing as the exit manager: every sell since the entry, cash-based for stocks.
-  const cash = entry ? await tripCashSince(botSymbol, entry.timestamp, order) : { exitPrice: Number(order.filled_avg_price), exitQty: Number(order.filled_qty), buyCost: 0 };
+  const costBasis = Number(pos.market_value) - Number(pos.unrealized_pl);
+  const cash = entry
+    ? await tripCashSince(botSymbol, entry.timestamp, order, costBasis)
+    : { exitPrice: Number(order.filled_avg_price), exitQty: Number(order.filled_qty), buyCost: costBasis };
   const exitFill = cash.exitPrice;
-  const entryFill = entry ? (entryFillOf(entry) ?? Number(entry.price)) : exitFill;
+  const entryFill = entry ? (entryFillOf(entry) ?? Number(entry.price)) : Number(pos.avg_entry_price);
   const actualPct = tripReturnPct(botSymbol.endsWith('USDT'), entryFill, cash);
+  // Closing a position the book holds overrides a signal that still says hold,
+  // so it starts the re-entry cooldown. Closing an orphan is cleanup: the book
+  // never held it, and may enter it on its own rule.
+  const what = entry ? MANUAL_CLOSE : 'Orphan position closed via dashboard';
   appendLedgerRow({
     timestamp: new Date().toISOString(),
     symbol: entry?.symbol ?? botSymbol,
     action: 'SELL',
     price: String(exitFill),
     quantity: String(cash.exitQty),
-    reason: `[actual:${entry ? tagOf(entry) : 'manual'}] ${MANUAL_CLOSE}; entry fill ${entryFill} (order ${entry ? (orderIdOf(entry) ?? 'unknown') : 'none: no open ledger entry'}); ACTUAL round-trip P&L from real paper fills, gross of Alpaca fees.`,
+    reason: `[actual:${entry ? tagOf(entry) : 'manual'}] ${what}; entry fill ${entryFill} (order ${entry ? (orderIdOf(entry) ?? 'unknown') : 'none: no open ledger entry'}); ACTUAL round-trip P&L from real paper fills, gross of Alpaca fees.`,
     mode: 'alpaca-paper-exit',
     outcome: actualPct > 0 ? 'win' : actualPct < 0 ? 'loss' : 'flat',
     pnl: actualPct.toFixed(4),

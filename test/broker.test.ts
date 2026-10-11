@@ -279,6 +279,34 @@ test('stock round trips are measured in cash, so a split does not read as a cras
   assert.equal(tripReturnPct(true, 2, { exitPrice: 2.1, exitQty: 99.75, buyCost: 200 }).toFixed(2), '5.00', 'crypto stays per unit');
 });
 
+test('without order history, a split stock is priced from the broker\'s cost basis, not the pre-split entry price', async () => {
+  const { tripCashSince, tripReturnPct } = await import('../src/exitPricing.ts');
+  const close = order({ id: 'c1', symbol: 'NVDAX', side: 'sell', status: 'filled', filled_qty: '100', filled_avg_price: '21' });
+  const down = mockFetch(() => ({ status: 503, body: { message: 'unavailable' } }));
+  try {
+    const cash = await tripCashSince('NVDAX', iso(t0), close, 2000); // 10 shares at 200 became 100 at 20
+    assert.deepEqual(cash, { exitPrice: 21, exitQty: 100, buyCost: 2000 });
+    assert.equal(tripReturnPct(false, 200, cash).toFixed(2), '5.00', 'the per-share fallback read -89.5%');
+  } finally {
+    down.restore();
+  }
+  // History that shows the sell but not the buy (bought before the window): the cost basis stands in only for a single closing sell.
+  const sellOnly = mockFetch(() => ({ body: [{ ...fill('sell', 100, 21, t0 + DAY, 'uuid-s'), symbol: 'NVDAX' }] }));
+  try {
+    assert.equal((await tripCashSince('NVDAX', iso(t0), close, 2000)).buyCost, 2000);
+  } finally {
+    sellOnly.restore();
+  }
+});
+
+test('reconcile and the scan repair both leave a still-held remainder to the exit manager', async () => {
+  const { exitStillHeld } = await import('../src/reconcileRun.ts');
+  const held = new Set(['DOTUSDT']);
+  assert.equal(exitStillHeld({ kind: 'missing-exit-row', botSymbol: 'DOTUSDT' } as never, held), true);
+  assert.equal(exitStillHeld({ kind: 'missing-exit-row', botSymbol: 'ADAUSDT' } as never, held), false, 'sold out: the exit row is due');
+  assert.equal(exitStillHeld({ kind: 'missing-entry-row', botSymbol: 'DOTUSDT' } as never, held), false);
+});
+
 test('repairFromBroker leaves a still-held leftover to the exit manager (no exit row, no orphan)', async () => {
   const { repairFromBroker } = await import('../src/reconcileRun.ts');
   memory.resetMemory();

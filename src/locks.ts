@@ -75,9 +75,16 @@ function kernelTry(file: string, token: string): number | null {
     throw err;
   }
   // Record who holds it, for messages only; the lock itself is the descriptor.
-  const info = Buffer.from(JSON.stringify({ pid: process.pid, at: Date.now(), token }));
-  fs.ftruncateSync(fd, 0);
-  fs.writeSync(fd, info, 0, info.length, 0);
+  try {
+    const info = Buffer.from(JSON.stringify({ pid: process.pid, at: Date.now(), token }));
+    fs.ftruncateSync(fd, 0);
+    fs.writeSync(fd, info, 0, info.length, 0);
+  } catch (err) {
+    // A failed write (disk full) must not leave this process holding a lock
+    // no caller knows about; the dashboard would block every writer until exit.
+    fs.closeSync(fd);
+    throw err;
+  }
   return fd;
 }
 

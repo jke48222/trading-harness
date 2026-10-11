@@ -79,6 +79,19 @@ export interface RepairResult {
   needsReview: string[];
 }
 
+function heldSymbols(positions: BrokerPosition[]): Set<string> {
+  return new Set(positions.map((p) => botSymbolOf(p.symbol)));
+}
+
+/**
+ * A trip counts as closed once 99% is sold. While the broker still holds the
+ * rest, the exit manager owns the position and writes the exit when it sells;
+ * an exit row written now would leave the remainder looking like an orphan.
+ */
+export function exitStillHeld(f: Finding, held: Set<string>): boolean {
+  return f.kind === 'missing-exit-row' && held.has(f.botSymbol);
+}
+
 /**
  * Bring the ledger in line with what the broker proves, for this run's
  * universe: adopt bot buys that filled after their scan gave up on them, and
@@ -95,12 +108,10 @@ export async function repairFromBroker(log: (m: string) => void, symbols: Set<st
   const today = new Date().toISOString().slice(0, 10);
   const add: LedgerRow[] = [];
   const result: RepairResult = { adopted: 0, exitsAdded: 0, needsReview: [] };
-  // A trip counts as closed once 99% is sold; if the broker still holds the
-  // rest, the exit manager owns it and will write the exit when it sells.
-  const held = new Set(truth.positions.map((p) => botSymbolOf(p.symbol)));
+  const held = heldSymbols(truth.positions);
   for (const f of findings) {
     if (!symbols.has(f.botSymbol) || f.trip?.manual) continue;
-    if (f.kind === 'missing-exit-row' && held.has(f.botSymbol)) continue;
+    if (exitStillHeld(f, held)) continue;
     if (f.kind === 'missing-entry-row' && f.fill) {
       const tag = tagRunningAt(rows, Date.parse(f.fill.submittedAt), bookTag());
       add.push(adoptionRow(f.fill, tag, await signalCloseFor(f.fill, tag), fmtPrice, today));
@@ -170,7 +181,11 @@ export async function runReconcile(apply: boolean): Promise<Finding[]> {
     corrections.set(rowKey(f.row as LedgerRow), correctedExitRow(f.row as LedgerRow, f.trip as RoundTrip, today));
   }
   const newExits: LedgerRow[] = [];
-  for (const f of findings.filter((x) => x.kind === 'missing-exit-row' && x.trip)) {
+  const held = heldSymbols(truth.positions);
+  for (const f of findings.filter((x) => exitStillHeld(x, held))) {
+    console.log(`  left for the exit manager: ${f.botSymbol} (the broker still holds the rest of the position; its exit row is written when it sells)`);
+  }
+  for (const f of findings.filter((x) => x.kind === 'missing-exit-row' && x.trip && !exitStillHeld(x, held))) {
     const trip = f.trip as RoundTrip;
     newExits.push(missingExitRow(trip, tagRunningAt(rows, Date.parse(trip.openedAt), bookTag()), fmtPrice, today));
   }

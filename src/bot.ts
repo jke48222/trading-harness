@@ -9,7 +9,7 @@ import { appendLedgerRow, ensureMemoryFiles, entryFillOf, ledgerPath, loadLedger
 import { consultMemory } from './adaptiveFilter';
 import { scoreMaturedScanTrades } from './scoring';
 import { regimeAllows, regimeAt } from './regime';
-import { fetchMarketClock } from './stockdata';
+import { HttpStatusError, fetchMarketClock } from './stockdata';
 import {
   BrokerHttpError,
   type EntryResult,
@@ -152,7 +152,10 @@ async function brokerReachable(attempts = 6, gapMs = 10_000): Promise<boolean> {
     try {
       await fetchMarketClock();
       return true;
-    } catch {
+    } catch (err) {
+      // An error status means the network is up: run the scan, so the exit
+      // manager still runs and the real error reaches the heartbeat.
+      if (err instanceof HttpStatusError) return true;
       if (i < attempts - 1) await new Promise((r) => setTimeout(r, gapMs));
     }
   }
@@ -256,8 +259,21 @@ async function manageBrokerExits(stats: ScanStats): Promise<void> {
       const stopHit = CONFIG.maxPositionLossPct > 0 && unrealizedPct <= -CONFIG.maxPositionLossPct;
       const stopReason = `CATASTROPHE STOP: position down ${unrealizedPct.toFixed(1)}% (limit ${CONFIG.maxPositionLossPct}%)`;
       let exitReason: string | null = null;
-      const series = closedCandles(await fetchSeries(sym, CONFIG.interval, Math.max(CONFIG.evalHorizon * 3, 90)));
-      if (CONFIG.tsmomState) {
+      // The stop must not depend on market data (a Binance outage, a delisted
+      // pair): past the limit, a position exits on the broker's own numbers
+      // even when its candles don't load.
+      let series: Candle[] | null = null;
+      try {
+        const s = closedCandles(await fetchSeries(sym, CONFIG.interval, Math.max(CONFIG.evalHorizon * 3, 90)));
+        if (CONFIG.tsmomState && s.length <= CONFIG.tsmomLookback) throw new Error(`only ${s.length} closed candles; momentum needs ${CONFIG.tsmomLookback + 1}`);
+        series = s;
+      } catch (err) {
+        if (!stopHit) throw err;
+        log(`Broker: ${sym} market data unavailable (${(err as Error).message.split('\n')[0]}), but the position is past the stop — exiting on the broker's numbers.`);
+      }
+      if (!series) {
+        exitReason = stopReason;
+      } else if (CONFIG.tsmomState) {
         const L = CONFIG.tsmomLookback;
         const mom = series[series.length - 1].close / series[series.length - 1 - L].close - 1;
         if (mom <= 0) exitReason = `momentum flipped non-positive (${(mom * 100).toFixed(2)}%) — state exit`;
@@ -286,7 +302,7 @@ async function manageBrokerExits(stats: ScanStats): Promise<void> {
         }
       }
       const order = await closePaperPosition(sym);
-      const cash = await tripCashSince(sym, entry.timestamp, order);
+      const cash = await tripCashSince(sym, entry.timestamp, order, Number(pos.market_value) - Number(pos.unrealized_pl));
       const { exitPrice: exitFill, exitQty } = cash;
       const entryFill = entryFillOf(entry) ?? Number(entry.price);
       const actualPct = tripReturnPct(isCryptoSymbol(sym), entryFill, cash);

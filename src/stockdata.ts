@@ -19,11 +19,22 @@ function authHeaders(): Record<string, string> {
   return { 'APCA-API-KEY-ID': key, 'APCA-API-SECRET-KEY': secret };
 }
 
+/** The server answered, with an error status: the network is up. */
+export class HttpStatusError extends Error {
+  constructor(
+    readonly status: number,
+    message: string
+  ) {
+    super(message);
+    this.name = 'HttpStatusError';
+  }
+}
+
 async function get<T>(host: string, path: string): Promise<T> {
   const res = await fetch(host + path, { headers: authHeaders(), signal: AbortSignal.timeout(15000), redirect: 'error' });
   if (!res.ok) {
     const body = (await res.text()).slice(0, 200);
-    throw new Error(`GET ${path} -> HTTP ${res.status}: ${body}`);
+    throw new HttpStatusError(res.status, `GET ${path} -> HTTP ${res.status}: ${body}`);
   }
   return (await res.json()) as T;
 }

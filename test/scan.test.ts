@@ -86,6 +86,65 @@ test('a catastrophe stop is not undone in the same scan (it used to re-buy at th
   assert.deepEqual(hb.stepFailures, []);
 });
 
+test('the catastrophe stop fires even when market data is down', async () => {
+  memory.resetMemory();
+  memory.appendLedgerRow(row({ timestamp: iso(now - 14 * DAY), symbol: 'AAPL', price: '199.00', reason: '[tsmom28-1d-state-long] up || broker fill 200 qty 10, order bot-AAPL-1790000000000-m1' }));
+  let closed = false;
+  const m = mockFetch((url, init) => {
+    const method = init?.method ?? 'GET';
+    if (url.includes('/v2/stocks/AAPL/bars')) return { status: 500, body: { message: 'data API down' } };
+    if (url.endsWith('/v2/clock')) return { body: { is_open: true, next_open: iso(now + DAY), next_close: iso(now + 3_600_000) } };
+    if (url.includes('/v2/orders?status=')) return { body: [] };
+    if (url.endsWith('/v2/account')) return { body: { account_number: 'x', status: 'ACTIVE', cash: '90000', equity: '100000', portfolio_value: '100000', buying_power: '90000' } };
+    if (url.endsWith('/v2/positions') && method === 'GET') {
+      return { body: closed ? [] : [{ symbol: 'AAPL', qty: '10', avg_entry_price: '200', market_value: '1300', unrealized_pl: '-700', current_price: '130' }] };
+    }
+    if (method === 'DELETE' && url.endsWith('/v2/positions/AAPL')) {
+      closed = true;
+      return { body: order({ id: 'close2', symbol: 'AAPL', side: 'sell', status: 'filled', filled_qty: '10', filled_avg_price: '130' }) };
+    }
+    if (url.endsWith('/v2/orders/close2')) return { body: order({ id: 'close2', symbol: 'AAPL', side: 'sell', status: 'filled', filled_qty: '10', filled_avg_price: '130' }) };
+    return { status: 404, body: { message: `unmocked ${method} ${url}` } };
+  });
+  const realLog = console.log;
+  console.log = () => {};
+  try {
+    await runScan();
+  } finally {
+    console.log = realLog;
+    m.restore();
+    process.exitCode = 0; // the failed symbol scan sets it; the test runner would report the file as failed
+  }
+  const exit = memory.loadLedger().find((r) => r.symbol === 'AAPL' && r.mode === 'alpaca-paper-exit');
+  assert.ok(exit, 'the stop exited although no candle loaded');
+  assert.match(exit.reason, /CATASTROPHE STOP/);
+  assert.equal(exit.pnl, '-35.0000', 'priced from the broker cost basis');
+});
+
+test('a broker that answers with an error status is reachable: the scan runs and reports it', async () => {
+  memory.resetMemory();
+  const m = mockFetch((url) => {
+    if (url.endsWith('/v2/clock')) return { status: 503, body: { message: 'clock unavailable' } };
+    if (url.includes('/v2/orders?status=')) return { body: [] };
+    if (url.endsWith('/v2/positions')) return { body: [] };
+    if (url.endsWith('/v2/account')) return { body: { account_number: 'x', status: 'ACTIVE', cash: '90000', equity: '100000', portfolio_value: '100000', buying_power: '90000' } };
+    return { status: 404, body: { message: 'unmocked' } };
+  });
+  const realLog = console.log;
+  console.log = () => {};
+  try {
+    await runScan();
+  } finally {
+    console.log = realLog;
+    m.restore();
+    process.exitCode = 0;
+  }
+  const hb = JSON.parse(fs.readFileSync(path.join(process.env.DATA_DIR as string, 'heartbeat', 'book.json'), 'utf8'));
+  assert.equal(hb.offline, false, 'an HTTP 503 is not a dark wake');
+  assert.equal(hb.exitsRan, true, 'the exit manager still ran');
+  assert.match(hb.stepFailures.join(' | '), /clock: .*HTTP 503/);
+});
+
 test('stopCooldownActive: holds after a stop until momentum turns, and only after a stop', () => {
   const day = (i: number): number => Date.parse('2026-01-01T00:00:00Z') + i * DAY;
   const candles = Array.from({ length: 40 }, (_, i) => ({ openTime: day(i), open: 1, high: 1, low: 1, close: 100 + i, volume: 1, closeTime: day(i + 1) - 1 }));

@@ -12,11 +12,13 @@ export interface TripCash {
 
 /**
  * Read the trip's fills from the broker: every sell and buy of the symbol
- * since a few minutes before the entry row. Falls back to the closing order's
- * own fill, with no buy cost, when the history can't be read.
+ * since a few minutes before the entry row. When the history can't be read,
+ * falls back to the closing order's own fill, with the position's cost basis
+ * as the buy cost: the broker adjusts that for splits, which a per-share
+ * entry price is not.
  */
-export async function tripCashSince(botSymbol: string, entryTimestamp: string, order: BrokerOrder): Promise<TripCash> {
-  const fallback: TripCash = { exitPrice: Number(order.filled_avg_price), exitQty: Number(order.filled_qty), buyCost: 0 };
+export async function tripCashSince(botSymbol: string, entryTimestamp: string, order: BrokerOrder, costBasis = 0): Promise<TripCash> {
+  const fallback: TripCash = { exitPrice: Number(order.filled_avg_price), exitQty: Number(order.filled_qty), buyCost: costBasis };
   try {
     // An entry row is written seconds after its fill; five minutes covers a slow settle.
     const since = new Date(Date.parse(entryTimestamp) - 5 * 60_000).toISOString();
@@ -24,10 +26,12 @@ export async function tripCashSince(botSymbol: string, entryTimestamp: string, o
     const sells = fills.filter((f) => f.side === 'sell');
     const q = sells.reduce((a, f) => a + f.qty, 0);
     if (!(q > 0)) return fallback;
+    const bought = fills.filter((f) => f.side === 'buy').reduce((a, f) => a + f.qty * f.price, 0);
     return {
       exitPrice: sells.reduce((a, f) => a + f.qty * f.price, 0) / q,
       exitQty: q,
-      buyCost: fills.filter((f) => f.side === 'buy').reduce((a, f) => a + f.qty * f.price, 0),
+      // The cost basis covers only what this close sold, so it stands in only when nothing sold earlier.
+      buyCost: bought > 0 ? bought : q === fallback.exitQty ? costBasis : 0,
     };
   } catch {
     return fallback;
