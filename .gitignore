@@ -17,9 +17,10 @@ data/*.log
 # OS noise
 .DS_Store
 
-# Runtime files the agents write: per-agent heartbeats, lock files, rotated
-# logs and the ledger backups reconcile makes before it repairs anything.
+# Runtime files the agents and reports write: per-agent heartbeats, lock files,
+# the perf report, rotated logs and the ledger backups reconcile makes first.
 data/heartbeat/
+data/perf.json
 data/logs-archive/
 data/backups/
 data/.*.lock

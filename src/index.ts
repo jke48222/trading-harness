@@ -8,6 +8,7 @@ import { getBrokerPositions } from './broker/orders';
 import { CONFIG, validateConfig } from './config';
 import { runHealth } from './health';
 import { runReport } from './report';
+import { runPerf } from './perf';
 import { runReconcile } from './reconcileRun';
 
 const command = process.argv[2];
@@ -62,6 +63,9 @@ async function main(): Promise<void> {
     case 'reconcile':
       await runReconcile(process.argv.includes('--apply'));
       break;
+    case 'perf':
+      await runPerf();
+      break;
     case 'broker:check':
       await brokerCheck();
       break;
@@ -72,7 +76,9 @@ async function main(): Promise<void> {
       console.log('Usage:');
       console.log('  npm run scan            one live decision cycle on real public data (paper only; scores matured trades first)');
       console.log('  npm run score           score open trades whose exit has printed (horizon or state flip; real candles only)');
+      console.log('  npm run positions       open paper positions and budget use');
       console.log('  npm run report          the book from broker fills: round trips, model vs actual, fees, per symbol');
+      console.log('  npm run perf            account return, drawdown and volatility against BTC, SPY and the universe held equally');
       console.log('  npm run reconcile       compare broker fills with the ledger (add -- --apply to repair what the broker proves)');
       console.log('  npm run health          agents, orders, positions and regime; exits 1 on any problem');
       console.log('  npm run replay:raw      honest baseline over real history, memory ignored; seeds memory from real outcomes');

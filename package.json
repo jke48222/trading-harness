@@ -16,6 +16,7 @@
     "positions": "tsx src/index.ts positions",
     "report": "tsx src/index.ts report",
     "reconcile": "tsx src/index.ts reconcile",
+    "perf": "tsx src/index.ts perf",
     "dashboard": "tsx src/dashboard/server.ts",
     "test": "node --import tsx --test test/*.test.ts",
     "health": "tsx src/index.ts health",
