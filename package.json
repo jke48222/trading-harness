@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Research harness and autonomous paper book: pre-registered strategy trials, honest statistics, and a 28-day momentum book on Alpaca's paper account. Orders reach only the paper host.",
+  "description": "Research harness and autonomous paper book: pre-registered strategy trials, honest statistics, and a crypto momentum book on Alpaca's paper account. Orders reach only the paper host.",
   "engines": {
     "node": ">=20.6"
   },

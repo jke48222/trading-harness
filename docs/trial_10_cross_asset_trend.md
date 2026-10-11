@@ -103,3 +103,8 @@ As traded, the sleeve returned +0.299% a month, against +0.559% for holding all 
 **No trend sleeve.** Over 2017 to 2026, trend timing on these 11 funds did not beat holding them, long/flat or long/short, by any of the three rules tested. That extends Trial 08's stock-only result to bonds, gold, commodities and the dollar.
 
 The managed-futures funds did better as held. They trade futures across many more markets, with shorts and borrowed exposure; this test can't speak for them, and the paper account can't trade futures. The decade tested overlaps the trend literature's flat 2010s (Babu et al., 2020); this is one window. Under the locked consequence, the budget the stock sleeve held stays in cash.
+
+### Implementation note
+
+D6's weights used daily returns from session 254 on, needing 20 or more, not "its 60 daily returns before the month" from 2016. D6 therefore starts in 2017-03 rather than 2017-01. It is a descriptive and decides nothing.
+

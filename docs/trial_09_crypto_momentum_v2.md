@@ -107,3 +107,13 @@ Context, not the rule: against the 61 configurations disclosed at the time, a Bo
 **The book moves to v2.** Its advantage comes mostly from trading less: before costs it leads v1 by about a tenth of a percent a month, and the lead grows with each basis point of cost. That v2 beats v1 is not established (p = 0.15). This was a choice between two pre-specified versions under a rule fixed in advance, not a claim of new edge.
 
 v2 does show a significant edge on the book's coins from 2021 on (H1). Trial 08's subsample from 2023-12 alone was not significant, so the recent era still deserves caution.
+
+### Note added after the run
+
+How the book runs the switch, settled after a review of the implementation, before deployment:
+
+- **The book holds what the vote holds.** It buys a coin whenever the vote's own state is long, computed over the coin's last 119 daily candles, and holds nothing. Requiring three votes on the day of entry would let an entry the book missed (no cash, the crypto window asleep) stay missed for as long as the coin sat at two votes. On 2026-10-11 the vote was long in 29 of the 32 coins and the book held 14 of them.
+- **Positions opened under the 28-day rule.** Crypto positions exit under the vote from the switch on, as the consequence says. Their trips are left out of the model-against-fill figures, because their model score follows the 28-day rule and their exit the vote. The stocks being wound down keep the 28-day exit they were opened with, the momentum rule Trial 08's consequence named; no trial tested the vote on stocks.
+- **Survivorship.** BOOK-32 is the list of coins Alpaca offered in 2026, so H1 (p = 0.010) carries survivor bias, as Trial 08's H2 did. The paired H2 and the switch rule compare two rules on the same coins and are less exposed.
+- **D5's weights** used daily returns from the first return day on, needing 20 or more, not "its 60 daily returns before the month" from listing. D5's full window therefore starts in 2017-12 rather than 2017-11. It is a descriptive and decides nothing.
+

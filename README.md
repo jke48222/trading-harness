@@ -29,7 +29,7 @@ Each trial writes down its rules, data window and pass bar ahead of its results,
 | [08](docs/trial_08_cost_and_sleeves.md) | Trial 07 at this account's real costs, on the book's 32 coins, and on US equity ETFs | Crypto holds: +3.74% a month on Trial 07's coins and +2.99% on the book's 32, p = 0.0011 each. Stocks fail: -0.23% a month, negative before costs |
 | [09](docs/trial_09_crypto_momentum_v2.md) | A vote across 7-, 14-, 28- and 56-day returns with a band between entry and exit, against the 28-day rule, 2021 to 2026 | **Pass:** +3.27% a month over its own average exposure, p = 0.010. It beat the 28-day rule by +0.37% a month (p = 0.15) and trades a third less, so the book switched |
 | [10](docs/trial_10_cross_asset_trend.md) | Trend timing across 11 asset-class ETFs: stocks, bonds, gold, commodities, the dollar | Fails: -0.09% a month, p = 0.83. No trend sleeve |
-| [11](docs/trial_11_combination.md) | The crypto book, an ETF trend sleeve and SPY mixed (descriptive) | Crypto and trend at equal risk: Sharpe 1.10 against 0.96 for crypto alone, worst drawdown 10% against 52% |
+| [11](docs/trial_11_combination.md) | The crypto book, an ETF trend sleeve and SPY mixed (descriptive) | Crypto and trend at equal risk: Sharpe 1.10 against 0.93 for crypto alone over the same months, worst drawdown 10% against 52% |
 
 Trial 08 is why the book stopped opening stock positions on 2026-10-11 (`ENTRY_SKIP=@book-stocks`); the stocks it held then exit on the momentum rule. Over ten years, 28-day momentum timing on 15 unselected US equity ETFs, held in equal weights, lost to its own average exposure even before costs; at 5 bps every one of them lost. The paper book's stocks lost $1,869 over 66 round trips. The crypto result survived this account's real costs with room to spare: it breaks even at 162 to 193 bps per position change, and this account pays roughly 26 to 37 by the mean and median fills. Two cautions stand: the 2023 to 2026 era alone is not significant, and corrected for all 68 configurations tried, the crypto passes are not significant (Trial 08 at 0.075, Trial 09 at 0.69).
 
@@ -46,7 +46,7 @@ The execution itself is faithful. Across 108 closed round trips, fills differed 
 You need Node 20.6 or later. Market data for crypto is public; stock data, paper trading and the reports need [Alpaca paper keys](https://app.alpaca.markets/paper/dashboard/overview).
 
 1. **Install:** `git clone https://github.com/jke48222/trading-harness && cd trading-harness && npm ci`
-2. **Test:** `npm test` runs 128 tests with the broker and market data mocked.
+2. **Test:** `npm test` runs 135 tests with the broker and market data mocked.
 3. **Replay a strategy on public data:** `npm run replay:raw`. Pick one with `STRATEGY`, `SYMBOL` and `INTERVAL`; every run is appended to `data/trials.csv`.
 4. **Connect a paper account:** `cp .env.example .env` and set `ALPACA_PAPER_KEY_ID` and `ALPACA_PAPER_SECRET`. Then `npm run broker:check` reads the account without placing anything.
 5. **Run the book:** `scripts/agents.sh install` loads the hourly book agent, the 30-minute health check and the monthly regime monitor on macOS. `scripts/agents.sh status` shows them; `uninstall` removes them. To keep the live ledger, heartbeats and logs out of the checkout, set `DATA_DIR` in `.env` (and `TRIALS_FILE=data/trials.csv` to keep the research record in it), then run `install` again.

@@ -62,6 +62,6 @@ Over M5's own 95 months, the other mixes' Sharpe ratios are 0.93 (crypto), 0.77 
 
 ### What it shows
 
-- **Mixing lifts the Sharpe ratio a little and cuts drawdowns a lot.** The crypto sleeve alone fell 52% at its worst. Mixed with the trend sleeve at equal risk, the worst fall was under 10%, at a Sharpe of 1.10 against 0.96.
+- **Mixing lifts the Sharpe ratio a little and cuts drawdowns a lot.** The crypto sleeve alone fell 52% at its worst. Mixed with the trend sleeve at equal risk, the worst fall was under 10%, at a Sharpe of 1.10 against crypto's 0.93 over the same 95 months.
 - **The trend sleeve's help comes from holding its assets, not from timing them.** Trial 10 found its timing worth nothing, so the same diversification is available by holding the funds, which is investing rather than trading.
 - **The crypto sleeve is the risk.** At 74% volatility and a 52% worst drawdown, how much of the account it uses decides the account's risk far more than anything else here.
