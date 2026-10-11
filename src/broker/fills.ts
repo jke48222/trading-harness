@@ -47,7 +47,9 @@ export function ordersToFills(orders: BrokerOrder[]): Fill[] {
   for (const o of orders) {
     const qty = Number(o.filled_qty);
     const price = Number(o.filled_avg_price);
-    if (!(qty > 0) || !(price > 0) || !o.filled_at) continue;
+    // A partial fill that was then canceled may carry no filled_at; it is still a fill.
+    const filledAt = o.filled_at ?? o.updated_at ?? o.canceled_at ?? o.submitted_at;
+    if (!(qty > 0) || !(price > 0) || !filledAt) continue;
     out.push({
       orderId: o.id,
       clientOrderId: o.client_order_id ?? '',
@@ -56,8 +58,8 @@ export function ordersToFills(orders: BrokerOrder[]): Fill[] {
       side: o.side === 'sell' ? 'sell' : 'buy',
       qty,
       price,
-      filledAt: o.filled_at,
-      submittedAt: o.submitted_at ?? o.filled_at,
+      filledAt,
+      submittedAt: o.submitted_at ?? filledAt,
       bot: isBotClientId(o.client_order_id ?? ''),
     });
   }

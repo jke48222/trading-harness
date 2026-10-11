@@ -8,12 +8,17 @@ import { CONFIG } from '../config';
  * Guardrails:
  * - Orders go to paper-api.alpaca.markets, hardcoded. That host only serves
  *   paper accounts, so no key or flag can make this code touch real money.
- * - Order placement also requires EXECUTION=alpaca-paper in config; the
- *   default is local simulation.
- * - No order is ever left resting. Every submit settles: it waits for a final
- *   state and cancels on timeout. A resting buy reserves cash and can fill
- *   hours later with no ledger row; from July to October 2026, 35 of them
- *   locked up ~$64k and blocked every crypto entry (see docs/incidents.md).
+ * - The scan loop places orders only with EXECUTION=alpaca-paper (the default
+ *   is local simulation). The dashboard's manual close and
+ *   scripts/paper_order_smoke.ts also place paper orders, on request.
+ * - Every submit settles: it waits for a final state and cancels on timeout,
+ *   retrying status checks through transient errors. Anything a crash leaves
+ *   behind is swept at the start of the next book scan. A resting buy reserves
+ *   cash and can fill hours later with no ledger row; from July to October
+ *   2026, 35 of them locked up about $64k and blocked many crypto entries
+ *   (docs/incidents.md).
+ * - Requests carrying the keys never follow a redirect, so the keys can only
+ *   reach the Alpaca host named here.
  */
 const PAPER_TRADING_HOST = 'https://paper-api.alpaca.markets';
 const DATA_HOST = 'https://data.alpaca.markets';
@@ -46,6 +51,7 @@ async function request<T>(method: string, path: string, body?: unknown, host = P
     headers: authHeaders(),
     body: body === undefined ? undefined : JSON.stringify(body),
     signal: AbortSignal.timeout(15000),
+    redirect: 'error',
   });
   if (!res.ok) {
     throw new BrokerHttpError(method, path, res.status, (await res.text()).slice(0, 300));
@@ -70,6 +76,8 @@ export interface BrokerOrder {
   submitted_at?: string;
   filled_at?: string | null;
   created_at?: string;
+  updated_at?: string | null;
+  canceled_at?: string | null;
 }
 
 export interface BrokerPosition {
@@ -237,15 +245,19 @@ export async function getLatestQuote(symbol: string): Promise<Quote | null> {
 }
 
 /**
- * Limit price text the broker accepts. Alpaca's crypto price increment is
- * 1e-9, so sub-dollar coins get up to 9 decimals (BONK at 0.0000034 keeps its
- * digits; the old toFixed(6) turned it into 0.000003, 12% below the market).
- * Stocks: cents at $1 and above, 4 decimals below.
+ * Buy-limit price text the broker accepts, rounded UP to the increment so a
+ * limit never lands below the price it was meant to pay. Crypto: Alpaca's
+ * increment is 1e-9 at every price. Rounding to cents had put a $1.08 coin's
+ * limit under the ask, and toFixed(6) put BONK's 12% under the market.
+ * Stocks: cents at $1 and above, 4 decimals below (the sub-penny rule).
  */
 export function fmtLimit(price: number, crypto: boolean): string {
-  if (price >= 1) return price.toFixed(2);
-  if (!crypto) return price.toFixed(4);
-  const s = price.toFixed(9).replace(/0+$/, '');
+  const step = crypto ? 1e9 : price >= 1 ? 100 : 10_000;
+  const decimals = crypto ? 9 : price >= 1 ? 2 : 4;
+  // The small epsilon keeps float noise (3400.0000000000005) from adding a whole increment.
+  const up = Math.ceil(price * step - 1e-6) / step;
+  if (!crypto) return up.toFixed(decimals);
+  const s = up.toFixed(decimals).replace(/0+$/, '');
   return s.endsWith('.') ? s + '0' : s;
 }
 
@@ -254,25 +266,46 @@ const TERMINAL = new Set(['filled', 'canceled', 'expired', 'rejected', 'done_for
 /**
  * Wait for an order to reach a final state. If it has not by the deadline,
  * CANCEL it and wait for the cancel to land, so nothing is left resting at the
- * broker. Returns the last state seen; a non-terminal result means the broker
- * never confirmed and the caller must treat the order as unknown.
+ * broker. A failed status check (rate limit, 5xx, timeout) is retried, never
+ * allowed to skip the cancel. Returns the last state seen; a non-terminal
+ * result (status 'unknown' if no check ever answered) means the broker never
+ * confirmed, and the caller must treat the order as unknown.
  */
 export async function settleOrder(orderId: string, timeoutMs = 30_000, pollMs = 500): Promise<BrokerOrder> {
   const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
-  const start = Date.now();
-  let o = await getOrder(orderId);
-  while (!TERMINAL.has(o.status) && Date.now() - start < timeoutMs) {
+  let last: BrokerOrder | null = null;
+  const poll = async (): Promise<BrokerOrder | null> => {
+    try {
+      last = await getOrder(orderId);
+    } catch {
+      /* transient: keep the last state and try again */
+    }
+    return last;
+  };
+  const done = (o: BrokerOrder | null): boolean => o != null && TERMINAL.has(o.status);
+  const deadline = Date.now() + timeoutMs;
+  let o = await poll();
+  while (!done(o) && Date.now() < deadline) {
     await sleep(pollMs);
-    o = await getOrder(orderId);
+    o = await poll();
   }
-  if (TERMINAL.has(o.status)) return o;
-  await cancelOrder(orderId);
+  if (done(o)) return o as BrokerOrder;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await request<unknown>('DELETE', `/v2/orders/${orderId}`);
+      break;
+    } catch (err) {
+      // 422 means it already finished (filled or canceled); anything else is retried.
+      if (err instanceof BrokerHttpError && err.status === 422) break;
+      await sleep(pollMs);
+    }
+  }
   const cancelDeadline = Date.now() + 15_000;
   do {
     await sleep(pollMs);
-    o = await getOrder(orderId);
-  } while (!TERMINAL.has(o.status) && Date.now() < cancelDeadline);
-  return o;
+    o = await poll();
+  } while (!done(o) && Date.now() < cancelDeadline);
+  return o ?? { id: orderId, client_order_id: '', symbol: '', status: 'unknown', side: '', notional: null, qty: null, filled_qty: '0', filled_avg_price: null };
 }
 
 export type EntryState = 'filled' | 'partial' | 'unfilled' | 'unknown';
@@ -296,8 +329,8 @@ export function classifyEntry(order: BrokerOrder): EntryResult {
 }
 
 /**
- * Notional market BUY. `clientOrderId` is deterministic per signal candle, so
- * Alpaca rejects a duplicate: a second guard behind the per-candle dedup.
+ * Notional market BUY. `clientOrderId` names the symbol and signal candle;
+ * duplicates are prevented by the per-candle dedup and the book run lock.
  */
 export async function submitPaperBuy(symbol: string, notionalUsd: number, clientOrderId: string): Promise<EntryResult> {
   const isCrypto = symbol.endsWith('USDT');
@@ -336,8 +369,9 @@ export async function submitPaperBuyLimit(symbol: string, notionalUsd: number, l
  * MAKER entry: a passive limit BUY below the mark, so it rests for the lower
  * fee instead of crossing the spread. Canceled if not filled within `waitSec`;
  * the caller writes no row for an unfilled result and the next scan retries.
- * Alpaca paper does not fill resting below-mark limits, so this is for real
- * accounts only (docs/paper_phase_protocol.md).
+ * Alpaca paper fills a resting limit once the market trades to it and charges
+ * the maker rate, but it has no queue, so paper overstates how often and how
+ * well passive orders fill. Off by default (docs/paper_phase_protocol.md).
  */
 export async function submitPaperBuyMaker(
   symbol: string,
@@ -362,9 +396,11 @@ export async function submitPaperBuyMaker(
 
 /**
  * Cancel the bot's own open orders (client_order_id "bot-...") older than
- * `minAgeMs`. Entries settle synchronously now, so any survivor is left over
- * from a crash or an unconfirmed cancel. The age floor keeps a scan from
- * canceling an order another process placed seconds ago.
+ * `minAgeMs`, and wait for each cancel to land. Entries settle synchronously,
+ * so any survivor was left by a crash or an unconfirmed cancel. Returns the
+ * orders' final states: one that filled before the cancel reached it is then
+ * adopted like any late fill. The age floor keeps a scan from canceling an
+ * order another process placed seconds ago.
  */
 export async function cancelStaleBotOrders(minAgeMs = 2 * 60_000): Promise<BrokerOrder[]> {
   const now = Date.now();
@@ -373,8 +409,9 @@ export async function cancelStaleBotOrders(minAgeMs = 2 * 60_000): Promise<Broke
     const t = Date.parse(o.submitted_at ?? o.created_at ?? '');
     return !Number.isFinite(t) || now - t >= minAgeMs;
   });
-  for (const o of stale) await cancelOrder(o.id);
-  return stale;
+  const settled: BrokerOrder[] = [];
+  for (const o of stale) settled.push(await settleOrder(o.id, 0));
+  return settled;
 }
 
 /**

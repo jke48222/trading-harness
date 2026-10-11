@@ -20,7 +20,7 @@ function authHeaders(): Record<string, string> {
 }
 
 async function get<T>(host: string, path: string): Promise<T> {
-  const res = await fetch(host + path, { headers: authHeaders(), signal: AbortSignal.timeout(15000) });
+  const res = await fetch(host + path, { headers: authHeaders(), signal: AbortSignal.timeout(15000), redirect: 'error' });
   if (!res.ok) {
     const body = (await res.text()).slice(0, 200);
     throw new Error(`GET ${path} -> HTTP ${res.status}: ${body}`);

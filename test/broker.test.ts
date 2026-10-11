@@ -24,13 +24,17 @@ const memory = await import('../src/memory.ts');
 const { attributeTrips } = await import('../src/report.ts');
 const DAY = 86_400_000;
 
-test('fmtLimit keeps every digit a sub-cent coin needs (the BONK/SHIB bug)', () => {
+test('fmtLimit keeps every digit a coin needs and rounds buy limits up (the BONK and $1-coin bugs)', () => {
   assert.equal(orders.fmtLimit(0.0000034, true), '0.0000034', 'old toFixed(6) gave 0.000003, 12% below the market');
-  assert.equal(orders.fmtLimit(0.00000339123, true), '0.000003391', 'rounded to the 1e-9 price increment');
+  assert.equal(orders.fmtLimit(0.00000339123, true), '0.000003392', 'rounded UP to the 1e-9 increment');
   assert.equal(orders.fmtLimit(0.4636, true), '0.4636');
-  assert.equal(orders.fmtLimit(83030.134, true), '83030.13');
+  // A $1.08 coin with a 30 bps cap: cents would give 1.08, under the 1.0801 ask.
+  const limit = 1.0801 * 1.003;
+  assert.ok(Number(orders.fmtLimit(limit, true)) >= limit, 'never below the intended limit');
+  assert.equal(orders.fmtLimit(1.0801 * 1.003, true), '1.0833403');
+  assert.equal(orders.fmtLimit(83030.134, true), '83030.134');
   assert.equal(orders.fmtLimit(0.5, false), '0.5000', 'stocks under $1 get 4 decimals');
-  assert.equal(orders.fmtLimit(12.345, false), '12.35');
+  assert.equal(orders.fmtLimit(12.341, false), '12.35', 'stock cents, rounded up');
 });
 
 test('classifyEntry: a canceled order with a fill is a real (partial) position', () => {
@@ -79,7 +83,7 @@ test('settleOrder returns a fill that lands while the cancel is in flight', asyn
   }
 });
 
-test('cancelStaleBotOrders cancels only old bot orders', async () => {
+test('cancelStaleBotOrders cancels only old bot orders, and waits for each cancel to land', async () => {
   const now = Date.now();
   const open = [
     order({ id: 'old', client_order_id: 'bot-LDOUSDT-1', status: 'new', submitted_at: new Date(now - 3_600_000).toISOString() }),
@@ -92,15 +96,55 @@ test('cancelStaleBotOrders cancels only old bot orders', async () => {
       deleted.push(url.split('/').pop() as string);
       return { status: 204, body: null };
     }
+    if (url.includes('/v2/orders/old')) return { body: { ...open[0], status: deleted.includes('old') ? 'canceled' : 'new' } };
     return { body: open };
   });
   try {
     const swept = await orders.cancelStaleBotOrders(2 * 60_000);
     assert.deepEqual(swept.map((o) => o.id), ['old']);
+    assert.equal(swept[0].status, 'canceled', 'the final state, not the stale one');
     assert.deepEqual(deleted, ['old']);
   } finally {
     m.restore();
   }
+});
+
+test('settleOrder: a failed status check never skips the cancel (the 429 that left an order resting)', async () => {
+  let gets = 0;
+  let deleted = false;
+  const m = mockFetch((_url, init) => {
+    if (init?.method === 'DELETE') {
+      deleted = true;
+      return { status: 204, body: null };
+    }
+    gets++;
+    if (gets === 2) return { status: 429, body: { message: 'too many requests' } };
+    return { body: order({ id: 'z', status: deleted ? 'canceled' : 'new', filled_qty: '0' }) };
+  });
+  try {
+    const final = await orders.settleOrder('z', 30, 5);
+    assert.equal(deleted, true, 'the cancel was still sent');
+    assert.equal(final.status, 'canceled');
+  } finally {
+    m.restore();
+  }
+});
+
+test('settleOrder: when the broker never answers, the result is unknown, not a throw', async () => {
+  const m = mockFetch((_url, init) => (init?.method === 'DELETE' ? { status: 500, body: {} } : { status: 503, body: {} }));
+  try {
+    const final = await orders.settleOrder('q', 10, 2);
+    assert.equal(orders.classifyEntry(final).state, 'unknown');
+  } finally {
+    m.restore();
+  }
+});
+
+test('ordersToFills keeps a partial fill that has no filled_at', () => {
+  const partial = order({ id: 'p', client_order_id: 'bot-DOTUSDT-1', status: 'canceled', filled_qty: '5', filled_avg_price: '1.1', filled_at: null, updated_at: '2026-10-01T00:00:30Z', submitted_at: '2026-10-01T00:00:00Z' });
+  const [f] = fills.ordersToFills([partial]);
+  assert.equal(f.qty, 5);
+  assert.equal(f.filledAt, '2026-10-01T00:00:30Z');
 });
 
 test('botSymbolOf and toOrderSymbol round-trip both broker spellings', () => {
