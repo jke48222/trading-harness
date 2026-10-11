@@ -13,10 +13,13 @@
  * `npm run tsmom:monitor`.
  */
 import * as fs from 'node:fs';
-import '../src/config';
+import * as path from 'node:path';
+import { CONFIG } from '../src/config';
 import { closedCandles, fetchCandlesSince, intervalToMs } from '../src/market';
+import { completeMonths } from '../src/months';
+import { TRIAL07_CRYPTO } from '../src/universe';
 
-const UNIVERSE = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT', 'DOGEUSDT', 'ADAUSDT', 'LINKUSDT'];
+const UNIVERSE = TRIAL07_CRYPTO;
 const L = 28;
 const COST_PER_UNIT = 0.0015;
 
@@ -53,7 +56,9 @@ async function buildSeries(symbol: string): Promise<MonthMaps> {
     benchAcc.set(key, (benchAcc.get(key) ?? 1) * (1 + wbar * rAsset));
   }
   const keys = [...stratAcc.keys()].sort();
-  const full = keys.slice(1, -1); // drop partial edge months
+  // Keep only months the return series fully covers (crypto trades daily, so no gap allowed).
+  const complete = new Set(completeMonths(t.slice(start), Date.now(), 0));
+  const full = keys.filter((k) => complete.has(k));
   const stratM = new Map<string, number>();
   const benchM = new Map<string, number>();
   for (const k of full) {
@@ -84,7 +89,7 @@ async function buildSeries(symbol: string): Promise<MonthMaps> {
     const status = Number.isNaN(t12) ? 'warmup' : t12 < 0 ? 'ALARM' : 'ok';
     csv.push(`${rows[i].month},${(rows[i].excess * 100).toFixed(3)},${rows[i].n},${Number.isNaN(t12) ? '' : (t12 * 100).toFixed(3)},${status}`);
   }
-  fs.writeFileSync('data/monitor_tsmom.csv', csv.join('\n') + '\n');
+  fs.writeFileSync(path.join(CONFIG.dataDir, 'monitor_tsmom.csv'), csv.join('\n') + '\n');
 
   const last12 = rows.slice(-12);
   const t12 = mean(last12.map((r) => r.excess));

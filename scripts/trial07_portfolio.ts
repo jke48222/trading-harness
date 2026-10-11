@@ -10,6 +10,7 @@
 import * as fs from 'node:fs';
 import '../src/config';
 import { closedCandles, fetchCandlesSince, intervalToMs } from '../src/market';
+import { completeMonths } from '../src/months';
 
 const UNIVERSE = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT', 'DOGEUSDT', 'ADAUSDT', 'LINKUSDT'];
 const SELECTED5 = ['ETHUSDT', 'BNBUSDT', 'ADAUSDT', 'LINKUSDT', 'SOLUSDT'];
@@ -88,7 +89,10 @@ async function buildSeries(symbol: string, bothSides: boolean): Promise<SymbolSe
   }
   for (const [k, v] of benchKeys) benchAcc.set(k, v);
   const keys = [...stratAcc.keys()].sort();
-  const full = keys.slice(1, -1); // drop partial first and last calendar months
+  // Drop partial first and last calendar months (the pre-registered rule; the old
+  // slice(1, -1) also dropped a finished last month when run on the 1st).
+  const complete = new Set(completeMonths(t.slice(start), Date.now(), 0));
+  const full = keys.filter((k) => complete.has(k));
   const stratM = new Map<string, number>();
   const benchM = new Map<string, number>();
   const bhM = new Map<string, number>();
