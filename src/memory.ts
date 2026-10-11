@@ -1,6 +1,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { CONFIG } from './config';
+import { withLedgerLock } from './locks';
 import type { LedgerRow } from './types';
 
 const LEDGER_HEADER = 'timestamp,symbol,action,price,quantity,reason,mode,outcome,pnl';
@@ -65,42 +66,105 @@ function parseCsvLine(line: string): string[] {
   return out;
 }
 
-export function appendLedgerRow(row: LedgerRow): void {
-  ensureMemoryFiles();
-  const line = [
-    row.timestamp,
-    row.symbol,
-    row.action,
-    row.price,
-    row.quantity,
-    row.reason,
-    row.mode,
-    row.outcome,
-    row.pnl,
-  ]
+function rowLine(row: LedgerRow): string {
+  return [row.timestamp, row.symbol, row.action, row.price, row.quantity, row.reason, row.mode, row.outcome, row.pnl]
     .map(csvEscape)
     .join(',');
-  fs.appendFileSync(ledgerPath(), line + '\n');
+}
+
+export function appendLedgerRow(row: LedgerRow): void {
+  withLedgerLock(() => {
+    ensureMemoryFiles();
+    fs.appendFileSync(ledgerPath(), rowLine(row) + '\n');
+  });
 }
 
 /**
- * Rewrite the whole ledger (scoring fills outcomes into existing rows).
- * Written atomically: a temp file + rename, so a crash mid-write can never
- * leave a truncated ledger — the rename either fully succeeds or the old file
- * is untouched. This protects the real forward record, which is the project's
- * one irreplaceable asset.
+ * Rewrite the whole ledger. Written atomically (temp file + rename) under the
+ * ledger lock, so a crash mid-write can't truncate it and a concurrent writer
+ * can't interleave. Prefer updateLedger, which also re-reads under the lock:
+ * rewriting rows loaded earlier can drop rows appended since.
  */
 export function writeLedger(rows: LedgerRow[]): void {
-  ensureMemoryFiles();
-  const lines = rows.map((row) =>
-    [row.timestamp, row.symbol, row.action, row.price, row.quantity, row.reason, row.mode, row.outcome, row.pnl]
-      .map(csvEscape)
-      .join(',')
-  );
-  const body = LEDGER_HEADER + '\n' + lines.join('\n') + (lines.length ? '\n' : '');
-  const tmp = ledgerPath() + '.tmp';
-  fs.writeFileSync(tmp, body);
-  fs.renameSync(tmp, ledgerPath());
+  withLedgerLock(() => {
+    ensureMemoryFiles();
+    const lines = rows.map(rowLine);
+    const body = LEDGER_HEADER + '\n' + lines.join('\n') + (lines.length ? '\n' : '');
+    const tmp = `${ledgerPath()}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, body);
+    fs.renameSync(tmp, ledgerPath());
+  });
+}
+
+/**
+ * Read-modify-write the ledger under the lock. The mutator gets the freshest
+ * rows; return false to skip the write. This is the only safe way to change
+ * existing rows while other agents may be appending.
+ */
+export function updateLedger(mutate: (rows: LedgerRow[]) => boolean | void): void {
+  withLedgerLock(() => {
+    const rows = loadLedger();
+    if (mutate(rows) !== false) writeLedger(rows);
+  });
+}
+
+/** Stable identity of a row, for applying computed updates to a freshly loaded ledger. */
+export function rowKey(row: LedgerRow): string {
+  return [row.timestamp, row.symbol, row.action, row.mode, row.price].join('|');
+}
+
+/**
+ * Insert rows at their chronological position (after the last row with an
+ * earlier or equal timestamp), so a back-dated row (an adopted late fill) sits
+ * where a reader expects it instead of at the end of the file.
+ */
+export function insertLedgerRows(newRows: LedgerRow[]): void {
+  if (newRows.length === 0) return;
+  updateLedger((rows) => {
+    for (const nr of [...newRows].sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp))) {
+      const t = Date.parse(nr.timestamp);
+      let at = rows.length;
+      while (at > 0 && Date.parse(rows[at - 1].timestamp) > t) at--;
+      rows.splice(at, 0, nr);
+    }
+  });
+}
+
+/** The client order id a broker row recorded ("order bot-ETHUSDT-1784160000000"), if any. */
+export function orderIdOf(row: LedgerRow): string | null {
+  const m = row.reason.match(/order (bot-[A-Za-z0-9]+-\d+(?:-[a-z0-9]+)?)/);
+  return m ? m[1] : null;
+}
+
+/** Fill price recorded on a broker entry row ("broker fill 0.8266"), if any. */
+export function entryFillOf(row: LedgerRow): number | null {
+  const m = row.reason.match(/broker fill ([0-9.eE+-]+)/);
+  const v = m ? Number(m[1]) : NaN;
+  return Number.isFinite(v) ? v : null;
+}
+
+/**
+ * The broker entry row that the symbol's current position belongs to: the
+ * latest `alpaca-paper` BUY with no `alpaca-paper-exit` at or after it. Ordered
+ * by timestamp, never by file position, so back-dated rows attribute correctly.
+ * Returns null when the symbol has no open entry (flat, or an orphan position).
+ */
+export function openEntryFor(rows: LedgerRow[], botSymbol: string): LedgerRow | null {
+  let entry: LedgerRow | null = null;
+  let entryT = -Infinity;
+  let exitT = -Infinity;
+  for (const r of rows) {
+    if (r.symbol !== botSymbol) continue;
+    const t = Date.parse(r.timestamp);
+    if (!Number.isFinite(t)) continue;
+    if (r.mode === 'alpaca-paper' && r.action === 'BUY' && t >= entryT) {
+      entry = r;
+      entryT = t;
+    } else if (r.mode === 'alpaca-paper-exit' && t > exitT) {
+      exitT = t;
+    }
+  }
+  return entry && entryT > exitT ? entry : null;
 }
 
 export function loadLedger(): LedgerRow[] {
