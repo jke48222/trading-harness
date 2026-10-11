@@ -1,4 +1,5 @@
 import * as fs from 'node:fs';
+import { expandSymbols } from './universe';
 
 // Minimal .env loader (no dependency): real environment variables win over .env values.
 (function loadDotEnv(): void {
@@ -32,14 +33,14 @@ const primarySymbol = process.env.SYMBOL ?? 'BTCUSDT';
 export const CONFIG = {
   symbol: primarySymbol,
   /**
-   * Scan universe: comma-separated SYMBOLS (e.g. "BTCUSDT,ETHUSDT,SPY").
+   * Scan universe: comma-separated SYMBOLS (e.g. "BTCUSDT,ETHUSDT,SPY"), or a
+   * named list from src/universe.ts with an @ prefix (SYMBOLS=@book).
    * Symbols ending in USDT use Binance public data; anything else is treated
    * as a US stock via the Alpaca PAPER data API (read-only, IEX feed).
    */
-  symbolsList: (process.env.SYMBOLS ?? primarySymbol)
-    .split(',')
-    .map((s) => s.trim().toUpperCase())
-    .filter(Boolean),
+  symbolsList: expandSymbols(process.env.SYMBOLS ?? primarySymbol),
+  /** Names this run's heartbeat file (data/heartbeat/<label>.json); health watches it by name. */
+  runLabel: process.env.RUN_LABEL ?? '',
   interval: process.env.INTERVAL ?? '5m',
   fastPeriod: num('FAST_MA', 9),
   slowPeriod: num('SLOW_MA', 21),
@@ -94,8 +95,12 @@ export const CONFIG = {
   cryptoClusterCapPct: num('CRYPTO_CLUSTER_CAP_PCT', 70),
   /** Catastrophe stop: force-exit a position down more than this % (0 = off). Wide, so it never fights the strategy. */
   maxPositionLossPct: num('MAX_POSITION_LOSS_PCT', 30),
-  /** Optional bounded marketable-limit: cap how far a fill may move from the decision price, in bps (0 = plain market). */
+  /** Optional bounded marketable-limit: cap how far above the quoted ask a fill may land, in bps (0 = plain market). */
   limitSlippageBps: num('LIMIT_SLIPPAGE_BPS', 0),
+  /** Skip a new entry when the venue's quoted spread is wider than this, in bps (0 = no check). */
+  maxSpreadBps: num('MAX_SPREAD_BPS', 100),
+  /** Seconds an order may stay unfilled before it is canceled. Nothing is ever left resting. */
+  orderTimeoutSec: num('ORDER_TIMEOUT_SEC', 30),
 
   // ---- Cost & timing levers (attack the ~30 bps that starts every trade underwater) ----
   /** 'taker' (market, default) or 'maker' (passive limit below the mark → lower fee; may not fill → retry next scan). */
@@ -159,6 +164,8 @@ export function validateConfig(): void {
   if (CONFIG.tsmomLookback < 2) die('TSMOM_LOOKBACK must be at least 2.');
   if (CONFIG.volSizeFloor <= 0 || CONFIG.volSizeFloor > 1) die('VOL_SIZE_FLOOR must be in (0,1].');
   if (CONFIG.cryptoClusterCapPct <= 0 || CONFIG.cryptoClusterCapPct > 100) die('CRYPTO_CLUSTER_CAP_PCT must be in (0,100].');
+  if (CONFIG.orderTimeoutSec < 5) die('ORDER_TIMEOUT_SEC must be at least 5.');
+  if (CONFIG.maxSpreadBps < 0) die('MAX_SPREAD_BPS cannot be negative.');
   if (CONFIG.executionMode !== 'sim' && CONFIG.executionMode !== 'alpaca-paper') {
     die(`EXECUTION must be 'sim' or 'alpaca-paper' (got '${CONFIG.executionMode}') — there is no live execution mode.`);
   }
