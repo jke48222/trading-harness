@@ -18,7 +18,7 @@ Find out, with statistics a skeptical referee would accept, whether a small syst
 ## 3. Research rules and current evidence
 
 - **Pre-register every test:** hypothesis, exact rules, data window, pass bar and consequences are committed before any statistic is computed. No tuning after looking.
-- **Count every look:** every configuration ever tested is a row in `data/trials.csv`. A result is judged against that count.
+- **Count every look:** every configuration ever tested is a row in `data/trials.csv`. A trial passes or fails on the rule it registered, and each result is reported next to a Bonferroni correction for that count.
 - **Check for drift:** a long strategy must beat its own average exposure to the market, not just ride it.
 
 | Trial | Result |
@@ -37,8 +37,8 @@ Details and raw numbers are in `docs/`. Nothing in this project is cleared for r
 - **Universe:** `SYMBOLS=@book`, 32 cryptos and 24 US stocks and ETFs (`src/universe.ts`).
 - **Size:** $2,000 per position, scaled down for volatile symbols (`VOL_TARGET_PCT` 4%/day, floor 25%), at most 50 positions and a $100,000 budget.
 - **Risk controls** (`src/portfolioRisk.ts`) are all on by default. New entries halt when the account is down 8% on the UTC day; exits still run. Crypto is capped at 70% of the budget because it moves as one bet. A position down 30% is closed whatever the signal says. No pyramiding.
-- **Costs:** the book's rows are scored at their sleeve's measured round-trip cost: 60 bps for crypto (`FEE_BPS_CRYPTO`; a 0.25% taker fee per side at the entry tier plus a few bps of slippage) and 10 bps for stocks (`FEE_BPS_STOCKS`; no commission). Replays and simulations use `FEE_BPS` (30).
-- **After a catastrophe stop**, the symbol is not bought back until its momentum has been non-positive on at least one close. Otherwise the still-positive signal would re-buy at the stop price in the same scan.
+- **Costs:** the book's rows are scored at a round-trip cost per sleeve. Crypto uses 60 bps (`FEE_BPS_CRYPTO`); its 42 round trips so far measure about 52: a 0.25% taker fee per side at the entry tier plus about 1 bp of mean slippage per side (`npm run report`). Stocks use 10 bps (`FEE_BPS_STOCKS`), an allowance rather than a measurement: there is no commission, and stock entries have filled a mean 1.8 bps above the price at order time across 80 entries. Replays and simulations use `FEE_BPS` (30).
+- **After a catastrophe stop or a manual close** from the dashboard, the symbol is not bought back until its momentum has been non-positive on at least one close. Otherwise the still-positive signal would re-buy it at the next scan.
 
 ## 5. Broker and execution
 
@@ -51,7 +51,7 @@ Details and raw numbers are in `docs/`. Nothing in this project is cleared for r
 
 ## 6. Records
 
-- `data/ledger.csv`: every decision, trade and skip, with a reason. Header `timestamp,symbol,action,price,quantity,reason,mode,outcome,pnl`. Writes take a file lock (`data/.ledger.lock`).
+- `data/ledger.csv`: every decision, trade and skip, with a reason. Header `timestamp,symbol,action,price,quantity,reason,mode,outcome,pnl`. Writes take a file lock on `data/.ledger.lock`: a kernel lock on macOS, which a crashed holder releases at once, and a lock file elsewhere.
 - Modes: `scan` (simulated trade), `scan-filtered` (a signal a filter declined, scored as a counterfactual), `alpaca-paper` (a real paper entry, scored by the model), `alpaca-paper-exit` (its exit, with actual P&L), `replay-*` (research replays).
 - `data/learnings.md`: one lesson per losing setup tag, from real outcomes only. The memory filter that reads it applies to simulated strategies, not to the book.
 - Model scores on the book's rows carry a note (`|| model v2: state exit DATE at PRICE, net of COST bps`). Rows scored under the older models were re-scored once on 2026-10-11 and keep their old figure in the reason.
@@ -60,6 +60,7 @@ Details and raw numbers are in `docs/`. Nothing in this project is cleared for r
 
 ## 7. Operations
 
-- Agents: `scripts/agents.sh install | status | uninstall` (plists in `ops/launchd/`). The hourly book, a 30-minute health check that posts a macOS notification on any problem, and the monthly regime monitor.
+- Agents: `scripts/agents.sh install | status | uninstall` (plists in `ops/launchd/`). The hourly book, a 30-minute health check that posts a macOS notification on any problem, and the monthly regime monitor. `install` and `uninstall` wait for a running book scan to finish.
+- Health exits 0 when clear and 2 when it found a problem and posted the notification. Exit 1 means it crashed or could not post, and the launchd job then posts its own fallback notice. A regime ALARM and a night with no crypto-window scan are posted once each, not every half hour.
+- launchd pauses while the Mac sleeps, so health measures a silent book in its own runs: five health runs with no book scan (about 2.5 awake hours) is a problem, and sleep alone never is. The hourly job holds off idle sleep while it runs (`caffeinate -i`). A scan that wakes with no network (a Power Nap dark wake) writes an offline heartbeat and does nothing; two in a row is a problem.
 - Daily and weekly checks, the regime alarm and the promotion gates: `docs/paper_phase_protocol.md`.
-- launchd pauses while the Mac sleeps; health flags a book heartbeat older than 130 minutes.

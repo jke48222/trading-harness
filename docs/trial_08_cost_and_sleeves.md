@@ -99,20 +99,22 @@ Context, not the rule: against all 57 configurations disclosed in `data/trials.c
 - **D1, cost sensitivity on T07-8:** +4.091%/mo at 15 bps (p 0.0006), +3.264%/mo at 50 bps (p 0.0045). Trial 07 as published: +4.299%/mo over 105 months to 2026-06.
 - **D2, from 2023-12 (34 months):** H1 +1.112%/mo (p 0.33), H2 +0.906%/mo (p 0.30), H3 -0.267%/mo (p 0.90). As in Trial 07, the recent era alone shows nothing significant.
 - **D3, the book's 24 stocks:** -0.217%/mo (p 0.94). Only TSLA (+1.11), AMD (+1.00) and META (+0.24) are positive.
-- **D4, per symbol:** all 8 T07-8 symbols are positive, DOGE highest at +10.63%/mo and ETH lowest at +1.43. 24 of the book's 32 coins are positive. The 8 negative ones are SKY, TRUMP, YFI, LTC, PAXG, RENDER, WIF and ONDO; SKY, ONDO and TRUMP have under 20 months of data. All 15 ETFs are negative, from XLY at -0.01 to XLI at -0.46. A crypto position changes 25 to 35 times a year, an ETF position 16 to 22.
+- **D4, per symbol:** all 8 T07-8 symbols are positive, DOGE highest at +10.63%/mo and ETH lowest at +1.43. 24 of the book's 32 coins are positive. The 8 negative ones are SKY, TRUMP, YFI, LTC, PAXG, RENDER, WIF and ONDO; SKY, ONDO and TRUMP have under 20 months of data. All 15 ETFs are negative, from XLY at -0.01 to XLI at -0.46. A position changes 26 to 32 times a year in Trial 07's 8 coins, 19 (POL) to 45 (SKY) across the book's 32, and 16 to 22 in an ETF.
 - **D5, break-even cost per unit change:** 193 bps for H1 and 162 bps for H2, against the 30 paid. H3 has none, because its excess is negative at zero cost.
 
 ### Verdict
 
 **Crypto holds at real costs.** Trial 07's result survives the fees this account pays, on its 8 coins and on the book's 32, with a wide margin on cost. Two limits stand: the 2023 to 2026 era alone is not significant, and a correction for every look the project has taken would not pass.
 
-**Stocks have no support.** On all 15 unselected ETFs, 28-day momentum timing lost to its own average exposure, before costs. The hand-picked 24 did no better. The paper book agrees: its 66 stock round trips averaged -1.64% and lost $1,869 realized.
+**Stocks have no support.** Equal-weighted, the 15 unselected ETFs lost to their own average exposure even before costs (D5), and at 5 bps every one of them lost (D4). The hand-picked 24 did no better. The paper book agrees: its 66 stock round trips averaged -1.64% and lost $1,869 realized.
 
 **Recommendation (the locked consequence; changing the book is Jalen's call):** remove the stock sleeve. `ENTRY_SKIP=@book-stocks` stops new stock entries and lets the exit manager close the open stock positions on the momentum rule, so nothing is orphaned or force-sold.
 
 ### Note added after the run
 
-Model v2 (2026-10-11, after this trial was registered) re-scored the book's rows with a full lookback for stocks. The registration's execution figures move a little: the gap between model and fills is now a mean of -0.09% (median -0.18%), and exit fills average 12 bps above the model's exit close instead of 17. The registered cost still fits: 25 bps of fee plus about 6 of slippage per side.
+Model v2 (2026-10-11, after this trial was registered) re-scored the book's rows with a full lookback for stocks. The registration's execution figures move a little: the gap between model and fills is now a mean of -0.09% (median -0.18%), and exit fills average 12 bps above the model's exit close instead of 17.
+
+Those figures pool all 108 trips, and 66 of them are stocks, whose fills against the signal close mostly measure the move from that close to the next morning's fill. On the 42 crypto trips alone, entries filled a mean 7 bps below the signal close and exits a mean 9 bps below the model's exit close (`npm run report`). That is about 1 bp of slippage per side on top of the 25 bps fee, roughly 26 bps per side against the 30 registered. At the medians, slippage is about 12 bps per side (entries 12 above the signal close, exits 13 below the model's exit), which would put the cost near 37 bps per side; with break-even at 162 bps (D5), the verdict holds either way.
 
 ### Implementation notes
 
@@ -121,3 +123,4 @@ Model v2 (2026-10-11, after this trial was registered) re-scored the book's rows
 - Binance's 2018-02-08 daily candle closed at 00:28 UTC during an exchange halt for BTC, ETH, BNB and LTC. It is kept as an ordinary day, as Trial 07 did.
 - Crypto months are keyed by candle close time, stock months by session date.
 - In `data/trials.csv`, `fee_bps` for these four rows is the cost per unit change (30 or 5). Trial 07's row put 30 there for the round trip at 15 per change.
+- These four rows carry the mean monthly excess in `total_pnl_pct`; Trial 07's row carried the same statistic in `avg_pnl_pct`. The ledger is append-only, so both stay as written.

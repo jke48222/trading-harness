@@ -13,13 +13,13 @@ A research harness for testing whether a small trading bot has a real edge, and 
 
 ## What is it?
 
-Each strategy test here is registered before it runs: the rules, the data window and the pass bar are committed first, every configuration tried is logged to [`data/trials.csv`](data/trials.csv) (118 rows covering 57 distinct configurations), and a pass has to survive a correction for that count. Three fast technical rules were rejected outright, five per-trade candidates failed the correction, and one portfolio construction passed (Trial 07). Trial 08 confirmed it at this account's real costs and found no support for the same rule on US stocks. Since July 2026 a set of launchd agents has traded it on a $100,000 Alpaca paper account, with every fill reconciled against the ledger.
+Each trial writes down its rules, data window and pass bar ahead of its results, and every configuration tried is logged to [`data/trials.csv`](data/trials.csv) (118 rows covering 57 distinct configurations). Each result is shown next to a Bonferroni correction for that count: Trial 07 survives it at 0.021, and Trial 08's crypto passes do not, at 0.063. Only Trial 08's order of rules and results shows in git; Trials 01 to 07 entered the history with their results in the first commit, weeks after they ran. Three fast technical rules were rejected outright, five per-trade candidates failed a multiple-testing correction, and one portfolio construction passed (Trial 07). Trial 08 confirmed it at this account's real costs and found no support for the same rule on US stocks. Since July 2026 a set of launchd agents has traded it on a $100,000 Alpaca paper account, with every fill reconciled against the ledger.
 
 ## Results
 
 | Trial | Question | Result |
 |---|---|---|
-| 01 | 9/21 moving-average cross, BTCUSDT 5m | Rejected: out-of-sample profit factor 0.52 |
+| [01](docs/trial_01_ma_cross.md) | 9/21 moving-average cross, BTCUSDT 5m | Rejected: out-of-sample profit factor 0.52 |
 | [02](docs/trial_02_htf_regime_filter.md) | The same cross with a 1h trend filter | Rejected: profit factor 0.69 and 0.45 |
 | [03](docs/trial_03_donchian_breakout.md) | Donchian-20 breakout, 1h | Rejected: 18 of 18 runs negative at 30 bps |
 | [04](docs/trial_04_tsmom_daily.md) | 28-day time-series momentum (TSMOM), daily, per trade | 2 candidates |
@@ -28,20 +28,20 @@ Each strategy test here is registered before it runs: the rules, the data window
 | [07](docs/trial_07_portfolio_reanalysis.md) | TSMOM as an equal-weight portfolio of 8 unselected cryptos | **Pass:** +4.30% a month over its own average exposure, p = 0.0004; the 2023 to 2026 subsample alone is not significant |
 | [08](docs/trial_08_cost_and_sleeves.md) | Trial 07 at this account's real costs, on the book's 32 coins, and on US equity ETFs | Crypto holds: +3.74% a month on Trial 07's coins and +2.99% on the book's 32, p = 0.0011 each. Stocks fail: -0.23% a month, negative before costs |
 
-Trial 08 is why this README recommends winding down the book's stock sleeve. Over ten years, 28-day momentum timing lost to its own average exposure on all 15 unselected US equity ETFs, before costs, and the paper book's stocks lost $1,869 over 66 round trips. The crypto result survived this account's real costs with room to spare: it breaks even at 162 to 193 bps per position change, and the account pays about 30. Two cautions stand. The 2023 to 2026 era alone is not significant, and a Bonferroni correction for all 57 configurations ever tried would give 0.063.
+Trial 08 is why this README recommends winding down the book's stock sleeve. Over ten years, 28-day momentum timing on 15 unselected US equity ETFs, held in equal weights, lost to its own average exposure even before costs; at 5 bps every one of them lost. The paper book's stocks lost $1,869 over 66 round trips. The crypto result survived this account's real costs with room to spare: it breaks even at 162 to 193 bps per position change, and this account pays roughly 26 to 37 by the mean and median fills. Two cautions stand: the 2023 to 2026 era alone is not significant, and the correction for all 57 configurations gives 0.063.
 
 ### The paper book
 
 From 2026-07-15 to 2026-10-10 the paper account returned +5.3%, with a -4.0% maximum drawdown. Over the same days BTC returned +27.0%, SPY +3.8%, and the book's 56 symbols held in equal weights +23.6%. In a broad crypto rally, holding everything beat a strategy that historically sits in each coin about half the time, and the book was also short of crypto for most of the period because resting orders blocked its entries ([incident](docs/incidents.md)).
 
-The execution itself is faithful. Across 108 closed round trips, fills differed from the model's gross return by a mean of -0.09% a trip (median -0.18%). Realized results split by sleeve: stocks lost $1,869 over 66 trips, crypto was near flat at -$31 over 42, and open crypto positions held about $6,500 of unrealized gains on October 11. `npm run report` and `npm run perf` reproduce these numbers.
+The execution itself is faithful. Across 108 closed round trips, fills differed from the model's gross return by a mean of -0.09% a trip (median -0.18%). Realized results split by sleeve, in cash before Alpaca's USD fees: stocks lost $1,869 over 66 trips and crypto $31 over 42. The crypto trips' share of the $199 in USD sell fees takes them to about -$220. Open crypto positions held about $6,700 of unrealized gains at 05:42 UTC on October 11, when the screenshot above was taken. `npm run report` and `npm run perf` reproduce these numbers.
 
 ## Get started
 
 You need Node 20.6 or later. Market data for crypto is public; stock data, paper trading and the reports need [Alpaca paper keys](https://app.alpaca.markets/paper/dashboard/overview).
 
 1. **Install:** `git clone https://github.com/jke48222/trading-harness && cd trading-harness && npm ci`
-2. **Test:** `npm test` runs 93 tests with the broker and market data mocked.
+2. **Test:** `npm test` runs 110 tests with the broker and market data mocked.
 3. **Replay a strategy on public data:** `npm run replay:raw`. Pick one with `STRATEGY`, `SYMBOL` and `INTERVAL`; every run is appended to `data/trials.csv`.
 4. **Connect a paper account:** `cp .env.example .env` and set `ALPACA_PAPER_KEY_ID` and `ALPACA_PAPER_SECRET`. Then `npm run broker:check` reads the account without placing anything.
 5. **Run the book:** `scripts/agents.sh install` loads the hourly book agent, the 30-minute health check and the monthly regime monitor on macOS. `scripts/agents.sh status` shows them; `uninstall` removes them.
@@ -54,7 +54,7 @@ You need Node 20.6 or later. Market data for crypto is public; stock data, paper
 | `npm run report` | The book from broker fills: round trips by sleeve, model against actual, fees, per symbol |
 | `npm run perf` | Account return, drawdown and volatility against BTC, SPY and an equal-weight hold of the universe |
 | `npm run reconcile` | Rebuild round trips from broker fills and list where the ledger disagrees; `-- --apply` repairs what the fills prove |
-| `npm run health` | Agents, open orders, positions and the regime monitor; exits 1 on any problem |
+| `npm run health` | Agents, open orders, positions and the regime monitor; exits 2 on a problem it has posted, 1 if it could not post |
 | `npm run positions` | Open paper positions and budget use |
 | `npm run tsmom:monitor` | Recompute Trial 07's construction month by month and check the registered alarm |
 | `npm run dashboard` | Local console at http://127.0.0.1:8787 |
@@ -70,11 +70,11 @@ Alpaca fills ──────────────────────�
 ```
 
 - **Signals** use closed candles only, so they never repaint. The book runs Trial 07's state construction: hold a symbol while its 28-day return is positive, sell when it turns.
-- **Risk gates** ([`src/portfolioRisk.ts`](src/portfolioRisk.ts)): an 8% daily-loss halt on new entries, volatility-scaled size, a 70% cap on crypto (it moves as one bet), a 30% catastrophe stop, and no pyramiding.
+- **Risk gates** ([`src/portfolioRisk.ts`](src/portfolioRisk.ts)): an 8% daily-loss halt on new entries, volatility-scaled size, a 70% cap on crypto (it moves as one bet), a 30% catastrophe stop, and no pyramiding. A stopped or manually closed symbol is not bought back until its momentum turns.
 - **Orders** ([`src/broker/orders.ts`](src/broker/orders.ts)) are priced off the venue's own quote and rounded up to Alpaca's increment. A crypto entry is skipped when the spread is over 100 bps. Every order settles, filled, partly filled or canceled after 30 seconds, and a scan sweeps anything a crash left behind.
 - **The ledger** (`data/ledger.csv`) records every decision with a plain-English reason. Writes take a file lock, so two agents can't drop each other's rows.
 - **Broker truth** ([`src/broker/fills.ts`](src/broker/fills.ts)): round trips are rebuilt from Alpaca's fills, which are the record of what traded. `reconcile` compares them with the ledger.
-- **Health** reads a heartbeat from each agent and posts a macOS notification on refused or stuck orders, unattributed positions, failed exits or a silent agent.
+- **Health** reads a heartbeat from each agent and posts a macOS notification on refused or stuck orders, unattributed positions, failed exits or a silent agent. It measures silence in its own runs, so a sleeping Mac never pages and an agent that misses five runs does.
 
 The operating rules and the gates before any real money are in [`docs/paper_phase_protocol.md`](docs/paper_phase_protocol.md).
 
@@ -83,7 +83,7 @@ The operating rules and the gates before any real money are in [`docs/paper_phas
 - **Paper fills are not real fills.** Alpaca's paper engine fills marketable orders at once and fills a resting limit whenever the market trades to it, with no queue, so it flatters passive orders. Maker-fee savings can't be judged from paper fills.
 - **The book's sizing differs from the test.** Trial 07 tested equal weights; the book scales size down for volatile coins. That is a risk control, and its effect on returns is untested.
 - **Crypto was under-deployed from July 27 to October 11.** Resting orders held back cash and blocked crypto entries on 48 days ([incident write-up](docs/incidents.md)). Results from that period understate the crypto positions the strategy called for.
-- **launchd pauses while the Mac sleeps**, so the book misses scans until it wakes. Crypto entries only open in the two hours after the 00:00 UTC close.
+- **launchd pauses while the Mac sleeps**, so the book misses scans until it wakes. Crypto entries only open in the two hours after the 00:00 UTC close, and health posts one notice a day when no scan ran in that window.
 - **Stock orders go in at the first scan after the open**, up to an hour after 9:30 ET.
 - **Trial 07's recent era is not significant on its own** (2023-12 onward, p = 0.23). The monthly monitor watches for the registered alarm: a negative trailing-12-month excess.
 

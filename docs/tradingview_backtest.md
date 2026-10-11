@@ -1,6 +1,6 @@
 # Prompt 02 — TradingView Backtest Procedure
 
-Status: **run 2026-07-15 via the TradingView MCP** — TradingView Desktop launched with the debug port, and the procedure below was executed end-to-end (script injected, saved, added to chart, 6-run IS/OOS × variant matrix). Results + verdict live in [trading_bot_instructions.md §3](../trading_bot_instructions.md); Strategy Tester screenshot at `backtest/ma_cross_9_21_backtest_2026-07-15.png`. The manual steps below remain valid as a fallback.
+Status: **run 2026-07-15 via the TradingView MCP.** TradingView Desktop launched with the debug port, and the procedure below was executed end-to-end (script injected, saved, added to chart, 6-run IS/OOS × variant matrix). Results and verdict live in [trial_01_ma_cross.md](trial_01_ma_cross.md); Strategy Tester screenshot at `backtest/ma_cross_9_21_backtest_2026-07-15.png`. The manual steps below remain valid as a fallback.
 
 ## A. The strategy being tested
 
@@ -24,7 +24,7 @@ Status: **run 2026-07-15 via the TradingView MCP** — TradingView Desktop launc
 
 **Quality rules (from the prompt — non-negotiable):** no future data, no repainting, costs included, explicit rules, IS/OOS separated, and do not claim profitability the backtest doesn't support.
 
-## C. What to paste back into `trading_bot_instructions.md` §3
+## C. What to record (the format Trial 01 used; its results are in `docs/trial_01_ma_cross.md`)
 
 ```
 TradingView backtest (BINANCE:BTCUSDT 5m, run <date>):
