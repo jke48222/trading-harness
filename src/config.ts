@@ -137,8 +137,16 @@ export const CONFIG = {
   replayCandles: num('REPLAY_CANDLES', 500),
   /** Candles held when scoring a replay setup (12 x 5m = 1 hour). */
   evalHorizon: num('EVAL_HORIZON', 12),
-  /** Round-trip fee + slippage assumption, in basis points (10 = 0.10%). */
+  /** Round-trip cost charged when scoring replays and simulated rows, in bps. */
   feeBps: num('FEE_BPS', 30),
+  /**
+   * Round-trip cost charged when scoring the book's real paper rows, per
+   * sleeve. Crypto: 60 bps, the 30 per side Trial 08 registered (a 0.25%
+   * taker fee plus measured slippage). Stocks: 10 bps (no commission, ETF
+   * and large-cap spreads near 1 bp, plus slippage).
+   */
+  feeBpsCrypto: num('FEE_BPS_CRYPTO', 60),
+  feeBpsStocks: num('FEE_BPS_STOCKS', 10),
   /** Candles pulled for a single scan. */
   scanCandles: num('SCAN_CANDLES', 120),
 
@@ -166,7 +174,7 @@ export function validateConfig(): void {
   if (CONFIG.perTradeUsd <= 0) die('PER_TRADE_USD must be positive.');
   if (CONFIG.budgetUsd < CONFIG.perTradeUsd) die('BUDGET must be at least PER_TRADE_USD.');
   if (CONFIG.maxOpenPositions < 1) die('MAX_OPEN_POSITIONS must be at least 1.');
-  if (CONFIG.feeBps < 0) die('FEE_BPS cannot be negative.');
+  if (CONFIG.feeBps < 0 || CONFIG.feeBpsCrypto < 0 || CONFIG.feeBpsStocks < 0) die('FEE_BPS, FEE_BPS_CRYPTO and FEE_BPS_STOCKS cannot be negative.');
   if (CONFIG.tsmomLookback < 2) die('TSMOM_LOOKBACK must be at least 2.');
   if (CONFIG.volSizeFloor <= 0 || CONFIG.volSizeFloor > 1) die('VOL_SIZE_FLOOR must be in (0,1].');
   if (CONFIG.cryptoClusterCapPct <= 0 || CONFIG.cryptoClusterCapPct > 100) die('CRYPTO_CLUSTER_CAP_PCT must be in (0,100].');
@@ -176,7 +184,6 @@ export function validateConfig(): void {
     die(`EXECUTION must be 'sim' or 'alpaca-paper' (got '${CONFIG.executionMode}') — there is no live execution mode.`);
   }
   const warn: string[] = [];
-  if (CONFIG.executionMode === 'alpaca-paper' && CONFIG.feeBps < 25) warn.push(`FEE_BPS=${CONFIG.feeBps} understates real ~30–58 bps costs for live scoring.`);
   if (CONFIG.maxDailyLossPct <= 0 || CONFIG.maxDailyLossPct > 50) warn.push(`MAX_DAILY_LOSS_PCT=${CONFIG.maxDailyLossPct} is unusual (kill switch effectively ${CONFIG.maxDailyLossPct <= 0 ? 'always on' : 'very loose'}).`);
   for (const w of warn) console.error(`[config warn] ${w}`);
 }

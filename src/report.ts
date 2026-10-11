@@ -15,7 +15,7 @@ import type { LedgerRow } from './types';
 export interface TripAttribution {
   trip: RoundTrip;
   entryRow: LedgerRow | null;
-  /** Model gross % (ledger pnl is net of FEE_BPS; the fee is added back so both sides are gross). */
+  /** Model gross %: the ledger pnl plus the cost it was scored at, so both sides are gross. */
   modelGrossPct: number | null;
   /** Entry fill vs the signal close the model entered at, bps (positive = paid more). */
   entrySlipBps: number | null;
@@ -23,8 +23,18 @@ export interface TripAttribution {
   exitSlipBps: number | null;
 }
 
-const MODEL_EXIT = /\|\| model: state exit (\d{4}-\d{2}-\d{2}) at ([0-9.eE+-]+)/;
+/**
+ * The latest model exit recorded on a row: model v2 notes carry the cost the
+ * row was scored at; older notes do not, and were all scored at the fallback.
+ */
+export function lastModelExit(reason: string): { date: string; price: number; costBps: number | null } | null {
+  let last: RegExpMatchArray | null = null;
+  for (const m of reason.matchAll(/state exit (\d{4}-\d{2}-\d{2}) at ([0-9.eE+-]+)(?:, net of ([0-9.]+) bps)?/g)) last = m;
+  if (!last) return null;
+  return { date: last[1], price: Number(last[2]), costBps: last[3] != null ? Number(last[3]) : null };
+}
 
+/** `feeBps` is the fallback cost for rows whose model note does not record one. */
 export function attributeTrips(trips: RoundTrip[], rows: LedgerRow[], feeBps: number): TripAttribution[] {
   const byClientId = new Map<string, LedgerRow>();
   for (const r of rows) {
@@ -40,11 +50,11 @@ export function attributeTrips(trips: RoundTrip[], rows: LedgerRow[], feeBps: nu
     if (entryRow) {
       const signalClose = Number(entryRow.price);
       if (signalClose > 0) entrySlipBps = (trip.entryVwap / signalClose - 1) * 10_000;
+      const exit = lastModelExit(entryRow.reason);
       if ((entryRow.outcome === 'win' || entryRow.outcome === 'loss' || entryRow.outcome === 'flat') && entryRow.pnl !== '') {
-        modelGrossPct = Number(entryRow.pnl) + feeBps / 100;
+        modelGrossPct = Number(entryRow.pnl) + (exit?.costBps ?? feeBps) / 100;
       }
-      const m = entryRow.reason.match(MODEL_EXIT);
-      if (m && trip.exitVwap != null) exitSlipBps = (trip.exitVwap / Number(m[2]) - 1) * 10_000;
+      if (exit && trip.exitVwap != null) exitSlipBps = (trip.exitVwap / exit.price - 1) * 10_000;
     }
     return { trip, entryRow, modelGrossPct, entrySlipBps, exitSlipBps };
   });

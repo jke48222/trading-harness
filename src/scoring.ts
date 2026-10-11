@@ -6,7 +6,7 @@ import type { LedgerRow } from './types';
 /**
  * Scores matured paper trades so the forward record has real win/loss
  * outcomes, using the same model as replay: enter at the signal candle's
- * close, net of FEE_BPS round trip. The exit depends on the construction:
+ * close, net of a round-trip cost (rowCostBps). The exit depends on the construction:
  *
  *   flip / horizon rows   exit EVAL_HORIZON trading candles later (index-based,
  *                         so stock overnight gaps behave exactly like replay)
@@ -25,7 +25,9 @@ import type { LedgerRow } from './types';
  */
 
 const SCORABLE_MODES = new Set(['scan', 'scan-filtered', 'alpaca-paper']);
-const STATE_MARKER = '|| model: state exit';
+/** Marker of the current state-scoring model. Rows scored before it are re-scored once. */
+const MODEL_V2 = '|| model v2:';
+const STATE_MARKER_V1 = '|| model: state exit';
 
 function setupTagOf(row: LedgerRow): string | null {
   const m = row.reason.match(/^\[([^\]]+)\]/);
@@ -73,13 +75,25 @@ function priceMatches(recordedStr: string, candleClose: number): boolean {
  * Index of the state-construction exit: the first candle after entry whose
  * trailing L-candle return is not positive. Null when momentum is still
  * positive on every candle so far (the model trade is still open).
+ * 'insufficient' when the series starts too late to test the first candle
+ * after entry: silently skipping it once made stock exits days late.
  */
-export function stateExitIndex(closes: number[], entryIdx: number, L: number): number | null {
+export function stateExitIndex(closes: number[], entryIdx: number, L: number): number | null | 'insufficient' {
+  if (entryIdx + 1 - L < 0) return 'insufficient';
   for (let j = entryIdx + 1; j < closes.length; j++) {
-    if (j - L < 0) continue;
     if (closes[j] / closes[j - L] - 1 <= 0) return j;
   }
   return null;
+}
+
+/**
+ * Round-trip cost a row is scored at. Real paper rows use the measured cost
+ * of their sleeve; replays and simulations use the run's FEE_BPS, the basis
+ * their trials registered.
+ */
+export function rowCostBps(row: LedgerRow): number {
+  if (row.mode !== 'alpaca-paper') return CONFIG.feeBps;
+  return row.symbol.endsWith('USDT') ? CONFIG.feeBpsCrypto : CONFIG.feeBpsStocks;
 }
 
 export interface ScoringResult {
@@ -92,19 +106,33 @@ interface Update {
   outcome: string;
   pnl: string;
   reasonSuffix: string;
+  /** The row as it was read; the update applies only if nobody changed it since. */
+  seenOutcome: string;
+  seenReason: string;
 }
 
-/** True for state rows scored before state scoring existed (fixed-horizon outcome, no state marker). */
+/**
+ * True for state rows scored under an older model: the fixed 28-candle
+ * horizon (no marker), or model v1 (one cost for every symbol and too short a
+ * window for stocks). Each is re-scored once, keeping its old figure.
+ */
 function needsStateRescore(r: LedgerRow): boolean {
   return (
     stateLookbackOf(setupTagOf(r)) !== null &&
     (r.outcome === 'win' || r.outcome === 'loss' || r.outcome === 'flat') &&
-    !r.reason.includes(STATE_MARKER)
+    !r.reason.includes(MODEL_V2)
   );
 }
 
+/** Why an already-scored row's figure changed, for the note kept in its reason. */
+function rescoreNote(r: LedgerRow, today: string, horizon: number): string {
+  return r.reason.includes(STATE_MARKER_V1)
+    ? ` (re-scored ${today} under model v2; was ${r.pnl}%)`
+    : ` (re-scored ${today} under model v2; the fixed ${horizon}-candle horizon had given ${r.pnl}%)`;
+}
+
 export async function scoreMaturedScanTrades(log: (msg: string) => void = console.log): Promise<ScoringResult> {
-  const { interval, evalHorizon, feeBps } = CONFIG;
+  const { interval, evalHorizon } = CONFIG;
   const iMs = intervalToMs(interval);
   const now = Date.now();
   const today = new Date(now).toISOString().slice(0, 10);
@@ -151,8 +179,11 @@ export async function scoreMaturedScanTrades(log: (msg: string) => void = consol
       }
       if (ready.length === 0) continue;
 
+      // State rows need L candles before the entry to test the first candle
+      // after it. Stocks trade about 5 days in 7, so reach back twice as far.
       const maxL = Math.max(0, ...ready.map((p) => p.stateL ?? 0));
-      const earliest = Math.min(...ready.map((p) => p.signalBoundary)) - (maxL + 5) * iMs;
+      const reach = symbol.endsWith('USDT') ? 1 : 2;
+      const earliest = Math.min(...ready.map((p) => p.signalBoundary)) - (maxL + 5) * reach * iMs;
       const candles = closedCandles(await fetchSeriesSince(symbol, interval, earliest));
       const closes = candles.map((c) => c.close);
       const byBoundary = new Map<number, number>(); // grid boundary -> candle index
@@ -180,23 +211,26 @@ export async function scoreMaturedScanTrades(log: (msg: string) => void = consol
           continue;
         }
 
-        let exitIdx: number | null;
+        let exitIdx: number;
         let rule: string;
+        const seen = { seenOutcome: p.row.outcome, seenReason: p.row.reason };
         if (p.stateL !== null) {
-          exitIdx = stateExitIndex(closes, entryIdx, p.stateL);
+          const found = stateExitIndex(closes, entryIdx, p.stateL);
           rule = `state exit (trailing ${p.stateL}-candle return turned non-positive)`;
-          if (exitIdx === null) {
+          if (found === 'insufficient') {
+            unmatched++;
+            log(`Scoring: ${symbol} ${p.row.timestamp} — fetched history starts too late to test the state exit; row left as it is.`);
+            continue;
+          }
+          if (found === null) {
             if (p.row.outcome !== 'open') {
-              // Scored under the old fixed horizon, but the state model is still in the trade.
-              updates.set(rowKey(p.row), {
-                outcome: 'open',
-                pnl: '',
-                reasonSuffix: ` ${STATE_MARKER} not reached by ${today} (re-scored; the fixed ${evalHorizon}-candle horizon had given ${p.row.pnl}%)`,
-              });
+              // Scored under an older model, but the state model is still in the trade.
+              updates.set(rowKey(p.row), { outcome: 'open', pnl: '', reasonSuffix: ` ${MODEL_V2} state exit not reached by ${today}${rescoreNote(p.row, today, evalHorizon)}`, ...seen });
             }
             pending++;
             continue;
           }
+          exitIdx = found;
         } else {
           exitIdx = entryIdx + evalHorizon;
           rule = `${evalHorizon} candles`;
@@ -215,19 +249,21 @@ export async function scoreMaturedScanTrades(log: (msg: string) => void = consol
           p.row.action === 'BUY'
             ? ((exitClose - recordedPrice) / recordedPrice) * 100
             : ((recordedPrice - exitClose) / recordedPrice) * 100;
-        const pnlPct = grossPct - feeBps / 100;
+        const cost = rowCostBps(p.row);
+        const pnlPct = grossPct - cost / 100;
         const outcome = pnlPct > 0 ? 'win' : pnlPct < 0 ? 'loss' : 'flat';
         let reasonSuffix = '';
         if (p.stateL !== null) {
-          const exitDay = new Date(candles[exitIdx].closeTime).toISOString().slice(0, 10);
-          reasonSuffix = ` ${STATE_MARKER} ${exitDay} at ${exitClose}`;
-          if (p.row.outcome !== 'open') reasonSuffix += ` (re-scored ${today}; the fixed ${evalHorizon}-candle horizon had given ${p.row.pnl}%)`;
+          // Date from the candle's open: an Alpaca session bar closes at 03:59 UTC the next day.
+          const exitDay = new Date(candles[exitIdx].openTime).toISOString().slice(0, 10);
+          reasonSuffix = ` ${MODEL_V2} state exit ${exitDay} at ${exitClose}, net of ${cost} bps`;
+          if (p.row.outcome !== 'open' && Math.abs(Number(p.row.pnl) - pnlPct) > 0.00005) reasonSuffix += rescoreNote(p.row, today, evalHorizon);
         }
-        updates.set(rowKey(p.row), { outcome, pnl: pnlPct.toFixed(4), reasonSuffix });
+        updates.set(rowKey(p.row), { outcome, pnl: pnlPct.toFixed(4), reasonSuffix, ...seen });
         const kind = p.row.mode === 'scan-filtered' ? ' [counterfactual — filter declined this signal]' : '';
         log(
           `Scoring: ${symbol} ${p.row.action} @ ${recordedPrice} (signal ${shortIso(candles[entryIdx].closeTime)}) -> ` +
-            `exit ${exitClose} after ${rule} = ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(3)}% (${outcome}) net of ${feeBps} bps.${kind}`
+            `exit ${exitClose} after ${rule} = ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(3)}% (${outcome}) net of ${cost} bps.${kind}`
         );
         if (p.tag && outcome === 'loss' && p.row.mode === 'scan') lessonKeys.add(`${symbol}|${p.tag}`);
       }
@@ -243,7 +279,8 @@ export async function scoreMaturedScanTrades(log: (msg: string) => void = consol
     updateLedger((rows) => {
       for (const r of rows) {
         const u = updates.get(rowKey(r));
-        if (!u) continue;
+        // Another scorer may have finished this row since it was read; leave it.
+        if (!u || r.outcome !== u.seenOutcome || r.reason !== u.seenReason) continue;
         r.outcome = u.outcome;
         r.pnl = u.pnl;
         r.reason += u.reasonSuffix;
@@ -273,7 +310,7 @@ export async function scoreMaturedScanTrades(log: (msg: string) => void = consol
       upsertLesson(
         tag,
         `Lost ${losses} of ${wins + losses} real recorded setups on ${symbol} ${interval} ` +
-          `(replay + live scan, net ${net.toFixed(2)}% after ${feeBps} bps costs), last loss ${shortIso(lastLoss)}. ` +
+          `(replay + live scan, net ${net.toFixed(2)}% after ${CONFIG.feeBps} bps costs), last loss ${shortIso(lastLoss)}. ` +
           `Skip fresh ${tag} signals while prior losses >= ${CONFIG.memoryMinLosses} and net PnL is negative.`
       );
     }
