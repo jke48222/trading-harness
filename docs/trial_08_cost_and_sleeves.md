@@ -116,6 +116,8 @@ Model v2 (2026-10-11, after this trial was registered) re-scored the book's rows
 
 Those figures pool all 108 trips, and 66 of them are stocks, whose fills against the signal close mostly measure the move from that close to the next morning's fill. On the 42 crypto trips alone, entries filled a mean 7 bps below the signal close and exits a mean 9 bps below the model's exit close (`npm run report`). That is about 1 bp of slippage per side on top of the 25 bps fee, roughly 26 bps per side against the 30 registered. At the medians, slippage is about 12 bps per side (entries 12 above the signal close, exits 13 below the model's exit), which would put the cost near 37 bps per side; with break-even at 162 bps (D5), the verdict holds either way.
 
+The Bonferroni context above gives Trial 07's 0.021, which is its p times the 53 configurations disclosed when it ran. Against today's 57 it is 0.023, still under 0.05.
+
 ### Implementation notes
 
 - Evaluated at a fixed date (2026-10-01 00:00 UTC) so a re-run reproduces these numbers.

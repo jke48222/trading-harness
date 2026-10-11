@@ -13,7 +13,7 @@ A research harness for testing whether a small trading bot has a real edge, and 
 
 ## What is it?
 
-Each trial writes down its rules, data window and pass bar ahead of its results, and every configuration tried is logged to [`data/trials.csv`](data/trials.csv) (118 rows covering 57 distinct configurations). Each result is shown next to a Bonferroni correction for that count: Trial 07 survives it at 0.021, and Trial 08's crypto passes do not, at 0.063. Only Trial 08's order of rules and results shows in git; Trials 01 to 07 entered the history with their results in the first commit, weeks after they ran. Three fast technical rules were rejected outright, five per-trade candidates failed a multiple-testing correction, and one portfolio construction passed (Trial 07). Trial 08 confirmed it at this account's real costs and found no support for the same rule on US stocks. Since July 2026 a set of launchd agents has traded it on a $100,000 Alpaca paper account, with every fill reconciled against the ledger.
+Each trial writes down its rules, data window and pass bar ahead of its results, and every configuration tried is logged to [`data/trials.csv`](data/trials.csv) (118 rows covering 57 distinct configurations). Each result is shown next to a Bonferroni correction for that count: Trial 07 survives it at 0.023 (0.021 against the 53 configurations disclosed when it ran), and Trial 08's crypto passes do not, at 0.063. Only Trial 08's order of rules and results shows in git; Trials 01 to 07 entered the history with their results in the first commit, weeks after they ran. Three fast technical rules were rejected outright, five per-trade candidates failed a multiple-testing correction, and one portfolio construction passed (Trial 07). Trial 08 confirmed it at this account's real costs and found no support for the same rule on US stocks. Since July 2026 a set of launchd agents has traded it on a $100,000 Alpaca paper account, with every fill reconciled against the ledger.
 
 ## Results
 
@@ -41,7 +41,7 @@ The execution itself is faithful. Across 108 closed round trips, fills differed 
 You need Node 20.6 or later. Market data for crypto is public; stock data, paper trading and the reports need [Alpaca paper keys](https://app.alpaca.markets/paper/dashboard/overview).
 
 1. **Install:** `git clone https://github.com/jke48222/trading-harness && cd trading-harness && npm ci`
-2. **Test:** `npm test` runs 110 tests with the broker and market data mocked.
+2. **Test:** `npm test` runs 114 tests with the broker and market data mocked.
 3. **Replay a strategy on public data:** `npm run replay:raw`. Pick one with `STRATEGY`, `SYMBOL` and `INTERVAL`; every run is appended to `data/trials.csv`.
 4. **Connect a paper account:** `cp .env.example .env` and set `ALPACA_PAPER_KEY_ID` and `ALPACA_PAPER_SECRET`. Then `npm run broker:check` reads the account without placing anything.
 5. **Run the book:** `scripts/agents.sh install` loads the hourly book agent, the 30-minute health check and the monthly regime monitor on macOS. `scripts/agents.sh status` shows them; `uninstall` removes them.
@@ -74,7 +74,7 @@ Alpaca fills ──────────────────────�
 - **Orders** ([`src/broker/orders.ts`](src/broker/orders.ts)) are priced off the venue's own quote and rounded up to Alpaca's increment. A crypto entry is skipped when the spread is over 100 bps. Every order settles, filled, partly filled or canceled after 30 seconds, and a scan sweeps anything a crash left behind.
 - **The ledger** (`data/ledger.csv`) records every decision with a plain-English reason. Writes take a file lock, so two agents can't drop each other's rows.
 - **Broker truth** ([`src/broker/fills.ts`](src/broker/fills.ts)): round trips are rebuilt from Alpaca's fills, which are the record of what traded. `reconcile` compares them with the ledger.
-- **Health** reads a heartbeat from each agent and posts a macOS notification on refused or stuck orders, unattributed positions, failed exits or a silent agent. It measures silence in its own runs, so a sleeping Mac never pages and an agent that misses five runs does.
+- **Health** reads a heartbeat from each agent and posts a macOS notification on refused or stuck orders, unattributed positions, failed exits or a silent agent. It measures silence in its own runs, so a sleeping Mac never pages, and a book agent silent across five health runs (about 2.5 awake hours) does.
 
 The operating rules and the gates before any real money are in [`docs/paper_phase_protocol.md`](docs/paper_phase_protocol.md).
 

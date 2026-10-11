@@ -80,7 +80,7 @@ async function main(): Promise<void> {
       console.log('  npm run report          the book from broker fills: round trips, model vs actual, fees, per symbol');
       console.log('  npm run perf            account return, drawdown and volatility against BTC, SPY and the universe held equally');
       console.log('  npm run reconcile       compare broker fills with the ledger (add -- --apply to repair what the broker proves)');
-      console.log('  npm run health          agents, orders, positions and regime; exits 1 on any problem');
+      console.log('  npm run health          agents, orders, positions and regime; exits 2 on a problem it has posted, 1 if it could not post');
       console.log('  npm run replay:raw      honest baseline over real history, memory ignored; seeds memory from real outcomes');
       console.log('  npm run replay:memory   same window with memory consulted; prints raw-vs-memory comparison');
       console.log('  npm run memory:reset    wipe ledger.csv and learnings.md back to empty');
