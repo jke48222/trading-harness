@@ -1,9 +1,9 @@
 import type { Candle } from './types';
 
 /**
- * US stock market data via the Alpaca PAPER account — READ-ONLY.
- * GET requests only; the IEX feed is what paper keys include. No order
- * endpoint exists here or anywhere else in this project.
+ * US stock market data via the Alpaca PAPER account, read-only: GET requests
+ * only. Orders live in src/broker/orders.ts. Paper keys get the IEX feed in
+ * real time and the consolidated SIP feed for history older than 15 minutes.
  */
 const PAPER_TRADING_HOST = 'https://paper-api.alpaca.markets';
 const DATA_HOST = 'https://data.alpaca.markets';
@@ -60,6 +60,18 @@ interface AlpacaBarsResponse {
   next_page_token: string | null;
 }
 
+export interface StockBarOptions {
+  /** IEX is what live scans use; SIP (consolidated) has history from 2016 for research. */
+  feed?: 'iex' | 'sip';
+  /**
+   * Live signals use 'split': raw bars would read a 10-for-1 split as a 90%
+   * crash and force a false momentum exit. Dividends stay unadjusted so a
+   * recorded signal close still matches its bar after an ex-date. Research
+   * that needs total returns asks for 'all'.
+   */
+  adjustment?: 'raw' | 'split' | 'dividend' | 'all';
+}
+
 /**
  * Fetch stock candles. With `startTime`, pages forward from that time; without
  * it, returns the most recent `limit` bars. Candle shape matches the Binance
@@ -70,8 +82,11 @@ export async function fetchStockCandles(
   symbol: string,
   interval: string,
   limit: number,
-  startTime?: number
+  startTime?: number,
+  opts: StockBarOptions = {}
 ): Promise<Candle[]> {
+  const feed = opts.feed ?? 'iex';
+  const adjustment = opts.adjustment ?? 'split';
   const timeframe = TIMEFRAMES[interval];
   const iMs = INTERVAL_MS[interval];
   if (!timeframe || !iMs) {
@@ -89,7 +104,7 @@ export async function fetchStockCandles(
   for (let page = 0; page < 10; page++) {
     let path =
       `/v2/stocks/${encodeURIComponent(symbol)}/bars?timeframe=${timeframe}` +
-      `&limit=10000&adjustment=raw&feed=iex` +
+      `&limit=10000&adjustment=${adjustment}&feed=${feed}` +
       `&start=${encodeURIComponent(new Date(effectiveStart).toISOString())}`;
     if (pageToken) path += `&page_token=${encodeURIComponent(pageToken)}`;
     const res = await get<AlpacaBarsResponse>(DATA_HOST, path);
@@ -113,7 +128,7 @@ export async function fetchStockCandles(
 
   if (out.length === 0) {
     throw new Error(
-      `No real ${interval} bars returned for stock ${symbol} (IEX feed). ` +
+      `No real ${interval} bars returned for stock ${symbol} (${feed.toUpperCase()} feed). ` +
         'The bot never invents candles — check the symbol, or the market may not have traded in the requested window.'
     );
   }

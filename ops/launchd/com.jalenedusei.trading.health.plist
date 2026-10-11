@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- Every 30 min: npm run health. Any PROBLEM exits 1 and posts a macOS notification. -->
+<!-- Every 30 min: npm run health. Any PROBLEM exits 1 and posts a macOS notification. Not run at load:
+     installed next to the book agent, it would check before the book's first heartbeat and raise a false alarm. -->
 <plist version="1.0">
 <dict>
   <key>Label</key>
@@ -14,7 +15,7 @@
   <key>StartInterval</key>
   <integer>1800</integer>
   <key>RunAtLoad</key>
-  <true/>
+  <false/>
   <key>StandardErrorPath</key>
   <string>__ROOT__/data/health-launchd.err.log</string>
 </dict>
