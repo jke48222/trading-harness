@@ -12,7 +12,7 @@ Registered 2026-07-15, before the paper phase produced results; amended as liste
 
 The plists live in `ops/launchd/`; `scripts/agents.sh install` renders and loads them. The 5m crossover scanner (`com.jalenedusei.trading.scan`) was retired on 2026-10-11.
 
-Execution safety: orders go only to the hardcoded paper host. Every order settles (filled, partly filled, or canceled after `ORDER_TIMEOUT_SEC`); nothing rests at the broker between scans. One action per signal candle, no pyramiding, one book scan at a time (run lock). Entries skip when the quoted spread exceeds `MAX_SPREAD_BPS`. New crypto entries only fire in the two hours after the 00:00 UTC close; stock orders wait for the open.
+Execution safety: orders go only to the hardcoded paper host. Every order settles (filled, partly filled, or canceled after `ORDER_TIMEOUT_SEC`), retrying status checks through broker errors; anything a crash leaves behind is swept at the start of the next book scan. One action per signal candle, no pyramiding, one book scan at a time (a run lock shared by every checkout using the account). A crypto entry skips when the quoted spread exceeds `MAX_SPREAD_BPS`; stock entries price off a fresh IEX quote or the last one-minute close. After a catastrophe stop, a symbol is not bought back until its momentum has turned at least once. New crypto entries only fire in the two hours after the 00:00 UTC close; stock orders wait for the open. Each scan also repairs the ledger from broker fills: it adopts late fills and records exits that filled with no row.
 
 ## Daily criteria (what "working" means)
 
@@ -22,7 +22,16 @@ Execution safety: orders go only to the hardcoded paper host. Every order settle
 4. Exits fired on the momentum flip, or were deferred to the next stock open with a log line.
 5. No invented data anywhere: a symbol whose data is missing is reported and skipped.
 
-`npm run health` checks 1 to 4 and pages when they fail.
+`npm run health` checks 1 to 3 and the exit half of 4. It posts a macOS notification for any of these:
+
+- a book heartbeat over 130 minutes old, except in the 75 minutes after the Mac wakes;
+- a book scan whose steps failed, or whose exit manager did not run;
+- broker refusals, unconfirmed orders and failed exits;
+- positions with no open ledger entry, and bot orders resting over 10 minutes;
+- a symbol whose wanted entry failed four scans running;
+- the broker unreachable twice in a row, and the regime ALARM.
+
+Everything else, including spread-guard streaks and repairs from broker fills, is a warning: it shows in `npm run health` and the dashboard but does not notify.
 
 ## Weekly review
 
@@ -52,10 +61,10 @@ For a real account later: a cash account (no pattern-day-trader flag; 28-day hol
 
 ## Findings that shape operations
 
-- **Alpaca paper does not fill resting below-market limits.** A limit 5 bps under the mark and one at the mark on $10 of BTC both went unfilled; a limit 20 bps above filled at once. Maker-fee savings can only be measured with real money, so `ORDER_MODE=maker` stays off on paper.
+- **Alpaca paper does fill resting limits, at the maker rate, but has no queue.** The July 16 probe concluded the opposite from two $10 BTC limits canceled after 12 seconds. The incident's late fills settle it: eight good-til-canceled buys rested from 28 seconds to 44 hours and then filled at exactly their limit, and the three still held paid 0.12% to 0.15% in fees against 0.20% to 0.25% for orders that filled at once. Paper fills a resting limit whenever the market trades to it, with no queue position, so it overstates how often and how well passive orders fill. `ORDER_MODE=maker` stays off until a registered test accounts for that.
 - **Ledger storage.** Moving the ledger to SQLite is still deferred; instead every write takes a file lock and repairs go through `npm run reconcile`, which backs the ledger up first.
 
 ## Amendments
 
 - **2026-07-15:** budget raised from $300 to the full $100,000 paper account for breadth across 56 symbols (Jalen's call); the $300 scale moved to the fidelity period in gate 5.
-- **2026-10-11:** after the resting-order incident (`docs/incidents.md`): orders settle and never rest; reconcile against broker fills; health pages on refused, resting or unattributed orders; per-agent heartbeats; the 5m scanner retired; agent definitions moved into `ops/launchd/`; gate 2 recorded as met; the operations clock in gate 1 restarted.
+- **2026-10-11:** after the resting-order incident (`docs/incidents.md`): orders settle and never rest; reconcile against broker fills; health pages on refused, resting or unattributed orders; per-agent heartbeats; the 5m scanner retired; agent definitions moved into `ops/launchd/`; gate 2 recorded as met; the operations clock in gate 1 restarted. Three registered daily criteria were replaced. "No unhandled `BLOCKED:` errors" became criterion 2 (no broker refusals) plus the health pages above. "Matured trades scored against real candles" now runs in every scan with model v2, which charges each sleeve's measured cost and reads a full lookback for stocks. "Budget guards held: never more than 3 positions or $300 deployed" stopped applying with the July 15 amendment; the guards are the risk controls in `trading_bot_instructions.md`. The finding that Alpaca paper never fills resting limits was wrong and is corrected above. Trial 08 recommends winding down the stock sleeve with `ENTRY_SKIP=@book-stocks`; that is Jalen's call.

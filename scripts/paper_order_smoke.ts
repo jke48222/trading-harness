@@ -1,5 +1,5 @@
 /**
- * One-time smoke test of the paper execution layer: buy $5 of BTC on the
+ * One-time smoke test of the paper execution layer: buy $10 of BTC on the
  * Alpaca PAPER account, measure the real fill vs the live reference price,
  * close it, and report the measured round-trip cost — the project's first
  * instrumented execution-cost datapoint (deep-research open question #1).

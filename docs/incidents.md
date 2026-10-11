@@ -32,11 +32,11 @@ Effect on results: from late July the crypto sleeve was not the Trial 07 constru
 ### Fix
 
 - Every order settles: it waits for a final state, cancels at `ORDER_TIMEOUT_SEC` (30), and records a partial fill as a position. Each book scan sweeps stale bot orders, adopts any late fill from the broker's history, and takes a run lock.
-- Limits come from the venue's own ask; entries skip when the quoted spread is over `MAX_SPREAD_BPS` (100). Sub-cent limits keep nine decimals.
+- Limits come from the venue's own ask; a crypto entry skips when the quoted spread is over `MAX_SPREAD_BPS` (100), and a stock entry falls back to the last one-minute close when the IEX quote is stale or wide. Crypto limits keep nine decimals at every price and round up.
 - Positions are attributed by timestamp to the open entry with no exit after it.
 - `npm run reconcile` rebuilds round trips from broker fills and compares them with the ledger. Run with `--apply` on 2026-10-11, it adopted the seven late fills and corrected the three exits above, each with a note in the row's reason. The ledger was backed up first.
 - Health pages on refused or unconfirmed orders, bot orders resting over 10 minutes, positions with no open entry, failed exits and a stale book agent.
 
-The 35 orders were canceled on 2026-10-11 at 02:50 UTC; none had filled in the meantime. The first book scan on the new code managed all four former orphans. PAXG's momentum was negative, so it exited at +0.61%; BONK, GRT and SHIB were held.
+The 35 orders were canceled on 2026-10-11 at 03:22 UTC (the broker's canceled_at); none had filled in the meantime. The first book scan on the new code managed all four former orphans. PAXG's momentum was negative, so it exited at +0.61%; BONK, GRT and SHIB were held.
 
 Three trips from the July 15 and 16 setup work stay as they are and are reported by reconcile as manual: a $10 BTC smoke test, and an LTC position that a test order closed and a manual buy restored.

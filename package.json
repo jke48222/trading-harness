@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Paper-trading bot with a two-file memory system. Real market data, simulated orders only \u2014 no live trading path exists.",
+  "description": "Research harness and autonomous paper book: pre-registered strategy trials, honest statistics, and a 28-day momentum book on Alpaca's paper account. Orders reach only the paper host.",
   "engines": {
     "node": ">=18"
   },
