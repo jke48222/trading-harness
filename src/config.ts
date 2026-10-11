@@ -132,7 +132,7 @@ export const CONFIG = {
   /** Candles held when scoring a replay setup (12 x 5m = 1 hour). */
   evalHorizon: num('EVAL_HORIZON', 12),
   /** Round-trip fee + slippage assumption, in basis points (10 = 0.10%). */
-  feeBps: num('FEE_BPS', 10),
+  feeBps: num('FEE_BPS', 30),
   /** Candles pulled for a single scan. */
   scanCandles: num('SCAN_CANDLES', 120),
 
