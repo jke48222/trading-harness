@@ -79,3 +79,41 @@ These are recommendations. Changing the paper book's construction is Jalen's cal
 ## Disclosure
 
 H1, H2, H3 and D3 are appended to `data/trials.csv` as four configurations, with D1, D2 and D5 in their notes.
+
+---
+
+## Results (computed 2026-10-11, after registration)
+
+`npx tsx scripts/trial08_cost_and_sleeves.ts`, evaluated as of 2026-10-01 00:00 UTC (months through 2026-09). Data were complete: no missing crypto days, no stock gap longer than a holiday weekend.
+
+| Test | Universe, cost, fills | Months | Mean monthly excess | t | Bootstrap p | Holm |
+|---|---|---|---|---|---|---|
+| H1 | T07-8, 30 bps, at the close | 2017-10 to 2026-09 (108) | +3.735% (sd 14.88%) | 2.61 | 0.0011 | **pass** (adjusted 0.0033) |
+| H2 | BOOK-32, 30 bps, at the close | 2017-10 to 2026-09 (108) | +2.991% (sd 11.25%) | 2.76 | 0.0011 | **pass** (adjusted 0.0033) |
+| H3 | ETF-15, 5 bps, next open | 2016-03 to 2026-09 (127) | -0.226% (sd 1.70%) | -1.50 | 0.934 | **fail** |
+
+Context, not the rule: against all 57 configurations disclosed in `data/trials.csv`, a Bonferroni correction gives 0.063 for H1 and H2. They pass the registered test but would not survive a correction for every look this project has taken. Trial 07 did (0.021).
+
+### Descriptives
+
+- **D1, cost sensitivity on T07-8:** +4.091%/mo at 15 bps (p 0.0006), +3.264%/mo at 50 bps (p 0.0045). Trial 07 as published: +4.299%/mo over 105 months to 2026-06.
+- **D2, from 2023-12 (34 months):** H1 +1.112%/mo (p 0.33), H2 +0.906%/mo (p 0.30), H3 -0.267%/mo (p 0.90). As in Trial 07, the recent era alone shows nothing significant.
+- **D3, the book's 24 stocks:** -0.217%/mo (p 0.94). Only TSLA (+1.11), AMD (+1.00) and META (+0.24) are positive.
+- **D4, per symbol:** all 8 T07-8 symbols are positive, DOGE highest at +10.63%/mo and ETH lowest at +1.43. 24 of the book's 32 coins are positive. The 8 negative ones are SKY, TRUMP, YFI, LTC, PAXG, RENDER, WIF and ONDO; SKY, ONDO and TRUMP have under 20 months of data. All 15 ETFs are negative, from XLY at -0.01 to XLI at -0.46. A crypto position changes 25 to 35 times a year, an ETF position 16 to 22.
+- **D5, break-even cost per unit change:** 193 bps for H1 and 162 bps for H2, against the 30 paid. H3 has none, because its excess is negative at zero cost.
+
+### Verdict
+
+**Crypto holds at real costs.** Trial 07's result survives the fees this account pays, on its 8 coins and on the book's 32, with a wide margin on cost. Two limits stand: the 2023 to 2026 era alone is not significant, and a correction for every look the project has taken would not pass.
+
+**Stocks have no support.** On all 15 unselected ETFs, 28-day momentum timing lost to its own average exposure, before costs. The hand-picked 24 did no better. The paper book agrees: its 66 stock round trips averaged -1.64% and lost $1,869 realized.
+
+**Recommendation (the locked consequence; changing the book is Jalen's call):** remove the stock sleeve. `ENTRY_SKIP=@book-stocks` stops new stock entries and lets the exit manager close the open stock positions on the momentum rule, so nothing is orphaned or force-sold.
+
+### Implementation notes
+
+- Evaluated at a fixed date (2026-10-01 00:00 UTC) so a re-run reproduces these numbers.
+- As in Trial 07's code: w̄ is averaged over every return day, the first return day is candle 30, and each p uses a fresh mulberry32(42).
+- Binance's 2018-02-08 daily candle closed at 00:28 UTC during an exchange halt for BTC, ETH, BNB and LTC. It is kept as an ordinary day, as Trial 07 did.
+- Crypto months are keyed by candle close time, stock months by session date.
+- In `data/trials.csv`, `fee_bps` for these four rows is the cost per unit change (30 or 5). Trial 07's row put 30 there for the round trip at 15 per change.
