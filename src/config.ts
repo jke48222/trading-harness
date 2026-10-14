@@ -63,7 +63,8 @@ export const CONFIG = {
   /**
    * Symbols that take no NEW entries but stay in the universe, so the exit
    * manager still closes their open positions on the strategy's own rule.
-   * Winds a sleeve down without orphaning it (ENTRY_SKIP=@book-stocks).
+   * Winds a sleeve down without orphaning it (ENTRY_SKIP=@book-stocks), or
+   * keeps the book off a pair the paper simulator never fills.
    */
   entrySkip: new Set(expandSymbols(process.env.ENTRY_SKIP ?? '')),
   interval: process.env.INTERVAL ?? '5m',

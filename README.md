@@ -85,7 +85,8 @@ The operating rules and the gates before any real money are in [`docs/paper_phas
 
 ## Limits and known issues
 
-- **Paper fills are not real fills.** Alpaca's paper engine fills marketable orders at once and fills a resting limit whenever the market trades to it, with no queue, so it flatters passive orders. Maker-fee savings can't be judged from paper fills.
+- **Paper fills are not real fills.** On most pairs, Alpaca's paper engine fills marketable orders at once and fills a resting limit once the market reaches it, with no queue, so it flatters passive orders. Maker-fee savings can't be judged from paper fills.
+- **Alpaca's paper engine never fills three of the book's coins.** It filled none of 42 orders on LDO, POL and WIF from July to October, market orders and limits above the ask alike, so the book takes no new entries in them and can open positions in at most 29 of its 32 coins ([incident](docs/incidents.md)). That is a fact about the paper engine; no live account was tested.
 - **The book's sizing differs from the test.** Trial 07 tested equal weights; the book scales size down for volatile coins. That is a risk control, and its effect on returns is untested.
 - **Crypto was under-deployed from July 27 to October 11.** Resting orders held back cash and blocked crypto entries on 48 days ([incident write-up](docs/incidents.md)). Results from that period understate the crypto positions the strategy called for.
 - **launchd pauses while the Mac sleeps**, so the book misses scans until it wakes. Crypto entries only open in the two hours after the 00:00 UTC close, and health posts one notice a day when no scan ran in that window.

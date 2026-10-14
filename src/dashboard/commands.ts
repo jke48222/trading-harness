@@ -32,7 +32,8 @@ export const BOOK_ENV: Readonly<Record<string, string>> = Object.freeze({
   ENTRY_WINDOW_MIN: '120',
   LIMIT_SLIPPAGE_BPS: '30',
   // Trial 08: no new stock entries; open stock positions still exit on the momentum rule.
-  ENTRY_SKIP: '@book-stocks',
+  // LDO, POL and WIF: Alpaca's paper simulator never fills them (docs/incidents.md).
+  ENTRY_SKIP: '@book-stocks,LDOUSDT,POLUSDT,WIFUSDT',
 });
 
 export interface Command {
