@@ -179,10 +179,11 @@ function previousHeartbeat(label: string): Partial<ScanStats> | null {
 }
 
 /**
- * Carry the missed-entry streaks forward. A miss adds one, an entry or a
- * signal that wants none resets, and a neutral scan (outside the entry
- * window, market closed, budget full) leaves the count alone, so a coin that
- * misses its window two days running reads 2, not 0.
+ * Carry the missed-entry streaks forward. A miss adds one; an entry, a
+ * signal that wants none, or a symbol whose entries are off (ENTRY_SKIP)
+ * resets; and a neutral scan (outside the entry window, market closed, budget
+ * full) leaves the count alone, so a coin that misses its window two days
+ * running reads 2, not 0.
  */
 export function nextEntryMisses(
   prev: Record<string, { n: number; kind: string }>,
@@ -473,7 +474,8 @@ export async function runScan(): Promise<void> {
           log(`${symbol}: ORDER REJECTED by the broker — HTTP ${err.status} ${err.body.slice(0, 200)}`);
         } else {
           stats.failures.push(`${symbol}: ${msg}`);
-          stats.attempts[symbol] ??= 'miss:error';
+          // A symbol whose entries are off can't miss one, even when its data fails.
+          stats.attempts[symbol] ??= CONFIG.entrySkip.has(symbol) ? 'ok' : 'miss:error';
           log(`${symbol}: BLOCKED — ${msg}`);
           log(`${symbol}: the bot never fakes a result for a symbol it cannot read; continuing with the rest of the universe.`);
         }
@@ -520,7 +522,10 @@ async function scanSymbol(symbol: string, stockMarketOpen: boolean | null, riskC
     return;
   }
   if (CONFIG.entrySkip.has(symbol)) {
-    stats.attempts[symbol] = 'neutral';
+    // Entries are off by design, so no wanted entry is being missed. 'ok'
+    // drops any earlier miss count; 'neutral' would carry it, and health
+    // would page on it for as long as the signal says buy.
+    stats.attempts[symbol] = 'ok';
     log(`${symbol}: ${sig.action} signal not taken — new entries are off for this symbol (ENTRY_SKIP); open positions still exit on the strategy's rule.`);
     return;
   }

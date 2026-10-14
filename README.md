@@ -46,7 +46,7 @@ The execution itself is faithful. Across 108 closed round trips, fills differed 
 You need Node 20.6 or later. Market data for crypto is public; stock data, paper trading and the reports need [Alpaca paper keys](https://app.alpaca.markets/paper/dashboard/overview).
 
 1. **Install:** `git clone https://github.com/jke48222/trading-harness && cd trading-harness && npm ci`
-2. **Test:** `npm test` runs 135 tests with the broker and market data mocked.
+2. **Test:** `npm test` runs 137 tests with the broker and market data mocked.
 3. **Replay a strategy on public data:** `npm run replay:raw`. Pick one with `STRATEGY`, `SYMBOL` and `INTERVAL`; every run is appended to `data/trials.csv`.
 4. **Connect a paper account:** `cp .env.example .env` and set `ALPACA_PAPER_KEY_ID` and `ALPACA_PAPER_SECRET`. Then `npm run broker:check` reads the account without placing anything.
 5. **Run the book:** `scripts/agents.sh install` loads the hourly book agent, the 30-minute health check and the monthly regime monitor on macOS. `scripts/agents.sh status` shows them; `uninstall` removes them. To keep the live ledger, heartbeats and logs out of the checkout, set `DATA_DIR` in `.env` (and `TRIALS_FILE=data/trials.csv` to keep the research record in it), then run `install` again.
