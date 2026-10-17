@@ -459,5 +459,5 @@ test('gate 1 counts days since the clock last restarted', () => {
   assert.equal(met.done, true);
   assert.match(met.progress, /^28\/28 days/);
   assert.equal(P.opsGate(Date.parse('2026-10-01T00:00:00Z'), start).progress.startsWith('0/28'), true, 'never negative');
-  assert.equal(P.OPS_CLOCK_START, '2026-10-11');
+  assert.equal(P.OPS_CLOCK_START, '2026-10-14', 'the protocol\'s last restart (docs/paper_phase_protocol.md, gate 1)');
 });
