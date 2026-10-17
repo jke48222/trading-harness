@@ -1,20 +1,22 @@
-import type { PortfolioHistory } from './broker/orders';
+import type { BrokerActivity, PortfolioHistory } from './broker/orders';
 
 /**
  * Cash that enters or leaves the paper account from outside the book:
  * deposits, withdrawals, journals, transfers. The bot can't make one (its
- * only writes are orders and position closes), so performance has to take
- * each one out of the returns. Alpaca journaled -$66,905.32 out of the
- * account on 2026-10-13, and the daily curve showed it as a -62.6% day
- * (docs/incidents.md).
+ * only writes are orders and position closes), so each one is news to
+ * health, and performance has to take it out of the returns. Alpaca
+ * journaled -$66,905.32 out of the account on 2026-10-13, and the daily
+ * curve showed it as a -62.6% day (docs/incidents.md).
  *
  * Alpaca's portfolio history lists cash flows by activity type when asked
  * with cashflow_types=ALL. The API reference calls them accumulated values;
  * on this account each flow appears in exactly one point, the one whose
- * window it was booked in (checked 2026-10-17). Fills, fees, and what the
- * holdings earn or cost (dividends, interest, corporate actions) are the
- * book's own result and stay in its returns. Every other type is external,
- * including a type this list has never seen.
+ * window it was booked in (checked 2026-10-17). The activity log is a second
+ * record, and the two disagree: the log never listed that journal, and the
+ * history can show a flow a day or more after the log does. Fills, fees,
+ * and what the holdings earn or cost (dividends, interest, corporate
+ * actions) are the book's own result and stay in its returns. Every other
+ * type is external, including a type this list has never seen.
  */
 
 // Alpaca's activity types as its API reference lists them (2026-10-17), plus older names for the same corporate actions (SC, SSO, SSP, OPXRC, CIL).
@@ -27,6 +29,13 @@ const BOOK_TYPES = new Set([
 export function isExternalFlowType(type: string): boolean {
   return !(BOOK_TYPES.has(type) || type.startsWith('DIV') || type.startsWith('INT'));
 }
+
+/**
+ * The account was funded with $100,000 by a JNLC on 2026-07-14, which the
+ * daily history books in its 2026-07-15 point, the book's first (perf's
+ * PERF_START_DATE). A flow booked on or before that point is the funding.
+ */
+export const FUNDED_THROUGH = '2026-07-15';
 
 export interface CashFlow {
   /** Stamp of the history point the flow is booked in, ms epoch. */
@@ -62,6 +71,12 @@ export function externalFlows(h: PortfolioHistory): CashFlow[] {
   }
   return out.sort((a, b) => a.t - b.t || a.type.localeCompare(b.type));
 }
+
+/** Health remembers each flow it has paged on by this key, so a flow whose amount later changes pages again. */
+export const flowKey = (f: Pick<CashFlow, 'type' | 'date' | 'amount'>): string => `${f.type}:${f.date}:${f.amount.toFixed(2)}`;
+
+const DAY_MS = 86_400_000;
+const dayOf = (date: string): number => Date.parse(`${date}T00:00:00Z`);
 
 // ---- returns net of flows ----
 
@@ -182,4 +197,156 @@ export function alignFlows(points: { t: number; equity: number }[], flows: CashF
     else if (impossible) f.at = null;
   }
   return out;
+}
+
+// ---- cash rebuilt from the activity log ----
+
+/** When an activity happened: a fill's execution time, or when a non-trade activity was created, which is what the API's `after` filters on. */
+export function activityTime(a: BrokerActivity): number {
+  return Date.parse(a.transaction_time ?? a.created_at ?? `${a.date ?? ''}T00:00:00Z`);
+}
+
+/** What one activity did to cash: a fill moves price times quantity, anything else its net amount. Fees taken in coin carry 0. */
+export function cashEffect(a: BrokerActivity): number {
+  if (a.status === 'canceled') return 0;
+  if (a.activity_type === 'FILL') {
+    const v = Number(a.price) * Number(a.qty);
+    return a.side === 'buy' ? -v : v;
+  }
+  return Number(a.net_amount ?? 0);
+}
+
+const isCryptoPair = (symbol = ''): boolean => symbol.includes('/') || (symbol.endsWith('USD') && symbol.length > 4);
+
+export interface ExternalActivity {
+  /** Alpaca's activity id: health keys a flow it saw in the log by this, so two equal flows on different days never share a key. */
+  id: string;
+  type: string;
+  date: string;
+  amount: number;
+}
+
+/** The activity log summed up to `through`, kept in data/health_state.json so a health run reads only the last few days. */
+export interface CashLedger {
+  /** Activities at or before this time (ISO) are summed in `cash`; later ones are read again every run. */
+  through: string;
+  cash: number;
+  count: number;
+  /** External activities through `through` (JNLC, CSD, ...), to match against the history's flows. */
+  external: ExternalActivity[];
+  /** When the log was last read in full (ISO). */
+  fullAt: string;
+}
+
+export interface CashRebuild {
+  /** Cash as the activity log has it. */
+  cash: number;
+  activities: number;
+  external: ExternalActivity[];
+  /** Crypto sold in the last 48 hours (USD). Broker cash takes the sell fee at once; the log posts it a day or so later. */
+  recentCryptoSalesUsd: number;
+}
+
+/** Activities older than this are summed into the ledger for good; newer ones are re-read every run, so a late posting still counts. */
+export const SETTLE_MS = 3 * 86_400_000;
+/** The whole log is re-read at least this often, which catches anything posted more than SETTLE_MS late. */
+export const FULL_READ_MS = 7 * 86_400_000;
+
+/**
+ * Cash from the activity log. With no `prior`, `rows` is the whole log; with
+ * one, `rows` covers at least everything after `prior.through`, and older rows
+ * are skipped because the ledger already holds them. Returns the rebuild and
+ * the ledger to keep for the next run. Throws on an activity it can't read
+ * rather than guess at cash.
+ */
+export function foldCash(prior: CashLedger | null, rows: BrokerActivity[], nowMs: number): { rebuild: CashRebuild; ledger: CashLedger } {
+  const baseT = prior ? Date.parse(prior.through) : -Infinity;
+  const through = Math.max(baseT, nowMs - SETTLE_MS);
+  let cash = prior?.cash ?? 0;
+  let count = prior?.count ?? 0;
+  const external = [...(prior?.external ?? [])];
+  const settled = { cash, count, external: [...external] };
+  let sales = 0;
+  for (const a of rows) {
+    const t = activityTime(a);
+    const v = cashEffect(a);
+    if (!Number.isFinite(t) || !Number.isFinite(v)) {
+      throw new Error(`A ${a.activity_type} activity has no readable ${Number.isFinite(t) ? 'amount' : 'time'}; the cash rebuild stops rather than guess.`);
+    }
+    if (t <= baseT) continue;
+    // An external activity that moves no cash (a stock journal at $0) is not a cash flow.
+    const ext = isExternalFlowType(a.activity_type) && a.status !== 'canceled' && cents(v) !== 0 ? { id: a.id, type: a.activity_type, date: a.date?.slice(0, 10) || isoDate(t), amount: cents(v) } : null;
+    cash += v;
+    count++;
+    if (ext) external.push(ext);
+    if (t <= through) {
+      settled.cash += v;
+      settled.count++;
+      if (ext) settled.external.push(ext);
+    }
+    if (a.activity_type === 'FILL' && a.side !== 'buy' && isCryptoPair(a.symbol) && t > nowMs - 2 * 86_400_000) sales += v;
+  }
+  return {
+    rebuild: { cash, activities: count, external, recentCryptoSalesUsd: sales },
+    ledger: { through: new Date(through).toISOString(), cash: settled.cash, count: settled.count, external: settled.external, fullAt: prior?.fullAt ?? new Date(nowMs).toISOString() },
+  };
+}
+
+export interface FlowMatch {
+  /** Each history flow with the log activities it pairs with (none for a flow the log leaves out). */
+  pairs: { flow: CashFlow; acts: ExternalActivity[] }[];
+  /** The part of each history flow the log does not account for, like the 2026-10-13 journal. */
+  historyOnly: { flow: CashFlow; amount: number }[];
+  /** External activities the history does not show, or not yet: its daily point can come days after the log. */
+  logOnly: ExternalActivity[];
+}
+
+/**
+ * Pair the history's external flows with the activity log's. A flow books in
+ * the first point after it happens, which is the next session's point: over
+ * a holiday weekend, or after the 2026-12-24 early close, that is 4 or 5 days
+ * after the activity's date. So a flow pairs with activities of its type
+ * dated from a day after its point to 6 days before it. A point stamped at
+ * 00:00 UTC on day D holds what happened by then, so the activities dated 1
+ * to 6 days before it come first, then its own day, then the day after: one
+ * of the same amount, else a few that sum to it (a point holds the sum of its
+ * window). Failing both, the log is taken to list part of it: the activities
+ * of the same sign dated before its day, if they come to less than the flow,
+ * and the rest of the flow is left unlisted. An activity of the other sign is
+ * never part of it, so a journal can't swallow its own reversal; the price is
+ * that a deposit and a journal in one point can't be told apart. The whole
+ * log is matched, not just the history's span, so a flow at the edge of the
+ * span still finds its activity.
+ */
+export function matchFlows(flows: CashFlow[], external: ExternalActivity[]): FlowMatch {
+  const unused = [...external];
+  const pairs: FlowMatch['pairs'] = [];
+  const historyOnly: FlowMatch['historyOnly'] = [];
+  for (const f of [...flows].sort((a, b) => a.t - b.t)) {
+    const lag = (a: ExternalActivity): number => (dayOf(f.date) - dayOf(a.date)) / DAY_MS;
+    const rank = (a: ExternalActivity): number => (lag(a) >= 1 ? lag(a) : 7 - lag(a));
+    const near = unused.filter((a) => a.type === f.type && lag(a) >= -1 && lag(a) <= 6).sort((a, b) => rank(a) - rank(b));
+    const one = near.find((a) => Math.abs(a.amount - f.amount) < 0.005);
+    let acts = one ? [one] : summingTo(near, f.amount);
+    if (!acts) {
+      const part = near.filter((a) => lag(a) >= 1 && Math.sign(a.amount) === Math.sign(f.amount));
+      acts = Math.abs(part.reduce((s, a) => s + a.amount, 0)) < Math.abs(f.amount) ? part : [];
+    }
+    for (const a of acts) unused.splice(unused.indexOf(a), 1);
+    pairs.push({ flow: f, acts });
+    const rest = cents(f.amount - acts.reduce((s, a) => s + a.amount, 0));
+    if (rest !== 0) historyOnly.push({ flow: f, amount: rest });
+  }
+  return { pairs, historyOnly, logOnly: unused };
+}
+
+/** The first set of up to 10 activities whose amounts sum to `target` to the cent, or null. */
+function summingTo(xs: ExternalActivity[], target: number): ExternalActivity[] | null {
+  const pool = xs.slice(0, 10);
+  for (let mask = 1; mask < 1 << pool.length; mask++) {
+    let sum = 0;
+    for (let i = 0; i < pool.length; i++) if (mask & (1 << i)) sum += pool[i].amount;
+    if (Math.abs(sum - target) < 0.005) return pool.filter((_, i) => mask & (1 << i));
+  }
+  return null;
 }

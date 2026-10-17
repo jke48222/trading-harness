@@ -8,10 +8,24 @@ import {
   type BrokerOrder,
   type BrokerPosition,
   botSymbolOf,
+  fetchAccountActivities,
   getAccount,
   getBrokerPositions,
   getOpenOrders,
+  getPortfolioHistory,
 } from './broker/orders';
+import {
+  type CashFlow,
+  type CashLedger,
+  type CashRebuild,
+  FULL_READ_MS,
+  FUNDED_THROUGH,
+  externalFlows,
+  flowKey,
+  foldCash,
+  matchFlows,
+  usd,
+} from './cashflows';
 import { loadLedger, openEntryFor } from './memory';
 import { runLockHolder } from './locks';
 import { plistRunEnv } from './dashboard/commands';
@@ -36,6 +50,13 @@ import type { LedgerRow } from './types';
  * broker health can't reach twice in a row. A regime ALARM and a day with no
  * scan in the crypto entry window post one notice each. Everything else is a
  * warning, which does not notify.
+ *
+ * Cash, since a -$66,905.32 journal on 2026-10-13 went unnoticed for days
+ * (docs/incidents.md): a cash flow from outside the book pages once, the run
+ * health first sees it in either record; negative cash pages every run;
+ * broker cash that neither the activity log nor the history's flows account
+ * for pages on the second run in a row, since a fill can land between the
+ * two reads; and so does a cash read that fails twice running.
  */
 
 /** Agents health expects, by heartbeat label (RUN_LABEL in the launchd plist). */
@@ -76,6 +97,27 @@ export interface HealthInput {
   /** Present only when broker keys are configured and the broker answered. */
   broker?: { positions: BrokerPosition[]; openOrders: BrokerOrder[]; account: BrokerAccount };
   brokerError?: string;
+  /** External cash flows and the activity log's cash, read alongside the account. */
+  cash?: CashInput;
+  /** Why the cash checks could not run this time. */
+  cashError?: string;
+  /** Consecutive health runs, including this one, whose cash read failed in part or whole. */
+  cashFailStreak?: number;
+  /** Keys of the external flows health has already paged on (data/health_state.json). */
+  knownFlows?: string[];
+  /** Consecutive earlier runs on which broker cash did not reconcile. */
+  cashGapRuns?: number;
+}
+
+export interface CashInput {
+  /** When the history and the activity log were read (ms). */
+  asOfMs: number;
+  /** External flows in the account's daily history, oldest first. */
+  flows: CashFlow[];
+  /** Cash from the activity log; null when the log was not read (`skipped` or `logError` says why). */
+  rebuild: CashRebuild | null;
+  skipped?: string;
+  logError?: string;
 }
 
 export interface HealthReport {
@@ -84,7 +126,18 @@ export interface HealthReport {
   info: string[];
   /** Things worth one notification, not one every run (keyed so each is posted once). */
   notices: { key: string; text: string }[];
+  /** External flows paged on for the first time; runHealth remembers them once the page is posted. */
+  newFlows: string[];
+  /** More keys for flows already on record (the other record's date for the same flow), remembered whatever is posted. */
+  seenFlows: string[];
+  /** Whether broker cash failed to reconcile this run; null when the check did not run. */
+  cashGap: boolean | null;
 }
+
+/** Broker cash may sit this far from what the records account for before health says so. */
+export const CASH_TOLERANCE_USD = 50;
+/** Crypto sell fees the log has not posted yet, as a share of recent sales: above Alpaca's 0.25% top taker rate. */
+export const UNPOSTED_FEE_RATE = 0.003;
 
 /**
  * The latest month the monitor must have reported by now. It runs at 06:00
@@ -231,12 +284,127 @@ export function evaluateHealth(input: HealthInput): HealthReport {
       problems.push(`${stale.length} bot order(s) resting at the broker for over 10 min (${list(stale.map((o) => `${o.symbol} ${o.client_order_id}`))}) — they reserve cash and can fill with no ledger row.`);
     }
     const nmbp = Number(account.non_marginable_buying_power ?? account.cash);
-    if (Number.isFinite(nmbp) && nmbp < CONFIG.perTradeUsd) {
+    // Negative cash says this too, as a problem (section 4).
+    if (Number.isFinite(nmbp) && nmbp < CONFIG.perTradeUsd && !(Number(account.cash) < 0)) {
       warnings.push(`Crypto buying power is $${nmbp.toFixed(0)}, below one $${CONFIG.perTradeUsd} position — new crypto entries will be refused.`);
     }
     info.push(`Broker: ${positions.length} positions, ${openOrders.length} open order(s), equity $${Number(account.equity).toFixed(0)}.`);
   }
-  return { problems, warnings, info, notices };
+
+  // 4. Cash from outside the book.
+  const cash = evaluateCash(input, byLabel.get('book'));
+  problems.push(...cash.problems);
+  warnings.push(...cash.warnings);
+  info.push(...cash.info);
+  // A new flow leads the list, so the one page it gets names it.
+  return { problems: [...cash.firstPage, ...problems], warnings, info, notices, newFlows: cash.newFlows, seenFlows: cash.seenFlows, cashGap: cash.gap };
+}
+
+/**
+ * The cash rules. The bot's only writes are orders and position closes, so
+ * cash that arrives or leaves any other way came from Alpaca or from Jalen:
+ *
+ * - An external flow in the daily history (a journal, deposit, withdrawal or
+ *   transfer after the funding) pages the run health first sees it.
+ * - Broker cash is compared with the activity log rebuilt to the cent, plus
+ *   any history flow the log leaves out. A gap past $50 (wider on the low
+ *   side by the crypto fees the log has not posted yet) warns, and pages if
+ *   the next run finds it too.
+ * - Negative cash pages every run: crypto buys need cash, so the book can't
+ *   open a position, and Alpaca refuses its next crypto entry.
+ */
+function evaluateCash(
+  input: HealthInput,
+  bookHb: ScanStats | undefined
+): { firstPage: string[]; problems: string[]; warnings: string[]; info: string[]; newFlows: string[]; seenFlows: string[]; gap: boolean | null } {
+  const out = { firstPage: [] as string[], problems: [] as string[], warnings: [] as string[], info: [] as string[], newFlows: [] as string[], seenFlows: [] as string[], gap: null as boolean | null };
+  if (!input.broker) return out;
+  const account = input.broker.account;
+  const cash = Number(account.cash);
+  const fails = input.cashFailStreak ?? 1;
+  // One failed read is a blip; two in a row leave health blind to cash, which is how the 2026-10-13 journal went unseen.
+  const failed = (text: string): void => {
+    (fails >= 2 ? out.problems : out.warnings).push(`${text} (${fails} check(s) in a row)`);
+  };
+  if (input.cashError) failed(`Cash checks did not run: ${input.cashError}`);
+  const c = input.cash;
+  if (c?.logError) failed(`The activity log could not be read, so broker cash was not reconciled: ${c.logError}`);
+  const match = matchFlows(c?.flows ?? [], c?.rebuild?.external ?? []);
+  const unlistedOf = new Map(match.historyOnly.map((h) => [h.flow, h.amount]));
+  const known = new Set(input.knownFlows ?? []);
+
+  // Reconcile first, so a new flow's page can say what it did to cash.
+  let gapSentence = '';
+  if (c?.rebuild) {
+    if (input.bookScanRunning || (bookHb && Date.parse(bookHb.at) > c.asOfMs)) {
+      out.info.push('A book scan ran or is running since the activity log was read; the cash reconcile waits for the next health run.');
+    } else {
+      // What only the history shows (the journal) explains a gap; what only the log shows is already in its cash.
+      const unlisted = match.historyOnly.reduce((s, h) => s + h.amount, 0);
+      const gap = cash - c.rebuild.cash;
+      const unexplained = gap - unlisted;
+      const feeRoom = UNPOSTED_FEE_RATE * c.rebuild.recentCryptoSalesUsd;
+      out.gap = unexplained > CASH_TOLERANCE_USD || unexplained < -(CASH_TOLERANCE_USD + feeRoom);
+      gapSentence = ` broker cash is ${usd(Math.abs(gap))} ${gap < 0 ? 'below' : 'above'} the ${usd(c.rebuild.cash)} the log accounts for.`;
+      if (out.gap) {
+        const text =
+          `Broker cash ${usd(cash)} is ${usd(Math.abs(unexplained))} ${unexplained < 0 ? 'below' : 'above'} what ` +
+          `${match.historyOnly.length ? "the activity log and the history's cash flows account" : 'the activity log accounts'} for (${usd(c.rebuild.cash + unlisted)}): cash moved with no record of it.`;
+        if ((input.cashGapRuns ?? 0) >= 1) out.problems.push(text);
+        else out.warnings.push(`${text} It pages if the next health run finds it too.`);
+      } else {
+        const within = `within ${usd(Math.abs(unexplained))}`;
+        for (const { flow: f, amount } of match.historyOnly.filter((h) => known.has(flowKey(h.flow)))) {
+          const part = amount === f.amount ? '' : ` (${usd(amount, true)} of it)`;
+          out.warnings.push(`Alpaca's activity log still leaves out ${f.type} ${usd(f.amount, true)}${part} (${f.date} history point); counting it, broker cash reconciles ${within}.`);
+        }
+        if (!match.historyOnly.length) out.info.push(`Broker cash reconciles with the activity log (${c.rebuild.activities} activities) ${within}.`);
+      }
+    }
+  } else if (c?.skipped) {
+    out.info.push(c.skipped);
+  }
+
+  // Every external movement either record shows after the funding: each history flow with the log entries it pairs with, and what only the log has so far.
+  // A movement is one flow however many records show it, and pages at most once. The history keys it by type, point and amount, the log by Alpaca's
+  // activity id, so two equal deposits a day apart never share a key. It is on record when its history key is, or when the log entries it pairs with
+  // all are and they cover all of it: a journal that lands in the same point as a deposit already paged is still news.
+  const logKey = (a: { id: string }): string => `log:${a.id}`;
+  type Move = { f: Pick<CashFlow, 'type' | 'date' | 'amount'>; histKey: string | null; logKeys: string[]; rest: number };
+  const moves: Move[] = [
+    ...match.pairs.map(({ flow, acts }) => ({ f: flow, histKey: flowKey(flow), logKeys: acts.map(logKey), rest: unlistedOf.get(flow) ?? 0 })),
+    ...match.logOnly.map((a) => ({ f: a, histKey: null, logKeys: [logKey(a)], rest: 0 })),
+  ].filter((m) => m.f.date > FUNDED_THROUGH);
+  for (const m of moves) {
+    const { f, histKey, logKeys, rest } = m;
+    const keys = histKey ? [histKey, ...logKeys] : logKeys;
+    const where = histKey ? `in the ${f.date} history point` : `in the activity log, dated ${f.date}; the daily history does not show it yet`;
+    const onRecord = (histKey != null && known.has(histKey)) || (logKeys.length > 0 && logKeys.every((k) => known.has(k)) && rest === 0);
+    if (onRecord) {
+      out.seenFlows.push(...keys.filter((k) => !known.has(k)));
+      out.info.push(`External cash flow on record: ${f.type} ${usd(f.amount, true)} ${where}.${histKey ? ' npm run perf leaves it out of returns.' : ''}`);
+      continue;
+    }
+    const earlier = histKey ? [...known].find((k) => k.startsWith(`${f.type}:${f.date}:`)) : undefined;
+    const unlisted = !c?.rebuild || rest === 0 ? '' : rest === f.amount ? " Alpaca's activity log does not list it" : ` Alpaca's activity log lists ${usd(f.amount - rest, true)} of it, not the rest`;
+    out.firstPage.push(
+      `New external cash flow: ${f.type} ${usd(f.amount, true)} ${where}` +
+        `${earlier ? ` (it read ${usd(Number(earlier.split(':')[2]), true)} when health last saw it)` : ''}. ` +
+        `The bot can't move cash, so this came from Alpaca or from you.${unlisted ? `${unlisted}${gapSentence ? `:${gapSentence}` : '.'}` : ''} ` +
+        `It pages once${histKey ? '; npm run perf leaves it out of returns' : ''}.`
+    );
+    out.newFlows.push(...keys);
+  }
+
+  if (cash < 0) {
+    const nmbp = Number(account.non_marginable_buying_power);
+    const net = moves.reduce((s, m) => s + m.f.amount, 0);
+    out.problems.push(
+      `Cash is ${usd(cash)}${Number.isFinite(nmbp) ? ` and crypto buying power is ${usd(nmbp)}` : ''}: crypto buys need cash, so the book can't open a crypto position, and Alpaca will refuse its next crypto entry.` +
+        (moves.length ? ` External cash flows since the funding total ${usd(net, true)}.` : '')
+    );
+  }
+  return out;
 }
 
 /** Fill fields that heartbeats written by older code lack. */
@@ -351,35 +519,100 @@ export function rotateLogs(maxBytes = 25 * 1024 * 1024, keep = 6): string[] {
   return rotated;
 }
 
-interface HealthState {
+export interface HealthState {
   brokerFails: number;
   /** Recent health run times (ms), newest last. */
   runs: number[];
   /** Notice keys already posted (an ALARM month, a missed crypto window day). */
   notified: string[];
+  /** External cash flows already paged on (flowKey). */
+  knownFlows: string[];
+  /** Consecutive runs on which broker cash did not reconcile. */
+  cashGaps: number;
+  /** Consecutive runs whose cash read failed in part or whole. */
+  cashFails: number;
+  /** The activity log summed through a few days ago, so a run reads only what is newer. */
+  cashLedger: CashLedger | null;
 }
 
 function healthStatePath(): string {
   return path.join(CONFIG.dataDir, 'health_state.json');
 }
 
+/** A stored ledger, or null when it is missing or unreadable (the next scheduled run reads the whole log). */
+function ledgerOf(x: unknown): CashLedger | null {
+  const l = x as Partial<CashLedger> | null;
+  if (!l || typeof l.through !== 'string' || typeof l.fullAt !== 'string' || !Array.isArray(l.external)) return null;
+  if (!Number.isFinite(Date.parse(l.through)) || !Number.isFinite(Date.parse(l.fullAt)) || !Number.isFinite(l.cash) || !Number.isFinite(l.count)) return null;
+  return l as CashLedger;
+}
+
 function readHealthState(): HealthState {
   try {
     const s = JSON.parse(fs.readFileSync(healthStatePath(), 'utf8')) as Partial<HealthState>;
-    return { brokerFails: Number(s.brokerFails) || 0, runs: Array.isArray(s.runs) ? s.runs : [], notified: Array.isArray(s.notified) ? s.notified : [] };
+    return {
+      brokerFails: Number(s.brokerFails) || 0,
+      runs: Array.isArray(s.runs) ? s.runs : [],
+      notified: Array.isArray(s.notified) ? s.notified : [],
+      knownFlows: Array.isArray(s.knownFlows) ? s.knownFlows.map(String) : [],
+      cashGaps: Number(s.cashGaps) || 0,
+      cashFails: Number(s.cashFails) || 0,
+      cashLedger: ledgerOf(s.cashLedger),
+    };
   } catch {
-    return { brokerFails: 0, runs: [], notified: [] };
+    return { brokerFails: 0, runs: [], notified: [], knownFlows: [], cashGaps: 0, cashFails: 0, cashLedger: null };
   }
 }
 
 function writeHealthState(state: HealthState): void {
   try {
     const file = healthStatePath();
-    fs.writeFileSync(`${file}.tmp`, JSON.stringify({ ...state, runs: state.runs.slice(-50), notified: state.notified.slice(-50) }));
+    fs.writeFileSync(`${file}.tmp`, JSON.stringify({ ...state, runs: state.runs.slice(-50), notified: state.notified.slice(-50), knownFlows: state.knownFlows.slice(-200) }));
     fs.renameSync(`${file}.tmp`, file);
   } catch {
     /* non-fatal */
   }
+}
+
+const firstLine = (err: unknown): string => (err instanceof Error ? err.message : String(err)).split('\n')[0];
+
+/**
+ * Five years of daily history. The reconcile needs every flow the activity
+ * log leaves out, the 2026-10-13 journal among them, for as long as the
+ * account holds the cash it moved; a one-year window would drop that journal
+ * in October 2027 and make its gap look new. On 2026-10-17 a 5A read was 80 KB.
+ */
+const CASH_HISTORY_PERIOD = '5A';
+
+/**
+ * External flows from the daily history, and cash from the activity log: GET
+ * requests only. With a ledger, only the last few days of the log are read
+ * (one or two pages); without one, once a week, or when `forceFull` asks for
+ * it, all of it (14 pages and about 2 seconds on 2026-10-17). `fullAllowed`
+ * false (the dashboard) skips the rebuild rather than read the whole log. A
+ * failed log read still returns the history's flows, so a new journal pages
+ * whatever the log does; a failed history read throws.
+ */
+export async function readCash(prior: CashLedger | null, nowMs: number, fullAllowed: boolean, forceFull = false): Promise<{ input: CashInput; ledger: CashLedger | null }> {
+  const history = getPortfolioHistory(CASH_HISTORY_PERIOD, '1D');
+  const log = (async () => {
+    if (!prior && !fullAllowed) return null;
+    const full = !prior || (fullAllowed && (forceFull || nowMs - Date.parse(prior.fullAt) > FULL_READ_MS));
+    // A day of overlap: the ledger skips what it already holds, so nothing is counted twice.
+    const after = full || !prior ? null : new Date(Date.parse(prior.through) - 86_400_000).toISOString();
+    return foldCash(full ? null : prior, await fetchAccountActivities(after), nowMs);
+  })();
+  const [h, l] = await Promise.allSettled([history, log]);
+  if (h.status === 'rejected') throw h.reason;
+  const input: CashInput = { asOfMs: nowMs, flows: externalFlows(h.value), rebuild: null };
+  if (l.status === 'rejected') return { input: { ...input, logError: firstLine(l.reason) }, ledger: null };
+  if (!l.value) return { input: { ...input, skipped: 'The cash reconcile starts after the first scheduled health run reads the whole activity log.' }, ledger: null };
+  return { input: { ...input, rebuild: l.value.rebuild }, ledger: l.value.ledger };
+}
+
+/** The dashboard's read: the scheduled run's ledger, never written back. */
+export async function readCashReadOnly(): Promise<CashInput> {
+  return (await readCash(readHealthState().cashLedger, Date.now(), false)).input;
 }
 
 /** The book's state rule (setup tag) per this checkout's launchd template, or null. */
@@ -402,9 +635,10 @@ export function expectedBookRule(templatePath = path.join('ops', 'launchd', 'com
 /**
  * Everything the health rules look at. `record` is true for the scheduled
  * check, which counts this run and the broker failure streak; the dashboard
- * reads with `record` false and changes nothing.
+ * reads with `record` false and changes nothing. `cash` replaces the cash
+ * read (the dashboard passes a cached one).
  */
-export async function gatherHealthInput(record: boolean): Promise<{ input: HealthInput; state: HealthState }> {
+export async function gatherHealthInput(record: boolean, opts: { cash?: () => Promise<CashInput> } = {}): Promise<{ input: HealthInput; state: HealthState }> {
   const state = readHealthState();
   const nowMs = Date.now();
   const input: HealthInput = {
@@ -415,8 +649,17 @@ export async function gatherHealthInput(record: boolean): Promise<{ input: Healt
     healthRunTimes: record ? [...state.runs, nowMs] : state.runs,
     bookScanRunning: runLockHolder('book') != null,
     expectedBookRule: expectedBookRule(),
+    knownFlows: state.knownFlows,
+    cashGapRuns: state.cashGaps,
   };
   if (process.env.ALPACA_PAPER_KEY_ID) {
+    // Read the cash side alongside the account, so broker cash and the activity log describe the same moment.
+    // A gap that would page is checked against a full read of the log first, in case an old activity changed.
+    const read = opts.cash ? opts.cash().then((c) => ({ input: c, ledger: null })) : readCash(state.cashLedger, nowMs, record, record && state.cashGaps >= 1);
+    const cashRead = read.then(
+      (r) => ({ ok: true as const, ...r }),
+      (err: unknown) => ({ ok: false as const, error: firstLine(err) })
+    );
     try {
       const [positions, openOrders, account] = await Promise.all([getBrokerPositions(), getOpenOrders(), getAccount()]);
       input.broker = { positions, openOrders, account };
@@ -424,6 +667,16 @@ export async function gatherHealthInput(record: boolean): Promise<{ input: Healt
     } catch (err) {
       input.brokerError = (err as Error).message;
       input.brokerFailStreak = state.brokerFails + 1;
+    }
+    const cash = await cashRead;
+    if (input.broker) {
+      input.cashFailStreak = !cash.ok || cash.input.logError ? state.cashFails + 1 : 0;
+      if (cash.ok) input.cash = cash.input;
+      else input.cashError = cash.error;
+      if (record) {
+        state.cashFails = input.cashFailStreak;
+        if (cash.ok && cash.ledger) state.cashLedger = cash.ledger;
+      }
     }
   }
   // Read the ledger after the broker snapshot, so a fill that lands in between shows as a position whose row is already there.
@@ -447,11 +700,23 @@ export function notify(title: string, message: string): boolean {
   }
 }
 
+/** The state the next run starts from: the cash-gap streak, and the flows on record. */
+export function settleState(state: HealthState, report: HealthReport, posted: boolean): HealthState {
+  // Until a page about it has posted, a new flow stays new and pages again; more keys for a flow already on record are kept either way.
+  const add = [...report.seenFlows, ...(posted ? report.newFlows : [])];
+  return {
+    ...state,
+    cashGaps: report.cashGap == null ? state.cashGaps : report.cashGap ? state.cashGaps + 1 : 0,
+    knownFlows: [...state.knownFlows, ...add.filter((k, i) => !state.knownFlows.includes(k) && add.indexOf(k) === i)],
+  };
+}
+
 /**
  * The scheduled health check. Problems post a notification naming the first
  * one, every run while they last, and the process exits 2 ("problems, already
  * notified"); if posting fails it exits 1 so the launchd job's fallback
- * notification fires. Notices (an ALARM month) are posted once each.
+ * notification fires. Notices (an ALARM month) are posted once each, and a
+ * new external cash flow is remembered once its page has been posted.
  */
 export async function runHealth(): Promise<void> {
   const { input, state } = await gatherHealthInput(true);
@@ -464,13 +729,15 @@ export async function runHealth(): Promise<void> {
     if (state.notified.includes(n.key)) continue;
     if (notify('Trading bot notice', n.text)) state.notified.push(n.key);
   }
-  writeHealthState(state);
+  let posted = true;
   if (report.problems.length === 0) {
     console.log(`Health: OK${report.warnings.length ? ` (${report.warnings.length} warning(s))` : ''}.`);
-    return;
+  } else {
+    console.log(`Health: ${report.problems.length} PROBLEM(S) — investigate.`);
+    const first = report.problems[0].slice(0, 180);
+    const more = report.problems.length > 1 ? ` (+${report.problems.length - 1} more; see data/health.log)` : '';
+    posted = notify('Trading bot alert', first + more);
+    process.exitCode = posted ? 2 : 1;
   }
-  console.log(`Health: ${report.problems.length} PROBLEM(S) — investigate.`);
-  const first = report.problems[0].slice(0, 180);
-  const more = report.problems.length > 1 ? ` (+${report.problems.length - 1} more; see data/health.log)` : '';
-  process.exitCode = notify('Trading bot alert', first + more) ? 2 : 1;
+  writeHealthState(settleState(state, report, posted));
 }

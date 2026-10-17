@@ -182,7 +182,10 @@ export interface BrokerActivity {
   qty?: string;
   price?: string;
   side?: string;
+  /** Some descriptions (CAT fees) carry the full account number: never print one. */
   description?: string;
+  /** Non-trade activities: executed, correct or canceled. */
+  status?: string;
 }
 
 /** Account activities of one type (CFEE, FILL, ...) since `afterIso`, paging by token. */
@@ -199,6 +202,26 @@ export async function fetchActivities(type: string, afterIso: string): Promise<B
     token = batch[batch.length - 1].id;
   }
   return out;
+}
+
+/**
+ * Every account activity of every type, newest first, created after
+ * `afterIso` (all of them when null). Throws instead of returning a partial
+ * list, since a cash rebuild from part of the log would be wrong.
+ */
+export async function fetchAccountActivities(afterIso: string | null, maxPages = 400): Promise<BrokerActivity[]> {
+  const out: BrokerActivity[] = [];
+  let token = '';
+  for (let page = 0; page < maxPages; page++) {
+    const batch = await request<BrokerActivity[]>(
+      'GET',
+      `/v2/account/activities?direction=desc&page_size=100${afterIso ? `&after=${encodeURIComponent(afterIso)}` : ''}${token ? `&page_token=${encodeURIComponent(token)}` : ''}`
+    );
+    out.push(...batch);
+    if (batch.length < 100) return out;
+    token = batch[batch.length - 1].id;
+  }
+  throw new Error(`The account activity log runs past ${maxPages} pages of 100; the cash rebuild needs all of it.`);
 }
 
 export interface Quote {

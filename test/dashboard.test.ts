@@ -64,7 +64,7 @@ test('health payload: expected agents first, each fresh, stale, missing or unsch
     nowMs: NOW,
     expected: EXPECTED,
     heartbeats: [manual, flip, book, legacy as unknown as ScanStats],
-    report: { problems: [], warnings: ['a warning'], info: ['a note'], notices: [] },
+    report: { problems: [], warnings: ['a warning'], info: ['a note'], notices: [], newFlows: [], seenFlows: [], cashGap: null },
     monitor: { month: '2026-09', status: 'ok', trailing12: '1.185' },
     broker: { positions: 28, openOrders: 0, equity: 105305.58 },
     brokerChecked: true,

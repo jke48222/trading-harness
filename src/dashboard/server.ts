@@ -18,7 +18,7 @@ import {
   positionMatches,
 } from '../broker/orders';
 import { reconcile } from '../broker/fills';
-import { EXPECTED_AGENTS, evaluateHealth, expectedMonitorMonth, gatherHealthInput } from '../health';
+import { EXPECTED_AGENTS, evaluateHealth, expectedMonitorMonth, gatherHealthInput, readCashReadOnly } from '../health';
 import { attributeTrips, summarizeFees } from '../report';
 import { BOOK_START_ISO, loadBrokerTruth } from '../reconcileRun';
 import type { LedgerRow } from '../types';
@@ -203,6 +203,21 @@ async function summary(): Promise<unknown> {
 }
 
 /**
+ * The cash side of /api/health: five years of daily history and the newest
+ * account activities on top of the scheduled run's ledger. It changes slowly,
+ * so the page's 30-second refresh reads it at most once a minute; health
+ * skips the cash reconcile when a book scan has run since this was read.
+ */
+const cashSide = swrCache(readCashReadOnly, { ttlMs: 60_000, retryMs: 30_000, staleWhileRevalidate: true });
+
+async function cashInput(): ReturnType<typeof readCashReadOnly> {
+  const c = await cashSide.get();
+  if (!c.value) throw new Error(c.error ?? 'The broker did not answer.');
+  // A read from before the dashboard's last order or command lacks its fills, so it may not be reconciled against cash read after them.
+  return c.at == null ? { ...c.value, rebuild: null, skipped: 'The cash reconcile waits for a fresh read after the last order.' } : c.value;
+}
+
+/**
  * Agent heartbeats, the regime monitor and (when keys are set) live broker
  * state, judged by the same rules as `npm run health`. Read-only: unlike the
  * CLI it never rotates logs.
@@ -210,7 +225,7 @@ async function summary(): Promise<unknown> {
 async function health(): Promise<HealthPayload> {
   // The same input `npm run health` builds (awake-time run history, broker
   // streak, book lock, ledger read after the broker), without recording a run.
-  const { input } = await gatherHealthInput(false);
+  const { input } = await gatherHealthInput(false, { cash: cashInput });
   const nowMs = input.nowMs;
   const brokerChecked = Boolean(process.env.ALPACA_PAPER_KEY_ID);
   return shapeHealth({
@@ -421,6 +436,7 @@ function invalidateBrokerCaches(): void {
   brokerSnapshot.invalidate();
   brokerReport.invalidate();
   equityHistory.invalidate();
+  cashSide.invalidate();
 }
 
 async function manualClose(botSymbol: string): Promise<unknown> {
