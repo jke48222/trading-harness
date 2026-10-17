@@ -29,7 +29,11 @@ Execution safety: orders go only to the hardcoded paper host. Every order settle
 - broker refusals, unconfirmed orders and failed exits;
 - positions with no open ledger entry or outside the book's universe, and bot orders resting over 10 minutes;
 - a symbol whose wanted entry failed four scans running;
-- the broker unreachable on two health checks in a row.
+- the broker unreachable on two health checks in a row;
+- cash from outside the book (a journal, deposit, withdrawal or transfer), once, on the first run that sees it in the daily history or the activity log;
+- negative cash, since crypto buys need cash;
+- broker cash that neither the activity log nor the history's cash flows account for, on two health checks in a row;
+- a cash read that fails on two health checks in a row.
 
 A regime ALARM is posted once for each month it lasts, and a day with no book scan in the crypto entry window once for that day. Everything else, including spread-guard streaks and repairs from broker fills, is a warning: it shows in `npm run health` and the dashboard but does not notify.
 
@@ -38,7 +42,7 @@ A regime ALARM is posted once for each month it lasts, and a day with no book sc
 - `npm run health` and `npm run positions`.
 - `npm run reconcile`: the ledger should agree with broker fills (the three July setup trips are reported as manual and stay as they are).
 - `npm run report`: round trips by sleeve, the gap between the model and the fills, fees.
-- `npm run perf`: the account against BTC, SPY and an equal-weight hold of the universe.
+- `npm run perf`: the account's time-weighted return, net of cash from outside the book, against BTC, SPY and an equal-weight hold of the universe.
 - `data/monitor_tsmom.csv`: regime status.
 
 ## Regime alarm (Trial 07's forward role)
@@ -50,7 +54,7 @@ A regime ALARM is posted once for each month it lasts, and a day with no book sc
 
 All of these, sustained, before a real-money conversation rests on evidence:
 
-1. **At least 4 consecutive weeks of clean operations** (the daily criteria), with every incident fixed and written up in `docs/incidents.md`. The clock restarted on 2026-10-11 after the resting-order incident and again on 2026-10-14 after the unfillable-pairs incident.
+1. **At least 4 consecutive weeks of clean operations** (the daily criteria), with every incident fixed and written up in `docs/incidents.md`. The clock restarted on 2026-10-11 after the resting-order incident and again on 2026-10-14 after the unfillable-pairs incident. The cash-journal incident of 2026-10-14 is open, and the clock restarts again the day it closes (amendment of 2026-10-17).
 2. **At least 10 completed real-fill round trips with the model-to-fill gap measured.** Met on 2026-10-11: 108 closed round trips, mean gross gap -0.09% (median -0.18%), entry fills a mean 23 bps above the signal close, exit fills a mean 12 bps above the model's exit close (`npm run report`, model v2).
 3. **No regime ALARM** at decision time.
 4. **An honest evidence review.** Every strategy is on watch (Trial 06); the only support is portfolio-level and historical (Trial 07, with a recent era that is not significant on its own). Trial 08 found that it survives this account's costs on crypto (H1 and H2 pass) and that stocks have none (H3 fails). Trial 09's vote passed on 2021-2026 data (p 0.010) and Trial 10 found no support for trend timing on asset-class ETFs. Against every configuration ever tried (68), the crypto passes would not survive a Bonferroni correction (Trial 08 at 0.075, Trial 09 at 0.69). The base rates from three research reports stand: most retail algorithmic traders lose, and at this account size costs are the dominant force.
@@ -80,3 +84,4 @@ For a real account later: a cash account (no pattern-day-trader flag; 28-day hol
   - The book's rule is baked into the installed agent, so a change to it takes `scripts/agents.sh install` and a dashboard restart. Health raises a problem when the book's heartbeat names a different rule from the checkout's agent definition.
   - To roll the rule back, remove the three `TSMOM_*` vote settings from the agent definition and the dashboard command and reinstall. Checking out an older commit would not do it: older code can't read the vote's tags and would score those rows wrong.
 - **2026-10-14:** the book opens no new positions in LDOUSDT, POLUSDT or WIFUSDT, which Alpaca's paper simulator has never filled (`docs/incidents.md`). The skip covers paper only and is revisited before any real-money period. A symbol whose entries are off now clears its missed-entry count, so health stops paging on it. The incident's pages count against the daily criteria, so the clock in gate 1 restarted on 2026-10-14. Deploying the skip takes `scripts/agents.sh install` and a dashboard restart, as for a rule change.
+- **2026-10-17:** a -$66,905.32 cash journal that the bot did not make left cash negative from 2026-10-14 (`docs/incidents.md`). Health now pages once on each flow of cash from outside the book, every run on negative cash, and on broker cash the records can't account for; `npm run perf` and the dashboard measure returns net of outside cash. The incident is open on Alpaca's side. While cash is negative, health pages every run and the book can't open crypto positions, so no day counts toward gate 1 until the incident closes, and the clock restarts that day.

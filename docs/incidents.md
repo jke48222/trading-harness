@@ -82,3 +82,49 @@ This also corrects root cause 3 of the July incident. All 35 orders that piled u
 - The skip covers paper only. Before any real-money period, check whether a live account fills these pairs; nothing here tested one.
 - Deploying it takes `scripts/agents.sh install` run from the live folder, as for a rule change, because health checks only the rule's settings against the agent definition. A running dashboard needs a restart to pick up its copy.
 - ONDO stays in the book, since its most recent order filled. If the simulator won't fill its sell, the exit will fail and health will page. If its later entries fail four scans running, health will page as it did here, and the same skip applies.
+
+## 2026-10-14, still open: a -$66,905.32 cash journal the bot did not make
+
+Found 2026-10-17 during a status check. Detection and returns net of outside cash were written the same day. The Alpaca side is open.
+
+### What happened
+
+Alpaca's records show a cash journal (JNLC) of -$66,905.32 on the paper account (number ending ZWTK), booked in the 11:00 UTC hour of 2026-10-13. It reached the live account on the morning of 2026-10-14, UTC. The book scan at 06:13 UTC still saw the account up 0.06% on the day, the status check puts the drop between about 06:40 and 11:12 UTC, and equity went from $105,677 to $38,233 between two health runs.
+
+The bot did not make it. Its only writes to Alpaca are orders (POST and DELETE on /v2/orders) and position closes (DELETE on /v2/positions), and the Trading API has no endpoint that creates a journal.
+
+Nothing noticed it for three days. Health compared positions and orders with the ledger but never looked at cash, and its one sign was a warning, which does not notify: "Crypto buying power is $0".
+
+### Evidence
+
+From GET requests on 2026-10-17:
+
+- `GET /v2/account/portfolio/history` with `cashflow_types=ALL` lists two JNLC amounts: +$100,000.00 in the 2026-07-15 daily point (the funding) and -$66,905.32 in the 2026-10-14 point. At one-hour resolution with `intraday_reporting=continuous`, the journal sits in the 2026-10-13 11:00 UTC bucket, where equity steps from $104,964.88 to $37,658.89.
+- `GET /v2/account/activities` does not list it. Of the 1,306 activities since the account opened, the only JNLC is the +$100,000 funding of 2026-07-14.
+- Cash rebuilt from those activities (the funding, 771 fills, 445 crypto fees and 89 regulatory fees) is +$50,325.06. Broker cash is -$16,595.09. The gap of $66,920.15 is the journal plus $14.83, about the 0.25% fee ($14.75) on $5,899.03 of crypto sold at 00:10 UTC that day, which the log had not posted yet.
+- In the daily history, equity went from $103,601.89 (2026-10-13 point) to $38,742.05 (2026-10-14 point). The journal is -$66,905.32 of that -$64,859.84 move, so the book itself made +$2,045.48.
+
+### Effect on the book
+
+- The daily-loss kill switch fired at 15:20 UTC on 2026-10-14, with the account down 65.54% on the day, and halted new entries for the rest of that UTC day. Exits kept running. It reset on 2026-10-15 against the lower equity.
+- Cash has been negative since, and crypto buying power is $0. Crypto buys need cash, so the book can't open a crypto position: Alpaca will refuse its next crypto entry, and health will page that as a broker refusal. Exits still work.
+- The journal took cash, not positions. At 21:10 UTC on 2026-10-17 the account held $52,644 of positions on $36,049 of equity, against about 64% of equity before the journal, so each percent the positions move is now about 1.5% on the account.
+- The record. On the old code, `npm run perf` over the history to 2026-10-17 reports a return of -63.03%, a max drawdown of -66.13%, a worst day of -62.60% on 2026-10-14, volatility of 124.48% a year and a Sharpe of -1.93, and the dashboard draws the journal as a cliff. Net of the journal, the same history gives +1.74%, -6.78% (2026-10-06 to 2026-10-15), -6.61% on 2026-10-15, 23.80% and 0.40.
+
+### Root cause
+
+Not known. The journal is Alpaca's, and nothing on this side explains it. Resolution is open: ask Alpaca support what the journal is and whether they will reverse it.
+
+### Fix
+
+- Health reads the daily history with every cash flow by type, and the activity log. A journal, deposit, withdrawal or transfer after the funding pages once, on the first run that sees it in either record; `health_state.json` keeps the flows already paged on, and the same flow showing up later in the other record is not news again. Fees, dividends and interest are the book's own results and never page.
+- Health rebuilds cash from the activity log and compares it with broker cash, counting any flow the history shows and the log leaves out. A gap over $50, plus room for crypto sell fees the log has not posted yet, warns, and pages if the next run, after reading the whole log again, finds it too. The log is otherwise read in full once a week (14 pages on 2026-10-17) and from a few days back in between.
+- Negative cash pages every run, and so does a cash read that fails twice in a row: a failed log read still leaves the history's flows to page on.
+- `npm run perf` and the dashboard measure returns time-weighted, net of cash from outside the book, so a journal is neither a gain nor a loss. A flow is taken to land at mid-day, since the daily history shows the day but not the hour. The curve's values run straight through it, and the journal is marked as an event with the book's own result that day. The 2026-09-09 outlier is still excluded; outliers are now judged net of flows, so a journal reversed the next day can't pass for a bad print. A flow of 20% of equity or more that Alpaca books a point away from the equity's step counts where the equity moved, since a day off would put two false returns of about its size in the curve.
+- A reversal (+$66,905.32) gets the same treatment: health pages once when it lands, and perf leaves it out of returns.
+- Run read-only against the account on 2026-10-17, the new check reports two problems: the -$66,905.32 JNLC, with the gap to the activity log, and negative cash.
+
+### Still open
+
+- Alpaca's answer. Until cash is positive, health pages on it every 30 minutes and the book can't open crypto positions.
+- The daily-loss kill switch, and the dashboard's daily P&L tile, measure equity against the day's start, so they can't tell a journal from a loss. The switch halted entries on 2026-10-14 on the journal alone. Neither nets flows out yet.

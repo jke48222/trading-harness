@@ -57,9 +57,9 @@ You need Node 20.6 or later. Market data for crypto is public; stock data, paper
 |---|---|
 | `npm run scan` | One decision cycle over `SYMBOLS`: score matured trades, manage exits, look for entries |
 | `npm run report` | The book from broker fills: round trips by sleeve, model against actual, fees, per symbol |
-| `npm run perf` | Account return, drawdown and volatility against BTC, SPY and an equal-weight hold of the universe |
+| `npm run perf` | Account return (time-weighted, net of cash from outside the book), drawdown and volatility against BTC, SPY and an equal-weight hold of the universe |
 | `npm run reconcile` | Rebuild round trips from broker fills and list where the ledger disagrees; `-- --apply` repairs what the fills prove |
-| `npm run health` | Agents, open orders, positions and the regime monitor; exits 2 on a problem it has posted, 1 if it could not post |
+| `npm run health` | Agents, open orders, positions, cash and the regime monitor; exits 2 on a problem it has posted, 1 if it could not post |
 | `npm run positions` | Open paper positions and budget use |
 | `npm run tsmom:monitor` | Recompute Trial 07's construction month by month and check the registered alarm |
 | `npm run dashboard` | Local console at http://127.0.0.1:8787 |
@@ -79,7 +79,7 @@ Alpaca fills ──────────────────────�
 - **Orders** ([`src/broker/orders.ts`](src/broker/orders.ts)) are priced off the venue's own quote and rounded up to Alpaca's increment. A crypto entry is skipped when the spread is over 100 bps. Every order settles, filled, partly filled or canceled after 30 seconds, and a scan sweeps anything a crash left behind.
 - **The ledger** (`ledger.csv` in `DATA_DIR`, by default `data/`) records every decision with a plain-English reason. Writes take a file lock, so two agents can't drop each other's rows.
 - **Broker truth** ([`src/broker/fills.ts`](src/broker/fills.ts)): round trips are rebuilt from Alpaca's fills, which are the record of what traded. `reconcile` compares them with the ledger.
-- **Health** reads a heartbeat from each agent and posts a macOS notification on refused or stuck orders, unattributed positions, failed exits or a silent agent. It measures silence in its own runs, so a sleeping Mac never pages, and a book agent silent across five health runs (about 2.5 awake hours) does.
+- **Health** reads a heartbeat from each agent and posts a macOS notification on refused or stuck orders, unattributed positions, failed exits or a silent agent. It measures silence in its own runs, so a sleeping Mac never pages, and a book agent silent across five health runs (about 2.5 awake hours) does. It also pages on cash from outside the book (a journal, deposit or withdrawal), on negative cash, and on broker cash the activity log can't account for.
 
 The operating rules and the gates before any real money are in [`docs/paper_phase_protocol.md`](docs/paper_phase_protocol.md).
 
@@ -88,6 +88,7 @@ The operating rules and the gates before any real money are in [`docs/paper_phas
 - **Paper fills are not real fills.** On most pairs, Alpaca's paper engine fills marketable orders at once and fills a resting limit once the market reaches it, with no queue, so it flatters passive orders. Maker-fee savings can't be judged from paper fills.
 - **Alpaca's paper engine never fills three of the book's coins.** It filled none of 42 orders on LDO, POL and WIF from July to October, market orders and limits above the ask alike, so the book takes no new entries in them and can open positions in at most 29 of its 32 coins ([incident](docs/incidents.md)). That is a fact about the paper engine; no live account was tested.
 - **The book's sizing differs from the test.** Trial 07 tested equal weights; the book scales size down for volatile coins. That is a risk control, and its effect on returns is untested.
+- **A cash journal the bot did not make left cash negative.** Alpaca's records show -$66,905.32 journaled out of the paper account on October 13, which its activity log does not list. Until it is resolved, the book can't open crypto positions; returns are measured net of it ([incident](docs/incidents.md)).
 - **Crypto was under-deployed from July 27 to October 11.** Resting orders held back cash and blocked crypto entries on 48 days ([incident write-up](docs/incidents.md)). Results from that period understate the crypto positions the strategy called for.
 - **launchd pauses while the Mac sleeps**, so the book misses scans until it wakes. Crypto entries only open in the two hours after the 00:00 UTC close, and health posts one notice a day when no scan ran in that window.
 - **Stock exits wait for the open**, and go in at the first scan after 9:30 ET, up to an hour later.
