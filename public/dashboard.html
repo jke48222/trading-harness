@@ -281,6 +281,7 @@
   .chart .mark { stroke:var(--tip-bg); stroke-width:2; }
   .chart .mark.peak { fill:var(--m-blue); } .chart .mark.trough { fill:var(--m-red); }
   .chart .excl { fill:var(--m-amber); }
+  .chart .flow { fill:var(--ink-2); } .chart .flow-rule { stroke:var(--ink-3); stroke-width:1; stroke-dasharray:3 3; shape-rendering:crispEdges; }
   .chart .xh { stroke:var(--ink-3); stroke-width:1; visibility:hidden; shape-rendering:crispEdges; }
   .chart .xh-dot { visibility:hidden; stroke:var(--tip-bg); stroke-width:2; }
   .chart .xh-dot.eq { fill:var(--m-blue); } .chart .xh-dot.dd { fill:var(--m-red); }
@@ -737,12 +738,15 @@ const ro = new ResizeObserver((entries) => { for (const e of entries) { const c 
 
 /**
  * Equity (top) and underwater drawdown (bottom) as two small multiples on one
- * time axis: never two y-scales on one plot. Excluded points are marked on the
- * time axis; the crosshair reads both panels at once.
+ * time axis: never two y-scales on one plot. The equity line is the value net
+ * of external cash flows (the broker's equity when there were none), so a
+ * journal is a marked event, not a cliff. Excluded points and cash flows are
+ * marked on the time axis; the crosshair reads both panels at once.
  */
 function drawEquityDrawdown(host, d) {
   const W = Math.max(260, Math.round(host.clientWidth)); host.__w = W;
-  const pts = d.curve.map((p, i) => ({ t: dayMs(p.date), date: p.date, eq: p.equity, dd: d.drawdown[i] ? d.drawdown[i].pct : 0 }));
+  const flows = d.flows || [];
+  const pts = d.curve.map((p, i) => ({ t: dayMs(p.date), date: p.date, eq: isNum(p.value) ? p.value : p.equity, bal: p.equity, dd: d.drawdown[i] ? d.drawdown[i].pct : 0 }));
   if (pts.length < 2) { setHTML(host, '<div class="empty">' + esc(d.emptyText || 'Not enough points to draw yet.') + '</div>'); host._model = null; return; }
   const padL = 58, padR = 12, top1 = 8, h1 = W < 520 ? 150 : 180, gap = 30, h2 = W < 520 ? 70 : 84, axisH = 24;
   const y1Top = top1, y1Bot = top1 + h1, y2Top = y1Bot + gap, y2Bot = y2Top + h2, H = y2Bot + axisH;
@@ -774,14 +778,27 @@ function drawEquityDrawdown(host, d) {
     const t = dayMs(ex.date); if (!(t >= t0 && t <= t1)) continue; const xx = x(t);
     marks += '<path class="excl" d="M' + xx.toFixed(1) + ' ' + (y2Bot + 1) + ' l5 8 h-10 z"><title>' + esc('Excluded ' + fmtDate(ex.date, true) + ': ' + ex.reason) + '</title></path>';
   }
+  const flowText = (f) => f.type + ' ' + fmtSignedUsd(f.amountUsd, 2);
+  for (const f of flows) {
+    const t = dayMs(f.countedOn || f.date); if (!(t >= t0 && t <= t1)) continue; const xx = x(t).toFixed(1);
+    marks += '<line class="flow-rule" x1="' + xx + '" x2="' + xx + '" y1="' + y1Top + '" y2="' + y2Bot + '"/>' +
+      '<path class="flow" d="M' + xx + ' ' + (y2Bot + 1) + ' l4.5 4.5 l-4.5 4.5 l-4.5 -4.5 z"><title>' + esc('Cash from outside the book, ' + fmtDate(f.date, true) + ': ' + flowText(f) + '. Left out of every return.') + '</title></path>';
+  }
   setHTML(host, '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="' + esc(d.aria) + '">' + g +
     '<polygon class="eq-area" points="' + area1 + '"/><polyline class="eq-line" points="' + line1 + '"/>' +
     '<polygon class="dd-area" points="' + area2 + '"/><polyline class="dd-line" points="' + line2 + '"/>' + marks +
     '<line class="xh" x1="0" x2="0" y1="' + y1Top + '" y2="' + y2Bot + '"/><circle class="xh-dot eq" r="4"/><circle class="xh-dot dd" r="4"/>' +
     '<rect class="hit" x="' + padL + '" y="0" width="' + plotW + '" height="' + y2Bot + '" fill="transparent"/></svg><div class="tip" role="status" aria-live="polite"></div>');
   host._model = {
-    pts: pts.map((p) => ({ x: x(p.t), y1: y1(p.eq), y2: y2(p.dd),
-      html: '<div><b>' + esc(fmtDate(p.date, true)) + '</b></div><div><span class="tk" style="background:var(--m-blue)"></span>Equity <b>' + fmtUsd(p.eq) + '</b></div><div><span class="tk" style="background:var(--m-red)"></span>Drawdown <b>' + fmtPct(p.dd) + '</b></div>' })),
+    pts: pts.map((p) => {
+      const here = flows.filter((f) => (f.countedOn || f.date) === p.date);
+      const eqLine = flows.length
+        ? '<div><span class="tk" style="background:var(--m-blue)"></span>Net of outside cash <b>' + fmtUsd(p.eq) + '</b></div><div><span class="tk" style="background:transparent"></span>Broker equity ' + fmtUsd(p.bal) + '</div>'
+        : '<div><span class="tk" style="background:var(--m-blue)"></span>Equity <b>' + fmtUsd(p.eq) + '</b></div>';
+      return { x: x(p.t), y1: y1(p.eq), y2: y2(p.dd),
+        html: '<div><b>' + esc(fmtDate(p.date, true)) + '</b></div>' + eqLine + '<div><span class="tk" style="background:var(--m-red)"></span>Drawdown <b>' + fmtPct(p.dd) + '</b></div>' +
+          here.map((f) => '<div>Outside cash ' + esc(flowText(f)) + '</div>').join('') };
+    }),
     width: W, padL,
   };
   if (!host.__bound) bindCrosshair(host);
@@ -886,7 +903,7 @@ function renderPerf(p) {
   if (p.missing) {
     empty.hidden = false;
     setHTML(empty, '<strong>No performance file yet.</strong> This panel reads <code>data/perf.json</code>, which <code>npm run perf</code> (src/perf.ts) writes once every source answers.' +
-      (p.error ? ' ' + esc(p.error) : '') + ' Until then the chart shows the broker\'s own history for the last 30 days, with no glitch filter.');
+      (p.error ? ' ' + esc(p.error) : '') + ' Until then the chart shows the broker\'s own history for the last 30 days, net of cash from outside the book, with no glitch filter.');
     setHTML($('perf-kpis'), ''); $('perf-kpis').hidden = true; $('perf-side').hidden = true; $('perf-bottom').hidden = true; $('perf-main').classList.add('solo');
     setText($('perf-range'), 'perf.json missing'); setText($('perf-meta'), '');
     setText($('perf-chart-h'), 'Equity and drawdown, last 30 days (broker history)');
@@ -899,24 +916,29 @@ function renderPerf(p) {
   setText($('perf-meta'), p.generatedAt ? 'data/perf.json, generated ' + minsText(p.ageMin) : 'data/perf.json');
   setText($('perf-chart-h'), 'Equity and drawdown since ' + fmtDate(p.bookStart, true));
   const best = e.bestDay, worst = e.worstDay;
+  const flows = e.cashFlows || [];
   setHTML($('perf-kpis'),
-    kpi('Return', fmtPct(e.returnPct), clsNum(e.returnPct), esc(fmtUsd(e.start) + ' to ' + fmtUsd(e.end))) +
+    kpi('Return', fmtPct(e.returnPct), clsNum(e.returnPct), esc(fmtUsd(e.start) + ' to ' + fmtUsd(e.end) + (flows.length ? ' · ' + fmtSignedUsd(e.netFlowsUsd) + ' outside cash, left out' : ''))) +
     kpi('Max drawdown', fmtPct(e.maxDrawdownPct), isNum(e.maxDrawdownPct) && e.maxDrawdownPct < 0 ? 'neg' : '', esc(e.maxDrawdownPeak ? 'peak ' + fmtDate(e.maxDrawdownPeak) + ', trough ' + fmtDate(e.maxDrawdownTrough) : 'no drawdown')) +
     kpi('Volatility', isNum(e.annVolPct) ? e.annVolPct.toFixed(1) + '%' : DASH, '', 'a year · Sharpe ' + (isNum(e.sharpe) ? e.sharpe.toFixed(2) : 'n/a')) +
     kpi('Best day', best ? fmtPct(best.pct) : DASH, best ? clsNum(best.pct) : '', esc(best ? fmtDate(best.date) : '') + (worst ? ' · worst ' + esc(fmtPct(worst.pct)) + ' ' + esc(fmtDate(worst.date)) : '')));
-  setHTML($('perf-legend'), '<span><span class="swatch line" style="background:var(--m-blue)"></span>account equity</span><span><span class="swatch" style="background:color-mix(in srgb,var(--m-red) 40%,transparent);border:1px solid var(--m-red)"></span>drawdown</span>' +
-    (e.excludedPoints.length ? '<span><svg width="11" height="10" aria-hidden="true"><path d="M5.5 0l5 9h-10z" style="fill:var(--m-amber)"/></svg>excluded point</span>' : ''));
+  setHTML($('perf-legend'), equityLegend(flows.length > 0, e.excludedPoints.length > 0));
+  const first = p.curve[0], last = p.curve[p.curve.length - 1];
   drawChart($('perf-chart'), {
-    curve: p.curve, drawdown: p.drawdown, excluded: e.excludedPoints, peak: e.maxDrawdownPeak, trough: e.maxDrawdownTrough,
-    aria: 'Account equity from ' + fmtUsd(e.start) + ' to ' + fmtUsd(e.end) + ' since ' + fmtDate(p.bookStart, true) + ', and drawdown from the running peak, deepest ' + fmtPct(e.maxDrawdownPct) + '.',
+    curve: p.curve, drawdown: p.drawdown, excluded: e.excludedPoints, flows, peak: e.maxDrawdownPeak, trough: e.maxDrawdownTrough,
+    aria: (flows.length && first && last
+      ? 'Account value net of ' + plural(flows.length, 'cash flow') + ' from outside the book, ' + fmtUsd(first.value) + ' to ' + fmtUsd(last.value)
+      : 'Account equity from ' + fmtUsd(e.start) + ' to ' + fmtUsd(e.end)) +
+      ' since ' + fmtDate(p.bookStart, true) + ', and drawdown from the running peak, deepest ' + fmtPct(e.maxDrawdownPct) + '.',
   }, drawEquityDrawdown);
   const ex = e.excludedPoints;
-  setHTML($('perf-excluded'), ex.length
+  setHTML($('perf-excluded'), flowList(flows, true) + (ex.length
     ? '<p class="note"><b style="color:var(--ink-2)">' + plural(ex.length, 'point') + ' excluded</b> from the curve and every statistic above:</p><ul class="note" style="margin:4px 0 0;padding-left:18px">' +
       ex.map((x) => '<li>' + esc(fmtDate(x.date, true)) + (isNum(x.equity) && x.equity > 0 ? ' at ' + esc(fmtUsd(x.equity)) : '') + ': ' + esc(x.reason) + '</li>').join('') + '</ul>'
-    : '<p class="note">No points excluded: every day in the broker history is in the curve.</p>');
-  setHTML($('perf-table'), '<table><thead><tr><th scope="col">Day</th><th scope="col">Equity</th><th scope="col">Drawdown</th></tr></thead><tbody>' +
-    p.curve.map((c, i) => '<tr><td>' + esc(fmtDate(c.date, true)) + '</td><td class="tnum">' + fmtUsd(c.equity) + '</td><td class="tnum">' + fmtPct(p.drawdown[i] ? p.drawdown[i].pct : null) + '</td></tr>').join('') + '</tbody></table>');
+    : '<p class="note">No points excluded: every day in the broker history is in the curve.</p>'));
+  setHTML($('perf-table'), '<table><thead><tr><th scope="col">Day</th><th scope="col">' + (flows.length ? 'Broker equity</th><th scope="col">Net of outside cash' : 'Equity') + '</th><th scope="col">Drawdown</th></tr></thead><tbody>' +
+    p.curve.map((c, i) => '<tr><td>' + esc(fmtDate(c.date, true)) + '</td><td class="tnum">' + fmtUsd(c.equity) + '</td>' + (flows.length ? '<td class="tnum">' + fmtUsd(c.value) + '</td>' : '') +
+      '<td class="tnum">' + fmtPct(p.drawdown[i] ? p.drawdown[i].pct : null) + '</td></tr>').join('') + '</tbody></table>');
   setHTML($('perf-bench'), renderBench(p));
   setHTML($('perf-bench-note'), 'Benchmarks stay fully invested; the book holds cash while its signals are off.' +
     (p.benchmarks.some((b) => b.note) ? '<details class="notes" style="margin-top:6px"><summary>How each benchmark is priced</summary><ul>' + p.benchmarks.filter((b) => b.note).map((b) => '<li><b style="color:var(--ink-2)">' + esc(b.name) + '.</b> ' + esc(b.note) + '</li>').join('') + '</ul></details>' : ''));
@@ -933,13 +955,31 @@ function renderPerf(p) {
     '<div><dt>Fill slippage</dt><dd>Entries ' + bpsB(x.entrySlipMeanBps) + ' vs the signal close (includes drift since the close); exits ' + bpsB(x.exitSlipMeanBps) + ' vs the model\'s exit close. Means.</dd></div>');
 }
 
+/** The chart legend: the equity line is named for what it plots, and markers appear only when the chart has them. */
+function equityLegend(hasFlows, hasExcluded) {
+  return '<span><span class="swatch line" style="background:var(--m-blue)"></span>' + (hasFlows ? 'equity net of outside cash' : 'account equity') + '</span>' +
+    '<span><span class="swatch" style="background:color-mix(in srgb,var(--m-red) 40%,transparent);border:1px solid var(--m-red)"></span>drawdown</span>' +
+    (hasExcluded ? '<span><svg width="11" height="10" aria-hidden="true"><path d="M5.5 0l5 9h-10z" style="fill:var(--m-amber)"/></svg>excluded point</span>' : '') +
+    (hasFlows ? '<span><svg width="10" height="10" aria-hidden="true"><path d="M5 0.5l4.5 4.5l-4.5 4.5l-4.5 -4.5z" style="fill:var(--ink-2)"/></svg>cash from outside the book</span>' : '');
+}
+
+/** Cash flows from outside the book (a journal, a deposit), listed under the chart. The fallback chart has no returns to speak of. */
+function flowList(flows, withReturns) {
+  if (!flows.length) return '';
+  return '<p class="note"><b style="color:var(--ink-2)">' + plural(flows.length, 'cash flow') + ' from outside the book</b>, left out of the curve\'s values' + (withReturns ? ' and every return above' : '') + ': each day\'s return leaves the flow out, so it is neither a gain nor a loss.</p>' +
+    '<ul class="note" style="margin:4px 0 8px;padding-left:18px">' +
+    flows.map((f) => '<li>' + esc(fmtDate(f.date, true)) + ': ' + esc(f.type + ' ' + fmtSignedUsd(f.amountUsd, 2)) + (f.note ? '. ' + esc(f.note) : '') + '</li>').join('') + '</ul>';
+}
+
 async function loadLiveEquity() {
   const e = await get('/api/equity');
-  const pts = (e.points || []).filter((p) => p.equity != null && p.equity > 0);
-  const curve = pts.map((p) => ({ date: new Date(p.t).toISOString().slice(0, 10), equity: p.equity }));
-  let peak = -Infinity; const drawdown = curve.map((c) => { peak = Math.max(peak, c.equity); return { date: c.date, pct: (c.equity / peak - 1) * 100 }; });
-  setHTML($('perf-legend'), '<span><span class="swatch line" style="background:var(--m-blue)"></span>account equity</span><span><span class="swatch" style="background:color-mix(in srgb,var(--m-red) 40%,transparent);border:1px solid var(--m-red)"></span>drawdown</span>');
-  drawChart($('perf-chart'), { curve, drawdown, excluded: [], aria: 'Account equity over the last ' + curve.length + ' days of broker history, and drawdown from the running peak.',
+  const pts = (e.points || []).filter((p) => isNum(p.equity) && p.equity > 0);
+  const curve = pts.map((p) => ({ date: new Date(p.t).toISOString().slice(0, 10), equity: p.equity, value: isNum(p.value) ? p.value : p.equity }));
+  let peak = -Infinity; const drawdown = curve.map((c) => { peak = Math.max(peak, c.value); return { date: c.date, pct: (c.value / peak - 1) * 100 }; });
+  const flows = e.flows || [];
+  setHTML($('perf-legend'), equityLegend(flows.length > 0, false));
+  setHTML($('perf-excluded'), flowList(flows, false));
+  drawChart($('perf-chart'), { curve, drawdown, excluded: [], flows, aria: 'Account equity' + (flows.length ? ' net of cash from outside the book' : '') + ' over the last ' + curve.length + ' days of broker history, and drawdown from the running peak.',
     emptyText: e.error ? 'Broker history unavailable: ' + e.error : 'Equity history builds over the first days of trading.' }, drawEquityDrawdown);
 }
 

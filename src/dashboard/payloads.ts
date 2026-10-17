@@ -1,6 +1,7 @@
 import type { ScanStats } from '../bot';
 import type { Finding } from '../broker/fills';
-import type { BrokerPosition } from '../broker/orders';
+import type { BrokerPosition, PortfolioHistory } from '../broker/orders';
+import { alignFlows, externalFlows, netOfFlows } from '../cashflows';
 import type { HealthReport, MonitorReading } from '../health';
 import type { TripAttribution } from '../report';
 
@@ -409,9 +410,12 @@ export interface PerfData {
     bestDay: { date: string; pct: number } | null;
     worstDay: { date: string; pct: number } | null;
     excludedPoints: { date: string; equity: number | null; reason: string }[];
+    netFlowsUsd: number | null;
+    cashFlows: CashFlowEvent[];
   };
-  curve: { date: string; equity: number }[];
-  /** Underwater curve from `curve`: % below the running peak (0 at a new high). */
+  /** `equity` is the broker's; `value` is net of external cash flows (equity itself in a perf.json written before they were). */
+  curve: { date: string; equity: number; value: number }[];
+  /** Underwater curve from the curve's values: % below the running peak (0 at a new high). */
   drawdown: { date: string; pct: number }[];
   benchmarks: { name: string; returnPct: number | null; excessPct: number | null; note: string }[];
   realized: { all: PerfRealized; crypto: PerfRealized; stocks: PerfRealized };
@@ -427,6 +431,16 @@ export interface PerfData {
 }
 
 export type PerfPayload = { missing: true; error?: string } | PerfData;
+
+/** An external cash flow, marked on the curve at the point it counts at. */
+export interface CashFlowEvent {
+  date: string;
+  countedOn: string;
+  type: string;
+  amountUsd: number | null;
+  bookPnlUsd: number | null;
+  note: string;
+}
 
 const dayMove = (x: unknown): { date: string; pct: number } | null => {
   const o = obj(x);
@@ -461,12 +475,23 @@ export function shapePerf(raw: unknown, nowMs: number): PerfPayload {
   const curve = (Array.isArray(r.curve) ? r.curve : [])
     .map(obj)
     .filter((p) => typeof p.date === 'string' && p.date !== '' && isNum(p.equity) && p.equity > 0)
-    .map((p) => ({ date: p.date as string, equity: p.equity as number }))
+    .map((p) => ({ date: p.date as string, equity: p.equity as number, value: isNum(p.value) && p.value > 0 ? p.value : (p.equity as number) }))
     .sort((a, b) => a.date.localeCompare(b.date));
   const excludedPoints = (Array.isArray(e.excludedPoints) ? e.excludedPoints : [])
     .map(obj)
     .filter((p) => typeof p.date === 'string' && p.date !== '')
     .map((p) => ({ date: p.date as string, equity: numOrNull(p.equity), reason: typeof p.reason === 'string' ? p.reason : '' }));
+  const cashFlows = (Array.isArray(e.cashFlows) ? e.cashFlows : [])
+    .map(obj)
+    .filter((f) => typeof f.date === 'string' && f.date !== '')
+    .map((f) => ({
+      date: f.date as string,
+      countedOn: strOrNull(f.countedOn) ?? (f.date as string),
+      type: typeof f.type === 'string' ? f.type : '',
+      amountUsd: numOrNull(f.amountUsd),
+      bookPnlUsd: numOrNull(f.bookPnlUsd),
+      note: typeof f.note === 'string' ? f.note : '',
+    }));
   const benchmarks = (Array.isArray(r.benchmarks) ? r.benchmarks : [])
     .map(obj)
     .filter((b) => typeof b.name === 'string' && b.name !== '')
@@ -492,9 +517,11 @@ export function shapePerf(raw: unknown, nowMs: number): PerfPayload {
       bestDay: dayMove(e.bestDay),
       worstDay: dayMove(e.worstDay),
       excludedPoints,
+      netFlowsUsd: numOrNull(e.netFlowsUsd),
+      cashFlows,
     },
     curve,
-    drawdown: underwater(curve),
+    drawdown: underwater(curve.map((p) => ({ date: p.date, equity: p.value }))),
     benchmarks,
     realized: { all: realized(rz.all), crypto: realized(rz.crypto), stocks: realized(rz.stocks) },
     unrealized: { all: numOrNull(un.all), crypto: numOrNull(un.crypto), stocks: numOrNull(un.stocks) },
@@ -506,6 +533,30 @@ export function shapePerf(raw: unknown, nowMs: number): PerfPayload {
       entrySlipMeanBps: numOrNull(ex.entrySlipMeanBps),
       exitSlipMeanBps: numOrNull(ex.exitSlipMeanBps),
     },
+  };
+}
+
+/** /api/equity: the fallback chart while perf.json is missing. */
+export interface LiveEquity {
+  points: { t: number; equity: number; value: number; plPct: number | null }[];
+  flows: { date: string; countedOn: string; type: string; amountUsd: number }[];
+}
+
+/**
+ * The broker's own daily history for the fallback chart, with no glitch
+ * filter, valued net of external cash flows like perf.json. Flows at or
+ * before its first point are that point's capital.
+ */
+export function shapeLiveEquity(h: PortfolioHistory): LiveEquity {
+  const pts = h.timestamp
+    .map((s, i) => ({ t: s * 1000, date: new Date(s * 1000).toISOString().slice(0, 10), equity: h.equity[i], plPct: h.profit_loss_pct[i] ?? null }))
+    .filter((p): p is { t: number; date: string; equity: number; plPct: number | null } => isNum(p.equity) && p.equity > 0);
+  const flows = alignFlows(pts, pts.length ? externalFlows(h).filter((f) => f.t > pts[0].t && f.t <= pts[pts.length - 1].t) : []);
+  const adj = netOfFlows(pts, flows.filter((f) => f.at != null).map((f) => ({ t: f.at as number, amount: f.amount })));
+  const dateAt = (t: number | null): string => (t == null ? '' : (pts.find((p) => p.t >= t) ?? pts[pts.length - 1]).date);
+  return {
+    points: pts.map((p, i) => ({ t: p.t, equity: p.equity, value: adj[i].value, plPct: p.plPct })),
+    flows: flows.map((f) => ({ date: f.date, countedOn: dateAt(f.at), type: f.type, amountUsd: f.amount })),
   };
 }
 

@@ -3,6 +3,7 @@ import * as path from 'node:path';
 import { CONFIG } from './config';
 import { type BrokerPosition, type PortfolioHistory, botSymbolOf, fetchActivities, getPortfolioHistory } from './broker/orders';
 import type { RoundTrip } from './broker/fills';
+import { type AlignedFlow, type CashFlow, LARGE_FLOW_SHARE, alignFlows, externalFlows, netOfFlows, periodReturn, usd } from './cashflows';
 import { BOOK_START_ISO, loadBrokerTruth } from './reconcileRun';
 import { type TripAttribution, attributeTrips, summarizeFees } from './report';
 import { loadLedger } from './memory';
@@ -25,6 +26,11 @@ import type { Candle } from './types';
  * or before the stamp, and the last US session close before it. Checked 2026-10-11: the account's daily returns
  * correlate 0.73 with BTC priced this way and 0.12 with the candle that
  * carries the stamp's date (SPY: 0.43 against -0.07).
+ *
+ * Returns are time-weighted, net of cash that entered or left the account
+ * from outside the book (src/cashflows.ts), so a journal is neither a gain
+ * nor a loss. Before 2026-10-17 the curve was raw equity, and Alpaca's
+ * -$66,905.32 journal of 2026-10-13 read as a -62.6% day (docs/incidents.md).
  *
  * perf.json is written only when every source answered, so the dashboard
  * never shows a half-built report.
@@ -63,6 +69,24 @@ export interface EquityPoint {
   t: number;
   date: string;
   equity: number;
+}
+
+export interface CurvePoint extends EquityPoint {
+  /** The start equity grown by the time-weighted return to this point: what the account would hold with no external cash flows. */
+  value: number;
+}
+
+/** An external cash flow inside the window, shown as an event on the curve. */
+export interface FlowEvent {
+  /** The history point it is booked in. */
+  date: string;
+  /** The point it counts at: its own, or the next one kept when its own is left out, or the neighbour whose equity moved with it; empty when no point can absorb it and it is not counted. */
+  countedOn: string;
+  type: string;
+  amountUsd: number;
+  /** Equity change over the period the flow fell in, less the flows: the book's own result. */
+  bookPnlUsd: number;
+  note: string;
 }
 
 export interface ExcludedPoint {
@@ -130,8 +154,12 @@ export interface PerfJson {
     bestDay: DayMove;
     worstDay: DayMove;
     excludedPoints: ExcludedPoint[];
+    /** External cash flows inside the window, net. Every return above leaves them out. */
+    netFlowsUsd: number;
+    cashFlows: FlowEvent[];
   };
-  curve: { date: string; equity: number }[];
+  /** `equity` is the broker's; `value` is the start equity grown by the time-weighted return, net of external flows. */
+  curve: { date: string; equity: number; value: number }[];
   benchmarks: Benchmark[];
   realized: Sleeves<SleeveStats>;
   unrealized: Sleeves<number>;
@@ -210,29 +238,39 @@ export function coversStart(h: PortfolioHistory, startDate = PERF_START_DATE): b
  * neighbors while the neighbors agree within `agree` (2026-09-09: 75,118.07
  * between 99,750.90 and 99,918.66). A real move that lasts two days or more
  * is kept, and so is a point whose neighbors disagree. The first and last
- * points have one neighbor and are never judged.
+ * points have one neighbor and are never judged. With `flows` (counted at
+ * their stamps), each comparison leaves out the cash that moved in between,
+ * so a journal and its reversal the next day are not a bad print, and a bad
+ * print on the day a flow lands still is.
  */
 export function findGlitches(
   points: EquityPoint[],
   deviation = GLITCH_DEVIATION,
-  agree = GLITCH_NEIGHBORS_AGREE
-): { kept: EquityPoint[]; glitches: ExcludedPoint[] } {
+  agree = GLITCH_NEIGHBORS_AGREE,
+  flows: { t: number; amount: number }[] = []
+): { kept: EquityPoint[]; glitches: (ExcludedPoint & { t: number })[] } {
   const kept: EquityPoint[] = [];
-  const glitches: ExcludedPoint[] = [];
+  const glitches: (ExcludedPoint & { t: number })[] = [];
+  const flowIn = (a: number, b: number): number => flows.filter((f) => f.t > a && f.t <= b).reduce((s, f) => s + f.amount, 0);
   points.forEach((p, i) => {
     const prev = points[i - 1];
     const next = points[i + 1];
-    if (prev && next) {
-      const vsPrev = p.equity / prev.equity - 1;
-      const vsNext = p.equity / next.equity - 1;
-      const neighbors = next.equity / prev.equity - 1;
+    const into = prev ? flowIn(prev.t, p.t) : 0;
+    const out = next ? flowIn(p.t, next.t) : 0;
+    const rOut = next ? periodReturn(p.equity, next.equity, out) : NaN;
+    if (prev && next && rOut > -1) {
+      // The point's move from the day before, its move to the day after (as the point against the next), and the two days together, each net of the flows in them.
+      const vsPrev = periodReturn(prev.equity, p.equity, into);
+      const vsNext = 1 / (1 + rOut) - 1;
+      const neighbors = periodReturn(prev.equity, next.equity, into + out);
       if (Math.abs(vsPrev) > deviation && Math.abs(vsNext) > deviation && Math.abs(neighbors) <= agree) {
         glitches.push({
+          t: p.t,
           date: p.date,
           equity: p.equity,
           reason:
             `one-day outlier: ${pct(vsPrev * 100)} vs ${prev.date} and ${pct(vsNext * 100)} vs ${next.date}, ` +
-            `which agree within ${Math.abs(neighbors * 100).toFixed(2)}%`,
+            `which agree within ${Math.abs(neighbors * 100).toFixed(2)}%${into || out ? ', net of outside cash' : ''}`,
         });
         return;
       }
@@ -261,6 +299,40 @@ export function dailyMoves(points: EquityPoint[]): DayMove[] {
 }
 
 /**
+ * The window's flows as events. Each is dated by the history point Alpaca
+ * books it in and names the point it counts at, with the book's own result
+ * over that period, so a reader can see the flow and the market move apart.
+ * A large flow that neither its own point nor a neighbour moves with is
+ * flagged: its period's return is likely wrong by about its size.
+ */
+export function flowEvents(curve: EquityPoint[], flows: AlignedFlow[]): FlowEvent[] {
+  const events: FlowEvent[] = [];
+  if (curve.length < 2) return events;
+  const first = curve[0].t;
+  const last = curve[curve.length - 1].t;
+  for (const f of flows) {
+    // A flow no point can absorb is described where Alpaca books it.
+    const at = f.at ?? f.t;
+    if (at <= first || at > last) continue;
+    const i = curve.findIndex((p) => p.t >= at);
+    const a = curve[i - 1];
+    const b = curve[i];
+    const inPeriod = flows.filter((x) => x.at != null && x.at > a.t && x.at <= b.t).reduce((s, x) => s + x.amount, 0);
+    const moved = b.equity - a.equity;
+    const own = moved - inPeriod;
+    let note = `Equity moved ${usd(moved, true)} from ${a.date} to ${b.date}; the book's own result was ${usd(own, true)}.`;
+    if (f.at == null) note += ' Not counted: the equity here and a point either side is too small to have held it, so these returns include it; check those points by hand.';
+    else if (b.date !== f.date && b.t === f.at) note += ` Alpaca books it in the ${f.date} point, but the equity moved with it at ${b.date}, so it counts there.`;
+    else if (b.date !== f.date) note += ` Booked in the ${f.date} point, which is left out, so it counts at ${b.date}.`;
+    if (f.at != null && Math.abs(f.amount) >= LARGE_FLOW_SHARE * a.equity && Math.abs(own) > 0.5 * Math.abs(f.amount)) {
+      note += ' Equity barely moved with this flow here or a point either side, so the returns around it are likely wrong by about its size; check those points by hand.';
+    }
+    events.push({ date: f.date, countedOn: f.at == null ? '' : b.date, type: f.type, amountUsd: f.amount, bookPnlUsd: own, note });
+  }
+  return events;
+}
+
+/**
  * Annualized volatility (%) and Sharpe from per-point returns (fractions):
  * rf 0, sample sd, scaled by sqrt(perYear). Sharpe is null when undefined
  * (fewer than two returns, or no variation).
@@ -273,12 +345,13 @@ export function riskStats(returns: number[], perYear = POINTS_PER_YEAR): { annVo
 
 export interface EquityStats {
   bookStart: string;
-  /** Window points used for every statistic (excluded points removed). */
-  curve: EquityPoint[];
+  /** Window points used for every statistic (excluded points removed), with their value net of external flows. */
+  curve: CurvePoint[];
   /** Window points left out, each with its reason. */
   excluded: ExcludedPoint[];
-  start: EquityPoint;
-  end: EquityPoint;
+  start: CurvePoint;
+  end: CurvePoint;
+  /** Time-weighted, net of external flows; drawdown, volatility, Sharpe and the best and worst days use the same returns. */
   returnPct: number;
   drawdown: Drawdown;
   /** Max drawdown with glitch points left in, to show what the filter changed. */
@@ -289,16 +362,20 @@ export interface EquityStats {
   worst: DayMove;
   /** Daily returns behind the volatility and Sharpe. */
   returns: number;
+  /** External cash flows inside the window. */
+  flows: FlowEvent[];
+  netFlowsUsd: number;
 }
 
 /**
- * Equity statistics for the window that starts at `startDate`. Points with no
- * usable value, points stamped after `nowMs` (a day still in progress) and
- * one-day glitches are excluded and listed. Glitches are judged on the whole
- * funded history, so the window's first point is checked against the day
- * before it.
+ * Equity statistics for the window that starts at `startDate`, net of the
+ * external cash `flows`. Points with no usable value, points stamped after
+ * `nowMs` (a day still in progress) and one-day glitches are excluded and
+ * listed. Glitches are judged on the whole funded history, so the window's
+ * first point is checked against the day before it, and on values net of
+ * flows, so a journal reversed the next day can't pass for a bad print.
  */
-export function analyzeEquity(points: HistoryPoint[], startDate: string, nowMs: number): EquityStats {
+export function analyzeEquity(points: HistoryPoint[], startDate: string, nowMs: number, flows: CashFlow[] = []): EquityStats {
   const inWindow = (p: { date: string }): boolean => p.date >= startDate;
   const excluded: ExcludedPoint[] = [];
   const usable: EquityPoint[] = [];
@@ -315,32 +392,52 @@ export function analyzeEquity(points: HistoryPoint[], startDate: string, nowMs: 
     }
     usable.push({ t: p.t, date: p.date, equity: e });
   }
-  const { kept, glitches } = findGlitches(usable);
-  excluded.push(...glitches.filter(inWindow));
+  // Flows booked on or before the start funded the book; they are its capital, not news.
+  const live = alignFlows(
+    usable.filter(inWindow),
+    flows.filter((f) => f.date > startDate)
+  );
+  const counted = live.filter((f) => f.at != null).map((f) => ({ t: f.at as number, amount: f.amount }));
+  const valued = (pts: EquityPoint[]): EquityPoint[] => netOfFlows(pts, counted).map((v, i) => ({ ...pts[i], equity: v.value }));
+  // Outliers are judged net of the flows around them. Points are told apart by stamp: an early close puts two points on one UTC date.
+  const { glitches } = findGlitches(usable, GLITCH_DEVIATION, GLITCH_NEIGHBORS_AGREE, counted);
+  const glitchStamps = new Set(glitches.map((g) => g.t));
+  excluded.push(...glitches.filter(inWindow).map((g) => ({ date: g.date, equity: g.equity, reason: g.reason })));
   excluded.sort((a, b) => a.date.localeCompare(b.date));
 
-  const curve = kept.filter(inWindow);
-  if (curve.length < 2) {
-    throw new Error(`The equity history has ${curve.length} usable point(s) since ${startDate}; at least 2 are needed.`);
+  const kept = usable.filter((p) => !glitchStamps.has(p.t) && inWindow(p));
+  if (kept.length < 2) {
+    throw new Error(`The equity history has ${kept.length} usable point(s) since ${startDate}; at least 2 are needed.`);
   }
-  const moves = dailyMoves(curve);
+  const adj = netOfFlows(kept, counted);
+  const curve: CurvePoint[] = kept.map((p, i) => ({ ...p, value: adj[i].value }));
+  const moves: DayMove[] = curve.slice(1).map((p, i) => ({ date: p.date, pct: (adj[i + 1].ret as number) * 100 }));
   const { annVolPct, sharpe } = riskStats(moves.map((m) => m.pct / 100));
   const start = curve[0];
   const end = curve[curve.length - 1];
+  const events = flowEvents(kept, live);
+  let unfilteredDrawdownPct = NaN;
+  try {
+    unfilteredDrawdownPct = maxDrawdown(valued(usable.filter(inWindow))).pct;
+  } catch {
+    // A bad print against a large flow can't be valued; the report then says nothing about it.
+  }
   return {
     bookStart: start.date,
     curve,
     excluded,
     start,
     end,
-    returnPct: (end.equity / start.equity - 1) * 100,
-    drawdown: maxDrawdown(curve),
-    unfilteredDrawdownPct: maxDrawdown(usable.filter(inWindow)).pct,
+    returnPct: (end.value / start.value - 1) * 100,
+    drawdown: maxDrawdown(curve.map((p) => ({ ...p, equity: p.value }))),
+    unfilteredDrawdownPct,
     annVolPct,
     sharpe,
     best: moves.reduce((a, b) => (b.pct > a.pct ? b : a)),
     worst: moves.reduce((a, b) => (b.pct < a.pct ? b : a)),
     returns: moves.length,
+    flows: events,
+    netFlowsUsd: events.filter((x) => x.countedOn).reduce((s, x) => s + x.amountUsd, 0),
   };
 }
 
@@ -520,8 +617,10 @@ export function buildPerfJson(p: PerfParts): PerfJson {
       bestDay: { date: e.best.date, pct: fin(e.best.pct, 4) },
       worstDay: { date: e.worst.date, pct: fin(e.worst.pct, 4) },
       excludedPoints: e.excluded.map((x) => ({ date: x.date, equity: fin(x.equity, 2), reason: x.reason })),
+      netFlowsUsd: fin(e.netFlowsUsd, 2),
+      cashFlows: e.flows.map((f) => ({ date: f.date, countedOn: f.countedOn, type: f.type, amountUsd: fin(f.amountUsd, 2), bookPnlUsd: fin(f.bookPnlUsd, 2), note: f.note })),
     },
-    curve: e.curve.map((x) => ({ date: x.date, equity: fin(x.equity, 2) })),
+    curve: e.curve.map((x) => ({ date: x.date, equity: fin(x.equity, 2), value: fin(x.value, 2) })),
     benchmarks: p.benchmarks.map((b) => ({
       name: b.name,
       returnPct: fin(b.returnPct, 4),
@@ -579,7 +678,8 @@ export function renderPerf(perf: PerfJson, ctx: RenderContext): string[] {
   note('One point per US trading day, stamped 00:00 UTC: the account after that session.');
   row('start', `${money(e.start)}  ${perf.bookStart}`);
   row('end', `${money(e.end)}  ${last ? last.date : ''}`);
-  row('return', pct(e.returnPct));
+  if (e.cashFlows.length) row('external flows', `${signedMoney(e.netFlowsUsd)} net (${e.cashFlows.length})`);
+  row('return', `${pct(e.returnPct)} time-weighted`);
   row('max drawdown', `${pct(e.maxDrawdownPct)}  peak ${e.maxDrawdownPeak}, trough ${e.maxDrawdownTrough}`);
   row('volatility', `${e.annVolPct.toFixed(2)}% a year`);
   row('Sharpe', e.sharpe == null ? 'n/a' : e.sharpe.toFixed(2));
@@ -587,17 +687,29 @@ export function renderPerf(perf: PerfJson, ctx: RenderContext): string[] {
   row('worst day', `${pct(e.worstDay.pct)}  ${e.worstDay.date}`);
   row('points', `${perf.curve.length} used, ${e.excludedPoints.length} excluded`);
   note(
+    'Every return is time-weighted: each day leaves out cash that entered or left the account from outside ' +
+      'the book, so a deposit, withdrawal or journal is neither a gain nor a loss. A flow is taken to land ' +
+      'at mid-day, since the history shows the day but not the hour.'
+  );
+  note(
     `Sharpe: rf 0, mean over sample sd of the daily returns, times sqrt(${POINTS_PER_YEAR}). ` +
       `Volatility uses the same scaling. A year of this history holds about ${POINTS_PER_YEAR} points, ` +
       'not 365: crypto moves over a weekend land on the next trading day.'
   );
+  if (e.cashFlows.length) {
+    out.push('  External cash flows, left out of every return:');
+    for (const f of e.cashFlows) {
+      out.push(`    ${f.date}  ${f.type}  ${signedMoney(f.amountUsd)}`);
+      note(f.note, '      ');
+    }
+  }
   if (e.excludedPoints.length) {
     out.push('  Excluded from every statistic and the curve:');
     for (const x of e.excludedPoints) {
       out.push(`    ${x.date}  ${money(x.equity)}`);
       note(x.reason, '      ');
     }
-    if (ctx.unfilteredDrawdownPct !== e.maxDrawdownPct) {
+    if (Number.isFinite(ctx.unfilteredDrawdownPct) && ctx.unfilteredDrawdownPct !== e.maxDrawdownPct) {
       note(`With the outliers left in, the max drawdown would read ${pct(ctx.unfilteredDrawdownPct)}.`);
     }
   }
@@ -728,7 +840,8 @@ function writeJsonAtomic(file: string, data: unknown): void {
 /** `npm run perf`: print the account report and write data/perf.json. GET requests only. */
 export async function runPerf(): Promise<void> {
   const nowMs = Date.now();
-  const equity = analyzeEquity(historyPoints(await fetchBookHistory()), PERF_START_DATE, nowMs);
+  const history = await fetchBookHistory();
+  const equity = analyzeEquity(historyPoints(history), PERF_START_DATE, nowMs, externalFlows(history));
   const truth = await loadBrokerTruth();
   const fees = summarizeFees(await fetchActivities('CFEE', BOOK_START_ISO));
   const execution = executionStats(attributeTrips(truth.trips, loadLedger(), CONFIG.feeBps));
@@ -769,7 +882,7 @@ export async function runPerf(): Promise<void> {
   writeJsonAtomic(out, perf);
   console.log(
     renderPerf(perf, {
-      unfilteredDrawdownPct: fin(equity.unfilteredDrawdownPct, 4),
+      unfilteredDrawdownPct: Number.isFinite(equity.unfilteredDrawdownPct) ? fin(equity.unfilteredDrawdownPct, 4) : NaN,
       entrySlipTrips: execution.entrySlipTrips,
       exitSlipTrips: execution.exitSlipTrips,
       openPositions: truth.positions.length,

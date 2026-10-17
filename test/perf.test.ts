@@ -20,6 +20,8 @@ const perf = await import('../src/perf.ts');
 const DAY = 86_400_000;
 const at = (date: string): number => Date.parse(`${date}T00:00:00Z`);
 const pt = (date: string, equity: number) => ({ t: at(date), date, equity });
+/** A day's return net of a flow taken at mid-day (src/cashflows.ts periodReturn). */
+const dietz = (start: number, end: number, flow: number): number => (end - start - flow) / (start + flow / 2);
 const near = (actual: number | null, expected: number, eps = 1e-9): void => {
   assert.ok(actual != null && Math.abs(actual - expected) < eps, `expected ${expected}, got ${actual}`);
 };
@@ -258,11 +260,13 @@ test('perf.json has exactly the published shape, plain numbers, and a curve with
   assert.deepEqual(Object.keys(parsed), ['generatedAt', 'bookStart', 'equity', 'curve', 'benchmarks', 'realized', 'unrealized', 'fees', 'execution']);
   assert.deepEqual(Object.keys(parsed.equity), [
     'start', 'end', 'returnPct', 'maxDrawdownPct', 'maxDrawdownPeak', 'maxDrawdownTrough',
-    'annVolPct', 'sharpe', 'bestDay', 'worstDay', 'excludedPoints',
+    'annVolPct', 'sharpe', 'bestDay', 'worstDay', 'excludedPoints', 'netFlowsUsd', 'cashFlows',
   ]);
   assert.deepEqual(Object.keys(parsed.equity.bestDay), ['date', 'pct']);
   assert.deepEqual(Object.keys(parsed.equity.excludedPoints[0]), ['date', 'equity', 'reason']);
-  assert.deepEqual(Object.keys(parsed.curve[0]), ['date', 'equity']);
+  assert.deepEqual(Object.keys(parsed.curve[0]), ['date', 'equity', 'value']);
+  assert.deepEqual([parsed.equity.netFlowsUsd, parsed.equity.cashFlows], [0, []], 'no flow in this window');
+  assert.ok(parsed.curve.every((c) => c.value === c.equity), 'with no flows, the value is the equity');
   assert.deepEqual(Object.keys(parsed.benchmarks[0]), ['name', 'returnPct', 'excessPct', 'note']);
   for (const k of ['all', 'crypto', 'stocks'] as const) assert.deepEqual(Object.keys(parsed.realized[k]), ['trips', 'winRatePct', 'meanGrossPct', 'cashPnlUsd']);
   assert.deepEqual(Object.keys(parsed.unrealized), ['all', 'crypto', 'stocks']);
@@ -295,4 +299,174 @@ test('perf.json has exactly the published shape, plain numbers, and a curve with
   assert.ok(text.some((l) => l.includes('sqrt(252)')), 'the Sharpe convention is stated');
   assert.ok(text.some((l) => l.includes('-25.42%')), 'what the excluded point would have done is stated');
   assert.ok(text.join(' ').includes('leaves out $49.46 of buy fees taken in coin'), 'the unrealized caveat is stated');
+});
+
+// ---- external cash flows (docs/incidents.md: Alpaca journaled -$66,905.32 out on 2026-10-13) ----
+
+const funding = { t: at('2026-07-15'), date: '2026-07-15', type: 'JNLC', amount: 100000 };
+const journal = { t: at('2026-10-14'), date: '2026-10-14', type: 'JNLC', amount: -66905.32 };
+/** The real history through 2026-10-17, read with cashflow_types=ALL: the journal sits in the 2026-10-14 point. */
+const WITH_JOURNAL: [string, number | null][] = [
+  ...REAL.slice(0, -1),
+  ['2026-10-13', 103601.89],
+  ['2026-10-14', 38742.05],
+  ['2026-10-15', 36180.12],
+  ['2026-10-16', 37955.56],
+  ['2026-10-17', 36969.47],
+];
+const NOW_17 = Date.parse('2026-10-17T21:00:00Z');
+
+test('analyzeEquity nets the journal out: no -62.6% day, the event is listed, the 2026-09-09 outlier still goes', () => {
+  const s = perf.analyzeEquity(perf.historyPoints(history(WITH_JOURNAL)), perf.PERF_START_DATE, NOW_17, [funding, journal]);
+  // Raw equity fell from $100,000 to $36,969.47. Net of the journal the book is up 1.74%.
+  const NET_RETURN = ((103601.89 * (1 + dietz(103601.89, 38742.05, -66905.32)) * 36969.47) / 38742.05 / 100000 - 1) * 100;
+  near(s.returnPct, NET_RETURN, 1e-9);
+  assert.equal(s.start.equity, 100000);
+  assert.equal(s.end.equity, 36969.47);
+  const day = s.curve.find((p) => p.date === '2026-10-14');
+  assert.deepEqual([day?.equity, Number(day?.value.toFixed(2))], [38742.05, 106622.82]);
+  near(s.worst.pct, (36180.12 / 38742.05 - 1) * 100, 1e-9);
+  assert.equal(s.worst.date, '2026-10-15', 'the worst day is a market day, not the journal');
+  assert.ok(!s.curve.some((p, i) => i > 0 && p.value / s.curve[i - 1].value - 1 < -0.1), 'no -10% step anywhere in the values');
+  assert.deepEqual([s.drawdown.peak, s.drawdown.trough], ['2026-10-14', '2026-10-15']);
+  near(s.drawdown.pct, (36180.12 / 38742.05 - 1) * 100, 1e-9);
+  assert.deepEqual(s.excluded.map((x) => x.date), ['2026-08-01', '2026-09-09'], 'the one-day outlier is still left out');
+  assert.equal(s.excluded[1].equity, 75118.07, 'an excluded point lists its broker equity');
+  assert.equal(s.netFlowsUsd, -66905.32, 'the funding is the start, not a flow');
+  assert.deepEqual(s.flows.map((f) => [f.date, f.countedOn, f.type, f.amountUsd, Number(f.bookPnlUsd.toFixed(2))]), [['2026-10-14', '2026-10-14', 'JNLC', -66905.32, 2045.48]]);
+  near(s.unfilteredDrawdownPct, -25.4192692489154, 1e-9);
+  assert.match(s.flows[0].note, /^Equity moved -\$64,859\.84 from 2026-10-13 to 2026-10-14; the book's own result was \+\$2,045\.48\.$/);
+});
+
+test('a journal reversed the next day is two events, never a one-day outlier', () => {
+  const rows: [string, number | null][] = [['2026-07-15', 100000], ['2026-10-13', 103601.89], ['2026-10-14', 38742.05], ['2026-10-15', 105000], ['2026-10-16', 105500]];
+  const reversal = { t: at('2026-10-15'), date: '2026-10-15', type: 'JNLC', amount: 66905.32 };
+  const s = perf.analyzeEquity(perf.historyPoints(history(rows)), perf.PERF_START_DATE, NOW_17, [journal, reversal]);
+  assert.deepEqual(s.excluded, []);
+  assert.deepEqual(s.flows.map((f) => f.amountUsd), [-66905.32, 66905.32]);
+  near(s.curve[3].value / s.curve[2].value - 1, dietz(38742.05, 105000, 66905.32), 1e-12);
+  near(s.netFlowsUsd, 0, 1e-9);
+  // Without the flows, the raw dip would pass for a bad print and vanish from the record.
+  const blind = perf.analyzeEquity(perf.historyPoints(history(rows)), perf.PERF_START_DATE, NOW_17);
+  assert.deepEqual(blind.excluded.map((x) => x.date), ['2026-10-14']);
+});
+
+test('a journal booked a point early, or a reversal booked a point late, counts where the equity steps', () => {
+  const early = perf.analyzeEquity(perf.historyPoints(history(WITH_JOURNAL)), perf.PERF_START_DATE, NOW_17, [funding, { ...journal, t: at('2026-10-13'), date: '2026-10-13' }]);
+  near(early.returnPct, ((103601.89 * (1 + dietz(103601.89, 38742.05, -66905.32)) * 36969.47) / 38742.05 / 100000 - 1) * 100, 1e-9);
+  assert.deepEqual([early.flows[0].date, early.flows[0].countedOn], ['2026-10-13', '2026-10-14']);
+  assert.match(early.flows[0].note, /Alpaca books it in the 2026-10-13 point, but the equity moved with it at 2026-10-14, so it counts there\./);
+  // Alpaca hands the money back, and books it the day after equity shows it.
+  const rows: [string, number | null][] = [...WITH_JOURNAL, ['2026-10-20', 36969.47 * 1.01 + 66905.32], ['2026-10-21', (36969.47 * 1.01 + 66905.32) * 1.002]];
+  const reversal = { t: at('2026-10-21'), date: '2026-10-21', type: 'JNLC', amount: 66905.32 };
+  const late = perf.analyzeEquity(perf.historyPoints(history(rows)), perf.PERF_START_DATE, Date.parse('2026-10-21T12:00:00Z'), [funding, journal, reversal]);
+  assert.deepEqual(late.flows.map((f) => f.countedOn), ['2026-10-14', '2026-10-20']);
+  assert.deepEqual([late.best.date, Number(late.best.pct.toFixed(2))], ['2026-10-10', 5.39], 'not a +180% day on the reversal');
+  const booked = perf.analyzeEquity(perf.historyPoints(history(rows)), perf.PERF_START_DATE, Date.parse('2026-10-21T12:00:00Z'), [funding, journal, { ...reversal, t: at('2026-10-20'), date: '2026-10-20' }]);
+  near(late.annVolPct, booked.annVolPct, 1e-9);
+  near(late.returnPct, booked.returnPct, 1e-9);
+  near(late.curve[late.curve.length - 1].value / late.curve[late.curve.length - 3].value - 1, (1 + dietz(36969.47, 36969.47 * 1.01 + 66905.32, 66905.32)) * 1.002 - 1, 1e-12);
+});
+
+test('a bad print on the day a flow counts, or next to it, is still left out as an outlier', () => {
+  // The reversal books on 2026-10-20 where equity steps, but that day prints $78,000 instead of about $104,000.
+  const reversal = { t: at('2026-10-20'), date: '2026-10-20', type: 'JNLC', amount: 66905.32 };
+  const rows: [string, number | null][] = [...WITH_JOURNAL, ['2026-10-20', 78000], ['2026-10-21', 104200]];
+  const s = perf.analyzeEquity(perf.historyPoints(history(rows)), perf.PERF_START_DATE, Date.parse('2026-10-21T12:00:00Z'), [funding, journal, reversal]);
+  assert.deepEqual(s.excluded.map((x) => [x.date, x.equity]), [['2026-08-01', 0], ['2026-09-09', 75118.07], ['2026-10-20', 78000]]);
+  assert.match(s.excluded[2].reason, /one-day outlier: .*, net of outside cash$/);
+  assert.deepEqual(s.flows.map((f) => f.countedOn), ['2026-10-14', '2026-10-21'], 'the reversal counts at the next good point');
+  near(s.curve[s.curve.length - 1].value / s.curve[s.curve.length - 2].value - 1, dietz(36969.47, 104200, 66905.32), 1e-12);
+  // A $30,000 print the day before a -$60,000 journal: the print goes, and the journal stays where the equity stepped.
+  const before: [string, number | null][] = [['2026-07-15', 100000], ['2026-10-12', 100000], ['2026-10-13', 30000], ['2026-10-14', 40000], ['2026-10-15', 40000]];
+  const b = perf.analyzeEquity(perf.historyPoints(history(before)), perf.PERF_START_DATE, NOW_17, [{ t: at('2026-10-14'), date: '2026-10-14', type: 'JNLC', amount: -60000 }]);
+  assert.deepEqual(b.excluded.map((x) => x.date), ['2026-10-13']);
+  assert.deepEqual(b.flows.map((f) => f.countedOn), ['2026-10-14']);
+  near(b.returnPct, 0, 1e-9);
+});
+
+test('perf never stops on a flow the equity cannot hold: it moves it to the step, counts a step from a day in progress, or leaves it uncounted and says so', async () => {
+  const reversal = (date: string) => ({ t: at(date), date, type: 'JNLC', amount: 66905.32 });
+  // Booked a point before the equity steps, and the restored book then fell 12%: moved to the step all the same.
+  const fell: [string, number | null][] = [...WITH_JOURNAL, ['2026-10-20', 36969.47], ['2026-10-21', (36969.47 + 66905.32) * 0.88]];
+  const moved = perf.analyzeEquity(perf.historyPoints(history(fell)), perf.PERF_START_DATE, Date.parse('2026-10-21T12:00:00Z'), [funding, journal, reversal('2026-10-20')]);
+  assert.deepEqual(moved.flows.map((f) => f.countedOn), ['2026-10-14', '2026-10-21']);
+  // Taken at mid-day, half the reversal counts as there for the day's fall: -17.70%, between -12% (there all day) and -33.72% (there at the close).
+  near(moved.worst.pct, dietz(36969.47, (36969.47 + 66905.32) * 0.88, 66905.32) * 100, 1e-9);
+  // Booked in a day still in progress while the last finished point already stepped: it counts at that point today, not as a +181% day.
+  const stepped: [string, number | null][] = [...WITH_JOURNAL, ['2026-10-20', 36969.47 * 1.01 + 66905.32], ['2026-10-21', 104000]];
+  const today = perf.analyzeEquity(perf.historyPoints(history(stepped)), perf.PERF_START_DATE, Date.parse('2026-10-20T12:00:00Z'), [funding, journal, reversal('2026-10-21')]);
+  assert.deepEqual(today.flows.map((f) => f.countedOn), ['2026-10-14', '2026-10-20']);
+  near(today.curve[today.curve.length - 1].value / today.curve[today.curve.length - 2].value - 1, dietz(36969.47, 36969.47 * 1.01 + 66905.32, 66905.32), 1e-12);
+  // No point near it could have held it: left uncounted and flagged, and the report is still written.
+  const flat: [string, number | null][] = [['2026-07-15', 100000], ['2026-10-13', 36969.47], ['2026-10-14', 30000], ['2026-10-15', 29000], ['2026-10-16', 29500]];
+  const uncounted = perf.analyzeEquity(perf.historyPoints(history(flat)), perf.PERF_START_DATE, NOW_17, [{ ...reversal('2026-10-14'), amount: 100000 }]);
+  assert.deepEqual([uncounted.flows[0].countedOn, uncounted.netFlowsUsd], ['', 0]);
+  assert.match(uncounted.flows[0].note, /Not counted: the equity here and a point either side is too small to have held it/);
+  // The 30-day fallback chart has no outlier filter; a bad print on the reversal day can't stop it either.
+  const live = (await import('../src/dashboard/payloads.ts')).shapeLiveEquity;
+  const bad = live({ timestamp: ['2026-10-19', '2026-10-20', '2026-10-21'].map((d) => at(d) / 1000), equity: [36969.47, 30000, 104000], profit_loss_pct: [0, 0, 0], cashflow: { JNLC: [0, 66905.32, 0] } });
+  assert.equal(bad.points.length, 3);
+});
+
+test('a large flow that no point moves with stays where it is booked, and is flagged', () => {
+  const rows: [string, number | null][] = [['2026-07-15', 100000], ['2026-10-13', 103601.89], ['2026-10-14', 103000], ['2026-10-15', 103500], ['2026-10-16', 103200]];
+  const s = perf.analyzeEquity(perf.historyPoints(history(rows)), perf.PERF_START_DATE, NOW_17, [journal]);
+  assert.equal(s.flows[0].countedOn, '2026-10-14');
+  assert.match(s.flows[0].note, /Equity barely moved with this flow here or a point either side/);
+});
+
+test('a flow booked on a point left out counts at the next point kept, and only flows in the curve are counted', () => {
+  const deposit = { t: at('2026-09-09'), date: '2026-09-09', type: 'CSD', amount: 1000 };
+  const pending = { t: at('2026-10-13'), date: '2026-10-13', type: 'CSW', amount: -500 };
+  const s = perf.analyzeEquity(perf.historyPoints(history(REAL)), perf.PERF_START_DATE, NOW, [deposit, pending]);
+  assert.ok(s.excluded.some((x) => x.date === '2026-09-09'), 'the bad print is still left out');
+  assert.deepEqual(s.flows.map((f) => [f.date, f.countedOn]), [['2026-09-09', '2026-09-10']]);
+  assert.match(s.flows[0].note, /Booked in the 2026-09-09 point, which is left out, so it counts at 2026-09-10\./);
+  assert.equal(s.netFlowsUsd, 1000, 'the withdrawal in the day still in progress waits for the next run');
+  const d = perf.dailyMoves(s.curve.map((p) => ({ ...p, equity: p.value }))).find((m) => m.date === '2026-09-10');
+  near(d?.pct ?? NaN, dietz(99750.9, 99918.66, 1000) * 100, 1e-9);
+});
+
+test('two flows in one period share the book\'s own result for it', () => {
+  const s = perf.analyzeEquity(perf.historyPoints(history(REAL)), perf.PERF_START_DATE, NOW, [
+    { t: at('2026-10-10'), date: '2026-10-10', type: 'CSD', amount: 500 },
+    { t: at('2026-10-10'), date: '2026-10-10', type: 'JNLC', amount: -200 },
+  ]);
+  assert.deepEqual(s.flows.map((f) => Number(f.bookPnlUsd.toFixed(2))), [5086.92, 5086.92]);
+  assert.equal(s.netFlowsUsd, 300);
+});
+
+test('an early close puts two points on one UTC date; a glitch on one leaves the other', () => {
+  const stamps = ['2026-12-22T01:00:00Z', '2026-12-23T01:00:00Z', '2026-12-24T01:00:00Z', '2026-12-24T22:00:00Z', '2026-12-26T01:00:00Z'];
+  const h: PortfolioHistory = { timestamp: stamps.map((x) => Date.parse(x) / 1000), equity: [100000, 100500, 80000, 101000, 101200], profit_loss_pct: stamps.map(() => 0) };
+  const s = perf.analyzeEquity(perf.historyPoints(h), '2026-12-22', Date.parse('2026-12-27T00:00:00Z'));
+  assert.deepEqual(s.excluded.map((x) => [x.date, x.equity]), [['2026-12-24', 80000]]);
+  assert.deepEqual(s.curve.map((p) => p.equity), [100000, 100500, 101000, 101200], 'the early close stays in the curve');
+});
+
+test('perf.json and the report carry the flow, and the report says how returns are measured', () => {
+  const equity = perf.analyzeEquity(perf.historyPoints(history(WITH_JOURNAL)), perf.PERF_START_DATE, NOW_17, [funding, journal]);
+  const json = perf.buildPerfJson({
+    generatedAt: '2026-10-17T21:00:00.000Z',
+    equity,
+    benchmarks: [{ name: 'BTC buy-and-hold', returnPct: 25.48, note: 'n' }],
+    realized: perf.sleeveStats([]),
+    unrealized: { all: 0, crypto: 0, stocks: 0 },
+    fees: { usd: 0, inCoin: 0 },
+    execution: perf.executionStats([]),
+  });
+  assert.deepEqual(Object.keys(json.equity.cashFlows[0]), ['date', 'countedOn', 'type', 'amountUsd', 'bookPnlUsd', 'note']);
+  assert.deepEqual({ ...json.equity.cashFlows[0], note: '' }, { date: '2026-10-14', countedOn: '2026-10-14', type: 'JNLC', amountUsd: -66905.32, bookPnlUsd: 2045.48, note: '' });
+  assert.equal(json.equity.netFlowsUsd, -66905.32);
+  assert.equal(json.equity.returnPct, 1.7445);
+  assert.deepEqual(json.curve.find((c) => c.date === '2026-10-14'), { date: '2026-10-14', equity: 38742.05, value: 106622.82 });
+  const text = perf.renderPerf(json, { unfilteredDrawdownPct: -25.4193, entrySlipTrips: 0, exitSlipTrips: 0, openPositions: 28, openCoinFeesUsd: 0, outPath: 'data/perf.json' });
+  assert.deepEqual(text.filter((l) => l.length > 72), [], 'short lines');
+  assert.ok(!text.join('\n').includes('\u2014'), 'no em dashes');
+  const all = text.join('\n');
+  assert.match(all, /external flows +-\$66,905\.32 net \(1\)/);
+  assert.match(all, /return +\+1\.74% time-weighted/);
+  assert.match(all, /2026-10-14 {2}JNLC {2}-\$66,905\.32/);
+  assert.match(text.join(' '), /a deposit, withdrawal or\s+journal is neither a gain nor a loss/);
 });

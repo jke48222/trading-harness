@@ -36,6 +36,7 @@ import {
   isRetiredScannerRow,
   opsGate,
   shapeHealth,
+  shapeLiveEquity,
   shapePerf,
   shapeReport,
   swrCache,
@@ -265,16 +266,7 @@ async function report(): Promise<{ code: number; body: unknown }> {
   return { code: 200, body: { ...c.value, cache: { ttlSec: REPORT_TTL_MS / 1000, refreshing: c.refreshing, refreshError: c.error } } };
 }
 
-const equityHistory = swrCache(
-  async () => {
-    const h = await getPortfolioHistory('1M', '1D');
-    const points = h.timestamp
-      .map((t, i) => ({ t: t * 1000, equity: h.equity[i], plPct: h.profit_loss_pct[i] }))
-      .filter((p) => p.equity != null);
-    return { points };
-  },
-  { ttlMs: 60_000, retryMs: 30_000, staleWhileRevalidate: true }
-);
+const equityHistory = swrCache(async () => shapeLiveEquity(await getPortfolioHistory('1M', '1D')), { ttlMs: 60_000, retryMs: 30_000, staleWhileRevalidate: true });
 
 async function equityCurve(): Promise<unknown> {
   const c = await equityHistory.get();

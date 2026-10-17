@@ -270,6 +270,64 @@ test('perf payload: normalizes the published shape and derives the underwater cu
   assert.deepEqual(perf.execution, { tripsWithModel: null, gapMeanPct: null, gapMedianPct: null, entrySlipMeanBps: null, exitSlipMeanBps: null }, 'a section the writer left out reads as nulls');
 });
 
+test('perf payload: the curve is valued net of cash flows, drawdown follows the values, and an older perf.json still reads', () => {
+  const at = (d: string): number => Date.parse(`${d}T00:00:00Z`);
+  const perf = P.shapePerf(
+    {
+      generatedAt: iso(NOW),
+      bookStart: '2026-07-15',
+      equity: {
+        start: 100000, end: 36969.47, returnPct: 0.8136, netFlowsUsd: -66905.32,
+        cashFlows: [
+          { date: '2026-10-14', type: 'JNLC', amountUsd: -66905.32, bookPnlUsd: 2045.48, note: 'Equity moved -$64,859.84.' },
+          { date: '2026-09-09', countedOn: '2026-09-10', type: 'CSD', amountUsd: 1000, bookPnlUsd: 167.76, note: 'Booked in the 2026-09-09 point, which is left out.' },
+          { type: 'JNLC' },
+        ],
+      },
+      curve: [
+        { date: '2026-10-13', equity: 103601.89, value: 103601.89 },
+        { date: '2026-10-14', equity: 38742.05, value: 105647.37 },
+        { date: '2026-10-15', equity: 36180.12, value: 98661.13 },
+      ],
+    },
+    NOW
+  );
+  assert.equal(perf.missing, false);
+  if (perf.missing) return;
+  assert.deepEqual(perf.curve.map((c) => c.value), [103601.89, 105647.37, 98661.13]);
+  assert.deepEqual(perf.drawdown.map((d) => Number(d.pct.toFixed(4))), [0, 0, -6.6128], 'from the values: no -62.6% cliff');
+  assert.equal(perf.equity.netFlowsUsd, -66905.32);
+  assert.deepEqual(perf.equity.cashFlows, [
+    { date: '2026-10-14', countedOn: '2026-10-14', type: 'JNLC', amountUsd: -66905.32, bookPnlUsd: 2045.48, note: 'Equity moved -$64,859.84.' },
+    { date: '2026-09-09', countedOn: '2026-09-10', type: 'CSD', amountUsd: 1000, bookPnlUsd: 167.76, note: 'Booked in the 2026-09-09 point, which is left out.' },
+  ], 'a flow with no countedOn (an older perf.json) counts on its own date');
+  // A perf.json written before flows were netted has no value: the equity stands in, and no flows are listed.
+  const old = P.shapePerf({ curve: [{ date: '2026-10-13', equity: 103601.89 }] }, NOW);
+  assert.ok(!old.missing && old.curve[0].value === 103601.89 && old.equity.cashFlows.length === 0 && old.equity.netFlowsUsd === null);
+
+  // The 30-day fallback chart: the broker's own history, valued the same way.
+  const live = P.shapeLiveEquity({
+    timestamp: ['2026-10-13', '2026-10-14', '2026-10-15'].map((d) => at(d) / 1000),
+    equity: [103601.89, 38742.05, 36180.12],
+    profit_loss_pct: [0, -0.626, -0.0661],
+    cashflow: { JNLC: [0, -66905.32, 0], CFEE: [-9.77, -12.53, 0] },
+  });
+  assert.deepEqual(live.flows, [{ date: '2026-10-14', countedOn: '2026-10-14', type: 'JNLC', amountUsd: -66905.32 }]);
+  // Booked a point early, it counts where the equity steps, as in perf.json.
+  const early = P.shapeLiveEquity({
+    timestamp: ['2026-10-13', '2026-10-14', '2026-10-15'].map((d) => at(d) / 1000),
+    equity: [103601.89, 103000, 36500],
+    profit_loss_pct: [0, 0, 0],
+    cashflow: { JNLC: [0, -66905.32, 0] },
+  });
+  assert.deepEqual(early.flows.map((f) => [f.date, f.countedOn]), [['2026-10-14', '2026-10-15']]);
+  assert.ok(early.points.every((p, i) => i === 0 || Math.abs(p.value / early.points[i - 1].value - 1) < 0.05), 'no false step in the values');
+  assert.deepEqual(live.points.map((p) => Number(p.value.toFixed(2))), [103601.89, 106622.82, 99572.07]);
+  assert.deepEqual(live.points.map((p) => p.equity), [103601.89, 38742.05, 36180.12], 'broker equity rides along for the tooltip');
+  const before = P.shapeLiveEquity({ timestamp: [at('2026-10-14') / 1000, at('2026-10-15') / 1000], equity: [38742.05, 36180.12], profit_loss_pct: [0, 0], cashflow: { JNLC: [-66905.32, 0] } });
+  assert.deepEqual(before.flows, [], 'a flow at the first point is its capital');
+});
+
 test('underwater: percent below the running peak', () => {
   const dd = P.underwater([
     { date: 'a', equity: 100 },

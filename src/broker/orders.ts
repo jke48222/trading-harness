@@ -130,11 +130,13 @@ export interface PortfolioHistory {
   timestamp: number[];
   equity: (number | null)[];
   profit_loss_pct: (number | null)[];
+  /** USD booked in each point's window, per activity type (src/cashflows.ts). */
+  cashflow?: Record<string, (number | null)[]>;
 }
 
-/** Real equity curve from the paper account (Alpaca portfolio history). */
+/** Real equity curve from the paper account (Alpaca portfolio history), with every cash flow by type. */
 export async function getPortfolioHistory(period = '1M', timeframe = '1D'): Promise<PortfolioHistory> {
-  return request<PortfolioHistory>('GET', `/v2/account/portfolio/history?period=${period}&timeframe=${timeframe}&extended_hours=true`);
+  return request<PortfolioHistory>('GET', `/v2/account/portfolio/history?period=${period}&timeframe=${timeframe}&extended_hours=true&cashflow_types=ALL`);
 }
 
 export async function getOrder(id: string): Promise<BrokerOrder> {
