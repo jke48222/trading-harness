@@ -346,11 +346,10 @@ export interface Gate {
 
 /**
  * When gate 1's four-week clock last started. docs/paper_phase_protocol.md:
- * it restarted on 2026-10-14 after the unfillable-pairs incident, and it
- * restarts again the day the cash-journal incident closes
+ * it restarted on 2026-10-23, the day the cash-journal incident closed
  * (docs/incidents.md). Move it whenever an incident restarts the clock.
  */
-export const OPS_CLOCK_START = '2026-10-14';
+export const OPS_CLOCK_START = '2026-10-23';
 
 /** Gate 1: at least 4 consecutive weeks (28 days) of clean operations since the clock last started. */
 export function opsGate(nowMs: number, clockStart: string): Gate {
